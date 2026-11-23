@@ -13,6 +13,10 @@ export interface EtherResponse {
   status: number;
   headers?: Record<string, string>;
   body?: unknown;
+  /** Frontend adapters: Ether serves this playable item's bytes itself. */
+  media?: { itemRef: string; partIndex?: number; source?: string };
+  /** Frontend adapters: Ether serves this item's stored artwork itself. */
+  art?: { itemRef: string; role?: string };
 }
 
 export interface KindArtRef {

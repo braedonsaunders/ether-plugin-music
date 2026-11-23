@@ -13,6 +13,10 @@ import { MusicBrainzClient } from "./musicbrainz.ts";
 import { LrclibClient } from "./lrclib.ts";
 import { MusicCatalog } from "./catalog.ts";
 import { AlbumResolver } from "./resolver.ts";
+import { SUBSONIC_PREFIX, SubsonicAdapter, hostedSubsonicHost, setServerVersion } from "./subsonic.ts";
+
+export const PLUGIN_VERSION = "0.3.0";
+setServerVersion(PLUGIN_VERSION);
 
 function parseBody(req: EtherRequest): Record<string, any> {
   if (typeof req.body === "string") {
@@ -34,7 +38,7 @@ function queryParam(req: EtherRequest, key: string): string {
   return v ? String(v) : "";
 }
 
-export function createHandler(env?: HostEnv) {
+export function createHandler(env?: HostEnv, subsonicHost?: () => import("./subsonic.ts").SubsonicHost) {
   return function handleRequest(req: EtherRequest): EtherResponse {
     const host = env || defaultHostEnv();
     const settings = readSettings(host, req.settings);
@@ -53,7 +57,7 @@ export function createHandler(env?: HostEnv) {
     try {
       // Health, configure, and test routes (EPP/1)
       if (path === "/health" || path === "/ether/health") {
-        return { status: 200, body: { ok: true, status: "ok", plugin: "ether.music", version: "0.2.6" } };
+        return { status: 200, body: { ok: true, status: "ok", plugin: "ether.music", version: PLUGIN_VERSION } };
       }
       if (path === "/ether/test") {
         const startMs = host.now();
@@ -129,6 +133,21 @@ export function createHandler(env?: HostEnv) {
       }
       if (path === "/ether/configure") {
         return { status: 200, body: { ok: true } };
+      }
+
+      // Subsonic / OpenSubsonic frontend adapter (/subsonic on Ether).
+      if (path === SUBSONIC_PREFIX || path.startsWith(SUBSONIC_PREFIX + "/")) {
+        const adapter = new SubsonicAdapter(
+          (subsonicHost || hostedSubsonicHost)(),
+          {
+            expand: (r) => catalog.expand(r),
+            search: (q, limit) => catalog.search(q, limit),
+            lyrics: (q) => lrc.getLyrics(q),
+          },
+          host,
+          req.headers || {}
+        );
+        return adapter.handle(String(req.method || "GET").toUpperCase(), path.slice(SUBSONIC_PREFIX.length) || "/", req.query);
       }
 
       // 1. Browse (3-level artist -> album -> track)

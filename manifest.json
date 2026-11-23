@@ -1,8 +1,8 @@
 {
   "id": "ether.music",
   "name": "Music",
-  "version": "0.2.6",
-  "description": "Curated music discovery, live catalogue search across artists, albums, tracks and video concerts, and playback through your Ether indexers and debrid sources.",
+  "version": "0.3.0",
+  "description": "Curated music discovery, live catalogue search across artists, albums, tracks and video concerts, playback through your Ether indexers and debrid sources, and a Subsonic / OpenSubsonic server for Symfonium, Feishin, Amperfy, Substreamer and other Subsonic apps.",
   "ether": {
     "protocol": 1,
     "kind": "content",
@@ -22,7 +22,8 @@
     "capabilities": [
       "catalog_provider",
       "kind_resolver",
-      "matcher"
+      "matcher",
+      "frontend_adapter"
     ],
     "permissions": {
       "sources": "search",
@@ -671,6 +672,32 @@
           "match": {
             "thresholdDefault": 0.72
           }
+        }
+      ],
+      "frontendAdapters": [
+        {
+          "key": "subsonic",
+          "label": "Subsonic",
+          "protocolHint": "subsonic",
+          "pathPrefix": "/subsonic",
+          "auth": "query_credentials",
+          "libraries": [
+            "music"
+          ],
+          "clients": [
+            "Symfonium",
+            "Feishin",
+            "Substreamer",
+            "Amperfy",
+            "play:Sub",
+            "Tempo",
+            "DSub",
+            "Supersonic"
+          ],
+          "searchPaths": [
+            "/rest/search2",
+            "/rest/search3"
+          ]
         }
       ]
     }
