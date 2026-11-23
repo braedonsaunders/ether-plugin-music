@@ -53,7 +53,7 @@ export function createHandler(env?: HostEnv) {
     try {
       // Health, configure, and test routes (EPP/1)
       if (path === "/health" || path === "/ether/health") {
-        return { status: 200, body: { ok: true, status: "ok", plugin: "ether.music", version: "0.2.5" } };
+        return { status: 200, body: { ok: true, status: "ok", plugin: "ether.music", version: "0.2.6" } };
       }
       if (path === "/ether/test") {
         const startMs = host.now();

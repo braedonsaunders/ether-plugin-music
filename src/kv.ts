@@ -165,12 +165,14 @@ export class KVCache {
     this.env = env;
   }
 
-  get<T>(key: string, options?: { memOnly?: boolean }): T | null {
+  get<T>(key: string, options?: { memOnly?: boolean; fresh?: boolean }): T | null {
     const now = this.env.now();
-    const hit = this.mem.get(key);
-    if (hit) {
-      if (hit.exp > now) return hit.v as T;
-      this.mem.delete(key);
+    if (!options?.fresh) {
+      const hit = this.mem.get(key);
+      if (hit) {
+        if (hit.exp > now) return hit.v as T;
+        this.mem.delete(key);
+      }
     }
     if (options?.memOnly) return null;
     try {
@@ -179,7 +181,9 @@ export class KVCache {
       const parsed = JSON.parse(raw) as CacheEnvelope<T>;
       if (!parsed || typeof parsed.exp !== "number") return null;
       if (parsed.exp <= now) return null;
-      this.mem.set(key, parsed);
+      if (!options?.fresh) {
+        this.mem.set(key, parsed);
+      }
       return parsed.v;
     } catch (err) {
       rethrowHostFault(err);
@@ -274,6 +278,12 @@ export class KVCache {
         if (deleted >= maxDeletes) return deleted;
         tryDelete(k);
       }
+    }
+
+    // 1b. Short-lived search dedup memos (rebuilt safely after 5 min window).
+    for (const k of listSafe("sq_v1:")) {
+      if (deleted >= maxDeletes) return deleted;
+      tryDelete(k);
     }
 
     // 2. Bulky raw Deezer payloads (rebuilt on demand / already stored compactly in album_v2:*).

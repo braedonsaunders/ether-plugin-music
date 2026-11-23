@@ -2170,7 +2170,7 @@ export function searchLiveConcerts(
       method: "GET",
       url,
       headers: {
-        "User-Agent": "EtherMusicPlugin/0.2.5 (https://ether.local)",
+        "User-Agent": "EtherMusicPlugin/0.2.6 (https://ether.local)",
         Accept: "application/json",
       },
       timeoutMs,

@@ -39,11 +39,18 @@ import {
 } from "./normalize.ts";
 
 const ALBUM_CACHE_TTL_MS = 24 * HOUR_MS;
-const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000;
+const NEGATIVE_EMPTY_CACHE_TTL_MS = 30 * 60 * 1000;
+const NEGATIVE_UNMATCHED_CACHE_TTL_MS = 60 * 60 * 1000;
+const NEGATIVE_RESPONSE_EMPTY_TTL_SEC = 600;
+const NEGATIVE_RESPONSE_UNMATCHED_TTL_SEC = 900;
 const STAGE_CACHE_TTL_MS = 2 * 60 * 1000;
+const SEARCH_DEDUP_WINDOW_MS = 5 * 60 * 1000;
+const SEARCH_INFLIGHT_WAIT_MS = 6_000;
+const SEARCH_MEMO_MAX_CANDIDATES = 25;
 const RESOLVE_STEP_BUDGET_MS = 1400;
 const MAX_CACHED_RELEASES = 3;
-const MAX_FILE_LIST_PROBES = 10;
+const MAX_FILE_LIST_PROBES = 8;
+const MAX_USENET_PROBES = 5;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
@@ -60,6 +67,49 @@ export function concertCacheKey(concertId: string): string {
 
 function concertStageKey(concertId: string): string {
   return `concert_stage_v2:${concertId}`;
+}
+
+export function searchMemoKey(entityId: string, query: string): string {
+  const norm = normalizeText(query).slice(0, 96) || query.trim().toLowerCase().slice(0, 96);
+  return `sq_v1:${entityId}:${norm}`;
+}
+
+interface SearchQueryMemo {
+  status: "inflight" | "done";
+  at: number;
+  rawCount: number;
+  candidates?: SourceCandidate[];
+  errored?: boolean;
+}
+
+function compactCandidateForMemo(c: SourceCandidate): SourceCandidate {
+  const out: SourceCandidate = {};
+  if (c.infoHash) out.infoHash = c.infoHash;
+  if (c.magnet) out.magnet = c.magnet;
+  if (c.nzbUrl) out.nzbUrl = c.nzbUrl;
+  if (c.title) out.title = c.title;
+  if (typeof c.size === "number") out.size = c.size;
+  if (typeof c.seeders === "number") out.seeders = c.seeders;
+  if (typeof c.cached === "boolean") out.cached = c.cached;
+  if (c.indexer) out.indexer = c.indexer;
+  if (c.indexerId) out.indexerId = c.indexerId;
+  if (typeof c.score === "number") out.score = c.score;
+  if (typeof c.resolution === "number") out.resolution = c.resolution;
+  if (c.source) out.source = c.source;
+  if (c.codec) out.codec = c.codec;
+  return out;
+}
+
+/**
+ * Returns true when `narrower` contains every normalized token of `broader` (plus extra
+ * terms such as a release year). On Newznab/Torznab AND-searches, a strictly narrower query
+ * cannot match anything when the broader query already returned 0 results.
+ */
+export function isStrictlyNarrowerQuery(broader: string, narrower: string): boolean {
+  const bToks = normalizeText(broader).split(/\s+/).filter(Boolean);
+  const nToks = new Set(normalizeText(narrower).split(/\s+/).filter(Boolean));
+  if (bToks.length === 0 || nToks.size <= bToks.length) return false;
+  return bToks.every((t) => nToks.has(t));
 }
 
 interface ConcertResolveTarget {
@@ -81,6 +131,7 @@ interface ConcertResolveStage {
   archiveFallbacks: VerifiedConcertRelease[];
   debridFallbacks: VerifiedConcertRelease[];
   excludedSig: string;
+  rawCandidateCount?: number;
   usenetChecksUsed?: number;
   usenetCheckDisabled?: boolean;
 }
@@ -93,6 +144,7 @@ interface ResolveStage {
   archiveFallbacks: VerifiedAlbumRelease[];
   debridFallbacks: VerifiedAlbumRelease[];
   excludedSig: string;
+  rawCandidateCount?: number;
   usenetChecksUsed?: number;
   usenetCheckDisabled?: boolean;
 }
@@ -1048,8 +1100,8 @@ export class AlbumResolver {
 
     const cached = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (cached) {
-      if (cached.negative && excluded.size === 0) {
-        return { sources: [], ttlSec: 60 };
+      if (cached.negative) {
+        return { sources: [], ttlSec: this.negativeResponseTtlSec(cached) };
       }
       const sources = this.buildTrackSources(item, cached.releases, excluded);
       if (sources.length > 0) {
@@ -1060,7 +1112,7 @@ export class AlbumResolver {
         this.cache.delete(albumCacheKey(albumId));
         this.cache.delete(albumStageKey(albumId));
       } else {
-        return { sources: [], ttlSec: 60 };
+        return { sources: [], ttlSec: NEGATIVE_RESPONSE_EMPTY_TTL_SEC };
       }
     }
 
@@ -1068,14 +1120,17 @@ export class AlbumResolver {
     if (!step.done) {
       return {
         pending: true,
-        retryInMs: 250,
+        retryInMs: step.retryInMs ?? 250,
         sources: [],
       };
     }
 
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (!fresh || fresh.releases.length === 0) {
-      return { sources: [], ttlSec: 60 };
+      return {
+        sources: [],
+        ttlSec: fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC,
+      };
     }
     return { sources: this.buildTrackSources(item, fresh.releases, excluded), ttlSec: 3600 };
   }
@@ -1097,13 +1152,136 @@ export class AlbumResolver {
     );
 
     const existing = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
-    if (existing && !existing.negative && excluded.size === 0) {
+    if (existing && (existing.negative || excluded.size === 0)) {
       return { done: true, albumId, verifiedCount: existing.releases.length };
     }
 
     // Never run usenet_check during background/scheduled jobs (Ether enforces on-demand only).
     const step = this.stepResolveAlbum(albumId, item, excluded, 60_000, false);
-    return { done: true, albumId, verifiedCount: step.verifiedCount };
+    return { done: step.done, albumId, verifiedCount: step.verifiedCount };
+  }
+
+  private negativeResponseTtlSec(cached: { expiresAt: number }): number {
+    const remainingSec = Math.floor((cached.expiresAt - this.env.now()) / 1000);
+    if (remainingSec <= 0) return NEGATIVE_RESPONSE_EMPTY_TTL_SEC;
+    return Math.max(60, Math.min(NEGATIVE_RESPONSE_UNMATCHED_TTL_SEC, remainingSec));
+  }
+
+  private runMemoizedIndexerSearch(
+    entityId: string,
+    query: string,
+    category: string,
+    timeoutMs: number,
+    interactive: boolean,
+    prioritize?: (cands: SourceCandidate[]) => SourceCandidate[]
+  ): {
+    candidates: SourceCandidate[];
+    rawCount: number;
+    fromCache: boolean;
+    errored: boolean;
+    deferredInFlight: boolean;
+    elapsedMs: number;
+  } {
+    const memoKey = searchMemoKey(entityId, query);
+    const memo = this.cache.get<SearchQueryMemo>(memoKey, { fresh: true });
+    if (memo) {
+      if (memo.status === "done") {
+        return {
+          candidates: (memo.candidates || []).map((c) => ({ ...c })),
+          rawCount: memo.rawCount,
+          fromCache: true,
+          errored: Boolean(memo.errored),
+          deferredInFlight: false,
+          elapsedMs: 0,
+        };
+      }
+      if (this.env.now() - memo.at < SEARCH_INFLIGHT_WAIT_MS) {
+        return {
+          candidates: [],
+          rawCount: 0,
+          fromCache: true,
+          errored: false,
+          deferredInFlight: true,
+          elapsedMs: 0,
+        };
+      }
+      // Previous search attempt never completed within the active window (e.g. host timeout);
+      // do not re-hit the indexer for the remainder of SEARCH_DEDUP_WINDOW_MS.
+      return {
+        candidates: [],
+        rawCount: 0,
+        fromCache: true,
+        errored: true,
+        deferredInFlight: false,
+        elapsedMs: 0,
+      };
+    }
+
+    const reqAt = this.env.now();
+    this.cache.set<SearchQueryMemo>(
+      memoKey,
+      { status: "inflight", at: reqAt, rawCount: 0 },
+      SEARCH_DEDUP_WINDOW_MS
+    );
+
+    try {
+      const res = this.env.sources.resolve({
+        kind: "indexer_search",
+        query,
+        category,
+        firstResults: true,
+        settleMs: interactive ? 300 : 500,
+        timeoutMs,
+      });
+      const list = Array.isArray(res?.candidates) ? res.candidates : [];
+      const elapsedMs = Math.max(0, this.env.now() - reqAt);
+      const ordered = prioritize ? prioritize(list) : list;
+      const compacted = ordered.slice(0, SEARCH_MEMO_MAX_CANDIDATES).map(compactCandidateForMemo);
+      this.cache.set<SearchQueryMemo>(
+        memoKey,
+        { status: "done", at: this.env.now(), rawCount: list.length, candidates: compacted },
+        SEARCH_DEDUP_WINDOW_MS
+      );
+      return {
+        candidates: list,
+        rawCount: list.length,
+        fromCache: false,
+        errored: false,
+        deferredInFlight: false,
+        elapsedMs,
+      };
+    } catch (err) {
+      rethrowHostFault(err);
+      const elapsedMs = Math.max(0, this.env.now() - reqAt);
+      this.cache.set<SearchQueryMemo>(
+        memoKey,
+        { status: "done", at: this.env.now(), rawCount: 0, candidates: [], errored: true },
+        SEARCH_DEDUP_WINDOW_MS
+      );
+      this.env.log("debug", `indexer_search failed ${entityId} "${query}": ${String(err).slice(0, 120)}`);
+      return {
+        candidates: [],
+        rawCount: 0,
+        fromCache: false,
+        errored: true,
+        deferredInFlight: false,
+        elapsedMs,
+      };
+    }
+  }
+
+  private isSatisfiedAlbumRelease(v: VerifiedAlbumRelease, trackCount: number): boolean {
+    if (v.isArchiveFallback || v.isUnconfirmedDebridFallback) return false;
+    if (Object.keys(v.tracks).length < trackCount) return false;
+    if (this.settings.qualityPreference === "high_bitrate") {
+      return (
+        v.qualityTier === "flac" ||
+        v.qualityTier === "flac24" ||
+        v.qualityTier === "lossless" ||
+        v.qualityTier === "lossy_high"
+      );
+    }
+    return v.qualityTier === "flac" || v.qualityTier === "flac24";
   }
 
   private stepResolveAlbum(
@@ -1112,7 +1290,7 @@ export class AlbumResolver {
     excluded: Set<string>,
     budgetMs: number,
     allowUsenetCheck: boolean
-  ): { done: boolean; verifiedCount: number } {
+  ): { done: boolean; verifiedCount: number; retryInMs?: number } {
     const startMs = this.env.now();
     const excludedSig = Array.from(excluded).sort().join("|");
     let stage = this.cache.get<ResolveStage>(albumStageKey(albumId));
@@ -1133,15 +1311,21 @@ export class AlbumResolver {
         "info",
         `resolve-album: search ${album.id} "${album.artistName} - ${album.title}" (${album.year}, ${album.tracks.length} tracks)`
       );
-      const preRanked = this.searchAndRankCandidates(album, excluded, startMs, budgetMs);
+      const searched = this.searchAndRankCandidates(album, excluded, startMs, budgetMs);
+      if (searched.deferredInFlight) {
+        // Another worker is currently running the same album search; yield briefly without
+        // firing a duplicate parallel search or caching a premature negative result.
+        return { done: false, verifiedCount: 0, retryInMs: 350 };
+      }
       stage = {
         album,
-        preRanked: preRanked.slice(0, MAX_FILE_LIST_PROBES),
+        preRanked: searched.ordered.slice(0, MAX_FILE_LIST_PROBES),
         nextIdx: 0,
         verified: [],
         archiveFallbacks: [],
         debridFallbacks: [],
         excludedSig,
+        rawCandidateCount: searched.rawCount,
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
       };
@@ -1196,16 +1380,25 @@ export class AlbumResolver {
         startMs
       );
 
-      // Fast-finish as soon as we have a FULL-coverage verified lossless Debrid release (instant playback!),
-      // or a health-verified full-coverage lossless Usenet release once Debrid slots are done.
+      // Fast-finish as soon as we have a FULL-coverage verified release matching quality preference
+      // (or any full-coverage verified release when no lossless candidates remain to probe).
+      // Debrid is always probed first; for Usenet-only setups this avoids redundant FetchNZB hits.
+      const hasFullVerified = stage.verified.some(
+        (v) =>
+          !v.isArchiveFallback &&
+          !v.isUnconfirmedDebridFallback &&
+          Object.keys(v.tracks).length >= stage.album.tracks.length
+      );
+      const hasRemainingLossless =
+        hasFullVerified &&
+        stage.preRanked
+          .slice(stage.nextIdx)
+          .some((x) =>
+            classifyReleaseQuality(x.cand.title || "", undefined, this.settings.qualityPreference).lossless
+          );
       if (
-        budgetMs <= RESOLVE_STEP_BUDGET_MS &&
-        stage.verified.some(
-          (v) =>
-            v.sourceKind === "debrid" &&
-            (v.qualityTier === "flac" || v.qualityTier === "flac24") &&
-            Object.keys(v.tracks).length >= stage.album.tracks.length
-        )
+        stage.verified.some((v) => this.isSatisfiedAlbumRelease(v, stage.album.tracks.length)) ||
+        (hasFullVerified && !hasRemainingLossless)
       ) {
         break;
       }
@@ -1226,18 +1419,19 @@ export class AlbumResolver {
     }
 
     const now = this.env.now();
+    const negTtlMs =
+      (stage.rawCandidateCount || 0) > 0
+        ? NEGATIVE_UNMATCHED_CACHE_TTL_MS
+        : NEGATIVE_EMPTY_CACHE_TTL_MS;
+    const ttlMs = finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : negTtlMs;
     const record: CachedAlbumResolution = {
       albumId,
       resolvedAt: now,
-      expiresAt: now + (finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS),
+      expiresAt: now + ttlMs,
       releases: finalReleases,
       negative: finalReleases.length === 0,
     };
-    this.cache.set(
-      albumCacheKey(albumId),
-      record,
-      finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS
-    );
+    this.cache.set(albumCacheKey(albumId), record, ttlMs);
     this.cache.delete(albumStageKey(albumId));
 
     this.env.log(
@@ -1305,11 +1499,16 @@ export class AlbumResolver {
     excluded: Set<string>,
     startMs: number,
     budgetMs: number
-  ): Array<{ cand: SourceCandidate; score: number }> {
+  ): {
+    ordered: Array<{ cand: SourceCandidate; score: number }>;
+    rawCount: number;
+    deferredInFlight: boolean;
+  } {
     const cleanArtist = album.artistName.trim();
     const cleanAlbum = stripEditionSuffix(album.title).trim();
     // Primary query without year captures both "(2001)" and undated album packs in ONE search;
-    // only fall back to year-scoped search if primary returned nothing and budget remains.
+    // only fall back sequentially to the year-scoped variant when the primary returned noisy
+    // non-matching results and no well-matched release has been found yet.
     const queries: string[] = [`${cleanArtist} ${cleanAlbum}`];
     if (album.year > 0) {
       queries.push(`${cleanArtist} ${cleanAlbum} ${album.year}`);
@@ -1318,38 +1517,79 @@ export class AlbumResolver {
     const interactive = budgetMs <= RESOLVE_STEP_BUDGET_MS;
     const byRef = new Map<string, SourceCandidate>();
     const rawCandidates: SourceCandidate[] = [];
+    const emptyQueries: string[] = [];
+    let hasWellMatched = false;
+    let totalRawFromIndexer = 0;
 
+    const isWellMatched = (cand: SourceCandidate): boolean => {
+      if (!isUsenetCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
+      const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference, {
+        allowUnconfirmedTorrent: true,
+      });
+      return pre.accepted && pre.score >= 55;
+    };
+
+    const prioritizeForMemo = (cands: SourceCandidate[]): SourceCandidate[] => {
+      if (cands.length <= SEARCH_MEMO_MAX_CANDIDATES) return cands;
+      return [...cands].sort((a, b) => {
+        const pa = preScoreAlbumCandidate(a, album, this.settings.qualityPreference, { allowUnconfirmedTorrent: true });
+        const pb = preScoreAlbumCandidate(b, album, this.settings.qualityPreference, { allowUnconfirmedTorrent: true });
+        if (pa.accepted !== pb.accepted) return pa.accepted ? -1 : 1;
+        return pb.score - pa.score;
+      });
+    };
+
+    // Always run query variants strictly sequentially; stop at the first query that yields
+    // a well-matched release, and skip strictly narrower variants after a 0-result broader query.
     for (let qi = 0; qi < queries.length; qi++) {
       const q = queries[qi];
+      if (emptyQueries.some((prev) => isStrictlyNarrowerQuery(prev, q))) {
+        continue;
+      }
       const elapsed = this.env.now() - startMs;
       if (qi > 0 && interactive) {
-        if (rawCandidates.length > 0 && elapsed >= 1400) break;
-        if (elapsed >= 2200) break;
+        if (elapsed >= 1400) break;
       }
       const timeoutMs = interactive
         ? (qi === 0 ? 2500 : Math.max(800, Math.min(1800, 3200 - elapsed)))
         : 5000;
-      const res = this.env.sources.resolve({
-        kind: "indexer_search",
-        query: q,
-        category: this.settings.newznabCategories,
-        firstResults: true,
-        settleMs: interactive ? 300 : 500,
+      const res = this.runMemoizedIndexerSearch(
+        album.id,
+        q,
+        this.settings.newznabCategories,
         timeoutMs,
-      });
-      const list = Array.isArray(res?.candidates) ? res.candidates : [];
-      for (const c of list) {
+        interactive,
+        prioritizeForMemo
+      );
+      if (res.deferredInFlight) {
+        if (rawCandidates.length === 0) {
+          return { ordered: [], rawCount: 0, deferredInFlight: true };
+        }
+        break;
+      }
+      totalRawFromIndexer += res.rawCount;
+      if (res.rawCount === 0) {
+        emptyQueries.push(q);
+      }
+      for (const c of res.candidates) {
         const ref = candidateRefOf(c);
         if (excluded.has(ref)) continue;
         if (!byRef.has(ref)) {
           byRef.set(ref, c);
           rawCandidates.push(c);
+          if (!hasWellMatched && isWellMatched(c)) {
+            hasWellMatched = true;
+          }
         }
       }
-      if (rawCandidates.length >= 4) break;
+      if (hasWellMatched) break;
+      if (res.errored) break;
+      if (!res.fromCache && interactive && res.elapsedMs >= 1400) break;
     }
 
-    if (rawCandidates.length === 0) return [];
+    if (rawCandidates.length === 0) {
+      return { ordered: [], rawCount: totalRawFromIndexer, deferredInFlight: false };
+    }
 
     // Batch debrid_check for top torrent infoHashes (capped at 25, prioritizing lossless + seeders)
     // so popular albums never burn the 5s route budget checking 80+ obscure torrents.
@@ -1435,14 +1675,14 @@ export class AlbumResolver {
 
     const ordered = [
       ...debridRanked.slice(0, 6),
-      ...usenetDedup.slice(0, 8),
+      ...usenetDedup.slice(0, MAX_USENET_PROBES),
       ...unconfirmedDebrid.slice(0, 4),
     ];
     this.env.log(
       "info",
       `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
     );
-    return ordered;
+    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false };
   }
 
   /**
@@ -1742,8 +1982,8 @@ export class AlbumResolver {
 
     const cached = this.cache.get<CachedConcertResolution>(concertCacheKey(concertId));
     if (cached) {
-      if (cached.negative && excluded.size === 0) {
-        return { sources: [], ttlSec: 60 };
+      if (cached.negative) {
+        return { sources: [], ttlSec: this.negativeResponseTtlSec(cached) };
       }
       const sources = this.buildConcertSources(item, cached.releases, excluded);
       if (sources.length > 0) {
@@ -1753,7 +1993,7 @@ export class AlbumResolver {
         this.cache.delete(concertCacheKey(concertId));
         this.cache.delete(concertStageKey(concertId));
       } else {
-        return { sources: [], ttlSec: 60 };
+        return { sources: [], ttlSec: NEGATIVE_RESPONSE_EMPTY_TTL_SEC };
       }
     }
 
@@ -1761,14 +2001,17 @@ export class AlbumResolver {
     if (!step.done) {
       return {
         pending: true,
-        retryInMs: 250,
+        retryInMs: step.retryInMs ?? 250,
         sources: [],
       };
     }
 
     const fresh = this.cache.get<CachedConcertResolution>(concertCacheKey(concertId));
     if (!fresh || fresh.releases.length === 0) {
-      return { sources: [], ttlSec: 60 };
+      return {
+        sources: [],
+        ttlSec: fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC,
+      };
     }
     return { sources: this.buildConcertSources(item, fresh.releases, excluded), ttlSec: 3600 };
   }
@@ -1810,7 +2053,11 @@ export class AlbumResolver {
     excluded: Set<string>,
     startMs: number,
     budgetMs: number
-  ): Array<{ cand: SourceCandidate; score: number }> {
+  ): {
+    ordered: Array<{ cand: SourceCandidate; score: number }>;
+    rawCount: number;
+    deferredInFlight: boolean;
+  } {
     const cleanArtist = concert.artistName.trim();
     const cleanTitle = stripEditionSuffix(concert.title).trim();
     const shortTitle = cleanTitle.split(/[:\-–—]/)[0].trim() || cleanTitle;
@@ -1838,38 +2085,77 @@ export class AlbumResolver {
     const interactive = budgetMs <= RESOLVE_STEP_BUDGET_MS;
     const byRef = new Map<string, SourceCandidate>();
     const rawCandidates: SourceCandidate[] = [];
+    const emptyQueries: string[] = [];
+    let hasWellMatched = false;
+    let totalRawFromIndexer = 0;
+
+    const isWellMatched = (cand: SourceCandidate): boolean => {
+      if (!isUsenetCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
+      const pre = preScoreConcertCandidate(cand, concert, this.settings.videoQualityPreference, {
+        allowUnconfirmedTorrent: true,
+      });
+      return pre.accepted && pre.score >= 55;
+    };
+
+    const prioritizeForMemo = (cands: SourceCandidate[]): SourceCandidate[] => {
+      if (cands.length <= SEARCH_MEMO_MAX_CANDIDATES) return cands;
+      return [...cands].sort((a, b) => {
+        const pa = preScoreConcertCandidate(a, concert, this.settings.videoQualityPreference, { allowUnconfirmedTorrent: true });
+        const pb = preScoreConcertCandidate(b, concert, this.settings.videoQualityPreference, { allowUnconfirmedTorrent: true });
+        if (pa.accepted !== pb.accepted) return pa.accepted ? -1 : 1;
+        return pb.score - pa.score;
+      });
+    };
 
     for (let qi = 0; qi < queries.length; qi++) {
       const q = queries[qi];
+      if (emptyQueries.some((prev) => isStrictlyNarrowerQuery(prev, q))) {
+        continue;
+      }
       const elapsed = this.env.now() - startMs;
       if (qi > 0 && interactive) {
-        if (rawCandidates.length > 0 && elapsed >= 1400) break;
-        if (elapsed >= 2200) break;
+        if (elapsed >= 1400) break;
       }
       const timeoutMs = interactive
         ? (qi === 0 ? 2500 : Math.max(800, Math.min(1800, 3200 - elapsed)))
         : 5000;
-      const res = this.env.sources.resolve({
-        kind: "indexer_search",
-        query: q,
-        category: this.settings.concertNewznabCategories,
-        firstResults: true,
-        settleMs: interactive ? 300 : 500,
+      const res = this.runMemoizedIndexerSearch(
+        concert.id,
+        q,
+        this.settings.concertNewznabCategories,
         timeoutMs,
-      });
-      const list = Array.isArray(res?.candidates) ? res.candidates : [];
-      for (const c of list) {
+        interactive,
+        prioritizeForMemo
+      );
+      if (res.deferredInFlight) {
+        if (rawCandidates.length === 0) {
+          return { ordered: [], rawCount: 0, deferredInFlight: true };
+        }
+        break;
+      }
+      totalRawFromIndexer += res.rawCount;
+      if (res.rawCount === 0) {
+        emptyQueries.push(q);
+      }
+      for (const c of res.candidates) {
         const ref = candidateRefOf(c);
         if (excluded.has(ref)) continue;
         if (!byRef.has(ref)) {
           byRef.set(ref, c);
           rawCandidates.push(c);
+          if (!hasWellMatched && isWellMatched(c)) {
+            hasWellMatched = true;
+          }
         }
       }
-      if (rawCandidates.length >= 6) break;
+      if (hasWellMatched) break;
+      if (res.errored) break;
+      if (!res.fromCache && interactive && res.elapsedMs >= 1400) break;
     }
 
-    if (rawCandidates.length === 0) return [];
+    if (rawCandidates.length === 0) {
+      return { ordered: [], rawCount: totalRawFromIndexer, deferredInFlight: false };
+    }
 
     // Batch debrid_check for top 25 video torrent infoHashes sorted by video quality + seeders.
     const torrentCands = rawCandidates
@@ -1946,14 +2232,14 @@ export class AlbumResolver {
 
     const ordered = [
       ...orderedDebrid,
-      ...usenetDedup.slice(0, 8),
+      ...usenetDedup.slice(0, MAX_USENET_PROBES),
       ...unconfirmedDebrid.slice(0, 4),
     ];
     this.env.log(
       "info",
       `resolve-concert: ${concert.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
     );
-    return ordered;
+    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false };
   }
 
   private stepResolveConcert(
@@ -1962,7 +2248,7 @@ export class AlbumResolver {
     excluded: Set<string>,
     budgetMs: number,
     allowUsenetCheck: boolean
-  ): { done: boolean; verifiedCount: number } {
+  ): { done: boolean; verifiedCount: number; retryInMs?: number } {
     const startMs = this.env.now();
     const excludedSig = Array.from(excluded).sort().join("|");
     let stage = this.cache.get<ConcertResolveStage>(concertStageKey(concertId));
@@ -1982,15 +2268,19 @@ export class AlbumResolver {
         "info",
         `resolve-concert: search ${concert.id} "${concert.artistName} - ${concert.title}" (${concert.year})`
       );
-      const preRanked = this.searchAndRankConcertCandidates(concert, excluded, startMs, budgetMs);
+      const searched = this.searchAndRankConcertCandidates(concert, excluded, startMs, budgetMs);
+      if (searched.deferredInFlight) {
+        return { done: false, verifiedCount: 0, retryInMs: 350 };
+      }
       stage = {
         concert,
-        preRanked: preRanked.slice(0, MAX_FILE_LIST_PROBES),
+        preRanked: searched.ordered.slice(0, MAX_FILE_LIST_PROBES),
         nextIdx: 0,
         verified: [],
         archiveFallbacks: [],
         debridFallbacks: [],
         excludedSig,
+        rawCandidateCount: searched.rawCount,
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
       };
@@ -2029,11 +2319,13 @@ export class AlbumResolver {
       stage.nextIdx++;
       this.probeSingleConcertCandidate(stage, cand, preScore, allowUsenetCheck, startMs);
 
-      // Fast-finish on first verified Debrid cached HD/4K concert film!
+      // Fast-finish on first verified HD/4K concert film (Debrid or Usenet).
       if (
-        budgetMs <= RESOLVE_STEP_BUDGET_MS &&
         stage.verified.some(
-          (v) => v.sourceKind === "debrid" && (v.qualityTier === "uhd" || v.qualityTier === "1080p")
+          (v) =>
+            !v.isArchiveFallback &&
+            !v.isUnconfirmedDebridFallback &&
+            (v.qualityTier === "uhd" || v.qualityTier === "1080p")
         )
       ) {
         break;
@@ -2182,18 +2474,19 @@ export class AlbumResolver {
     }
 
     const now = this.env.now();
+    const negTtlMs =
+      (stage.rawCandidateCount || 0) > 0
+        ? NEGATIVE_UNMATCHED_CACHE_TTL_MS
+        : NEGATIVE_EMPTY_CACHE_TTL_MS;
+    const ttlMs = finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : negTtlMs;
     const record: CachedConcertResolution = {
       concertId,
       resolvedAt: now,
-      expiresAt: now + (finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS),
+      expiresAt: now + ttlMs,
       releases: finalReleases,
       negative: finalReleases.length === 0,
     };
-    this.cache.set(
-      concertCacheKey(concertId),
-      record,
-      finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS
-    );
+    this.cache.set(concertCacheKey(concertId), record, ttlMs);
     this.cache.delete(concertStageKey(concertId));
 
     this.env.log(

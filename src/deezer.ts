@@ -2,7 +2,7 @@ import type { HostEnv } from "./types.ts";
 import { KVCache, HOUR_MS, DAY_MS, rethrowHostFault } from "./kv.ts";
 
 const DEEZER_BASE = "https://api.deezer.com";
-const USER_AGENT = "EtherMusic/0.2.5 (https://ether.media)";
+const USER_AGENT = "EtherMusic/0.2.6 (https://ether.media)";
 const RATE_BUCKET = "rl:deezer";
 
 function slimArtist(a: DeezerArtist): DeezerArtist {

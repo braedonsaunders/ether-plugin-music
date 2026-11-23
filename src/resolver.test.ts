@@ -20,11 +20,13 @@ import {
   classifyReleaseQuality,
   classifyVideoQuality,
   expandReleaseFiles,
+  isStrictlyNarrowerQuery,
   isUsenetCandidate,
   matchAlbumReleaseFiles,
   matchConcertReleaseFiles,
   preScoreAlbumCandidate,
   preScoreConcertCandidate,
+  searchMemoKey,
 } from "./resolver.ts";
 import { buildConcertItem, getCuratedConcertById } from "./concerts.ts";
 import { isRejectedReleaseForRequest, parseTrackFilename } from "./normalize.ts";
@@ -1158,7 +1160,7 @@ test("Issue #753: RAR/ZIP archive with release_files.members expands exact inner
   const resolver = new AlbumResolver(env, cache, catalog, settings);
 
   const res = resolver.resolve({ item: trackItemFor(album, 3) });
-  assert.equal(res.sources.length, 2);
+  assert.equal(res.sources.length, 1, "fast-finishes after verifying full-coverage lossless Usenet archive");
 
   // First source: FLAC RAR expanded archive member -> exact inner member path as fileHint ONLY.
   const s0 = res.sources[0];
@@ -1169,8 +1171,13 @@ test("Issue #753: RAR/ZIP archive with release_files.members expands exact inner
   assert.equal(s0.release?.file, undefined, "archive member must NOT set outer file");
   assert.equal(s0.release?.track, undefined, "exact member match uses fileHint, not fallback track");
 
-  // Second source: MP3 ZIP expanded archive member -> exact inner member path as fileHint ONLY.
-  const s1 = res.sources[1];
+  // Failover to second source: MP3 ZIP expanded archive member -> exact inner member path as fileHint ONLY.
+  const failover = resolver.resolve({
+    item: trackItemFor(album, 3),
+    client: { exclude: [s0.id] },
+  });
+  assert.equal(failover.sources.length, 1);
+  const s1 = failover.sources[0];
   assert.equal(s1.mime, "audio/mpeg");
   assert.equal(s1.release?.fileHint, "Disc 2/02. They Don't Care About Us.mp3");
   assert.equal(s1.release?.fileIndex, undefined);
@@ -1825,4 +1832,371 @@ test("0.2.5: KVCache auto-evicts low-priority dz:* entries on quota_exceeded and
   assert.equal(store.has("album_v2:al-keep"), true);
   assert.equal(store.has("alb_rel_v6:al-keep"), true);
   assert.equal(store.has("alb_rel_v6:al-new"), true);
+});
+
+test("0.2.6: stops at the first query that yields a well-matched release and skips strictly narrower variants on 0 results", () => {
+  assert.equal(isStrictlyNarrowerQuery("Daft Punk Discovery", "Daft Punk Discovery 2001"), true);
+  assert.equal(isStrictlyNarrowerQuery("Stop Making Sense 1984", "Talking Heads Stop Making Sense"), false);
+
+  const album = sampleDiscoveryAlbum();
+  const singleFlac: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    nzbUrl: "https://althub.test/api?t=get&id=1",
+    indexer: "altHUB",
+    size: 130_000_000,
+  };
+  const backupFlac: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [WEB FLAC] Alt",
+    nzbUrl: "https://althub.test/api?t=get&id=2",
+    indexer: "altHUB",
+    size: 135_000_000,
+  };
+
+  // 1. Even a SINGLE well-matched release on query #1 stops immediately (no year variant #2)
+  //    AND Usenet fast-finishes after verifying 1 full-coverage FLAC (no 2nd FetchNZB).
+  const searchQueries: string[] = [];
+  const probedNzbs: string[] = [];
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") {
+        searchQueries.push(q.query || "");
+        return { candidates: [singleFlac, backupFlac] };
+      }
+      if (q.kind === "release_files") {
+        probedNzbs.push(q.candidate?.nzbUrl || "");
+        return {
+          candidates: [
+            {
+              ...q.candidate!,
+              files: album.tracks.map((t, i) => ({
+                index: i,
+                path: `${String(i + 1).padStart(2, "0")} - ${t.title}.flac`,
+                size: 30_000_000,
+              })),
+            },
+          ],
+        };
+      }
+      if (q.kind === "usenet_check") {
+        return { candidates: [{ nzbUrl: q.nzbUrl, usenetCheck: { available: true, checked: 4, missing: 0 } }] };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(res.sources.length, 1);
+  assert.deepEqual(searchQueries, ["Daft Punk Discovery"], "must stop after query #1 when well-matched release found");
+  assert.equal(probedNzbs.length, 1, "Usenet-only user must stop after 1 verified full-coverage FLAC FetchNZB");
+
+  // 2. When query #1 returns 0 results, strictly narrower year variant #2 must be skipped.
+  const emptyQueries: string[] = [];
+  const { env: envEmpty } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") {
+        emptyQueries.push(q.query || "");
+        return { candidates: [] };
+      }
+      return { candidates: [] };
+    },
+  });
+  const cacheEmpty = new KVCache(envEmpty);
+  cacheEmpty.set("album_v2:al-302127", album, 60_000);
+  const resEmpty = new AlbumResolver(
+    envEmpty,
+    cacheEmpty,
+    new MusicCatalog(envEmpty, cacheEmpty, new DeezerClient(envEmpty, cacheEmpty), new MusicBrainzClient(envEmpty, cacheEmpty), settings),
+    settings
+  ).resolve({ item: trackItemFor(album, 0) });
+  assert.equal(resEmpty.sources.length, 0);
+  assert.deepEqual(emptyQueries, ["Daft Punk Discovery"], "must not run narrower year variant when broader query returned 0 results");
+
+  // 3. When query #1 returns ONLY noisy non-matching releases, sequentially fall back to year variant #2.
+  const noisyQueries: string[] = [];
+  const { env: envNoisy } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") {
+        noisyQueries.push(q.query || "");
+        if (q.query === "Daft Punk Discovery") {
+          return {
+            candidates: [
+              { title: "Daft Punk - Greatest Hits (2010) [FLAC]", nzbUrl: "https://althub.test/gh.nzb", indexer: "altHUB", size: 200_000_000 },
+            ],
+          };
+        }
+        return { candidates: [singleFlac] };
+      }
+      if (q.kind === "release_files") {
+        return {
+          candidates: [
+            {
+              ...singleFlac,
+              files: album.tracks.map((t, i) => ({
+                index: i,
+                path: `${String(i + 1).padStart(2, "0")} - ${t.title}.flac`,
+                size: 30_000_000,
+              })),
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+  const cacheNoisy = new KVCache(envNoisy);
+  cacheNoisy.set("album_v2:al-302127", album, 60_000);
+  const resNoisy = new AlbumResolver(
+    envNoisy,
+    cacheNoisy,
+    new MusicCatalog(envNoisy, cacheNoisy, new DeezerClient(envNoisy, cacheNoisy), new MusicBrainzClient(envNoisy, cacheNoisy), settings),
+    settings
+  ).resolve({ item: trackItemFor(album, 0) });
+  assert.equal(resNoisy.sources.length, 1);
+  assert.deepEqual(noisyQueries, ["Daft Punk Discovery", "Daft Punk Discovery 2001"]);
+});
+
+test("0.2.6: negative results are cached per album for 30m (empty) / 60m (unmatched) and survive exclude retries", () => {
+  const album = sampleDiscoveryAlbum();
+  let now = 1_760_000_000_000;
+  let emptySearches = 0;
+  const kvMap = new Map<string, string>();
+  const env: HostEnv = {
+    now: () => now,
+    log: () => {},
+    kv: {
+      get: (k) => kvMap.get(k) ?? null,
+      put: (k, v) => { kvMap.set(k, v); },
+      delete: (k) => { kvMap.delete(k); },
+      list: (p = "") => Array.from(kvMap.keys()).filter((k) => k.startsWith(p)),
+    },
+    http: { fetch: () => ({ status: 404, body: "" }) },
+    settings: { get: () => ({}) },
+    sources: {
+      resolve: (q) => {
+        if (q.kind === "indexer_search") {
+          emptySearches++;
+          return { candidates: [] };
+        }
+        return { candidates: [] };
+      },
+    },
+  };
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 24 * 60 * 60 * 1000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const r1 = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(r1.sources.length, 0);
+  assert.ok((r1.ttlSec || 0) >= 600, `expected negative ttlSec >= 600, got ${r1.ttlSec}`);
+  assert.equal(emptySearches, 1);
+
+  // 15 minutes later (other track AND with client.exclude): MUST stay cached with 0 extra searches.
+  now += 15 * 60 * 1000;
+  const r2 = resolver.resolve({ item: trackItemFor(album, 2), client: { exclude: ["nzb:old"] } });
+  assert.equal(r2.sources.length, 0);
+  assert.equal(emptySearches, 1, "negative cache must not re-search within 30m even with exclude");
+
+  // 31 minutes later: negative cache expired -> allowed to re-search once.
+  now += 16 * 60 * 1000;
+  resolver.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(emptySearches, 2);
+
+  // Unmatched case (indexer answered cleanly with non-matching results) -> 60m negative cache.
+  let unmatchedSearches = 0;
+  const kvMap2 = new Map<string, string>();
+  let now2 = 1_760_000_000_000;
+  const env2: HostEnv = {
+    ...env,
+    now: () => now2,
+    kv: {
+      get: (k) => kvMap2.get(k) ?? null,
+      put: (k, v) => { kvMap2.set(k, v); },
+      delete: (k) => { kvMap2.delete(k); },
+      list: (p = "") => Array.from(kvMap2.keys()).filter((k) => k.startsWith(p)),
+    },
+    sources: {
+      resolve: (q) => {
+        if (q.kind === "indexer_search") {
+          unmatchedSearches++;
+          return {
+            candidates: [
+              { title: "Daft Punk - Greatest Hits (2010) [FLAC]", nzbUrl: "https://althub.test/gh.nzb", indexer: "altHUB", size: 200_000_000 },
+            ],
+          };
+        }
+        return { candidates: [] };
+      },
+    },
+  };
+  const cache2 = new KVCache(env2);
+  cache2.set("album_v2:al-302127", album, 24 * 60 * 60 * 1000);
+  const resolver2 = new AlbumResolver(
+    env2,
+    cache2,
+    new MusicCatalog(env2, cache2, new DeezerClient(env2, cache2), new MusicBrainzClient(env2, cache2), settings),
+    settings
+  );
+  const u1 = resolver2.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(u1.sources.length, 0);
+  assert.ok((u1.ttlSec || 0) >= 900, `expected unmatched negative ttlSec >= 900, got ${u1.ttlSec}`);
+  const initialCount = unmatchedSearches;
+  now2 += 45 * 60 * 1000;
+  resolver2.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(unmatchedSearches, initialCount, "unmatched negative cache must hold for 60 minutes");
+});
+
+test("0.2.6: never repeats the same (album, query) within the short dedup window (failover, concurrent in-flight, and timed-out retries)", () => {
+  const album = sampleDiscoveryAlbum();
+  const nzb1: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC] ReleaseA",
+    nzbUrl: "https://althub.test/a.nzb",
+    indexer: "altHUB",
+    size: 130_000_000,
+  };
+  const nzb2: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC] ReleaseB",
+    nzbUrl: "https://althub.test/b.nzb",
+    indexer: "altHUB",
+    size: 132_000_000,
+  };
+
+  let now = 1_760_000_000_000;
+  let searchCount = 0;
+  const kvMap = new Map<string, string>();
+  const env: HostEnv = {
+    now: () => now,
+    log: () => {},
+    kv: {
+      get: (k) => kvMap.get(k) ?? null,
+      put: (k, v) => { kvMap.set(k, v); },
+      delete: (k) => { kvMap.delete(k); },
+      list: (p = "") => Array.from(kvMap.keys()).filter((k) => k.startsWith(p)),
+    },
+    http: { fetch: () => ({ status: 404, body: "" }) },
+    settings: { get: () => ({}) },
+    sources: {
+      resolve: (q) => {
+        if (q.kind === "indexer_search") {
+          searchCount++;
+          return { candidates: [nzb1, nzb2] };
+        }
+        if (q.kind === "release_files") {
+          return {
+            candidates: [
+              {
+                ...q.candidate!,
+                files: album.tracks.map((t, i) => ({
+                  index: i,
+                  path: `${String(i + 1).padStart(2, "0")} - ${t.title}.flac`,
+                  size: 30_000_000,
+                })),
+              },
+            ],
+          };
+        }
+        return { candidates: [] };
+      },
+    },
+  };
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 24 * 60 * 60 * 1000);
+  const resolver = new AlbumResolver(
+    env,
+    cache,
+    new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings),
+    settings
+  );
+
+  // 1. Initial resolve searches once; failover (exclude nzb1) reuses sq_v1 memo with ZERO new searches!
+  const first = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(first.sources.length, 1);
+  assert.equal(searchCount, 1);
+
+  now += 20_000;
+  const failover = resolver.resolve({ item: trackItemFor(album, 0), client: { exclude: [first.sources[0].id] } });
+  assert.equal(failover.sources.length, 1);
+  assert.notEqual(failover.sources[0].id, first.sources[0].id);
+  assert.equal(searchCount, 1, "failover within 5m must reuse cached query candidates without re-searching indexer");
+
+  // 2. Concurrent worker guard: if another worker started the same (album, query) <6s ago,
+  //    yield pending without firing a parallel search or caching a premature negative result.
+  const kvInflight = new Map<string, string>();
+  let nowInfl = 1_760_000_000_000;
+  let inflSearches = 0;
+  const envInfl: HostEnv = {
+    ...env,
+    now: () => nowInfl,
+    kv: {
+      get: (k) => kvInflight.get(k) ?? null,
+      put: (k, v) => { kvInflight.set(k, v); },
+      delete: (k) => { kvInflight.delete(k); },
+      list: (p = "") => Array.from(kvInflight.keys()).filter((k) => k.startsWith(p)),
+    },
+    sources: {
+      resolve: (q) => {
+        if (q.kind === "indexer_search") {
+          inflSearches++;
+          return { candidates: [nzb1] };
+        }
+        return { candidates: [] };
+      },
+    },
+  };
+  const cacheInfl = new KVCache(envInfl);
+  cacheInfl.set("album_v2:al-302127", album, 24 * 60 * 60 * 1000);
+  // Simulate Worker 1 having written inflight 500ms ago (still running).
+  cacheInfl.set(
+    searchMemoKey(album.id, "Daft Punk Discovery"),
+    { status: "inflight", at: nowInfl - 500, rawCount: 0 },
+    5 * 60 * 1000
+  );
+  const resolverInfl = new AlbumResolver(
+    envInfl,
+    cacheInfl,
+    new MusicCatalog(envInfl, cacheInfl, new DeezerClient(envInfl, cacheInfl), new MusicBrainzClient(envInfl, cacheInfl), settings),
+    settings
+  );
+
+  const concurrent = resolverInfl.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(concurrent.pending, true, "concurrent worker must yield pending while primary search is in-flight");
+  assert.equal(inflSearches, 0, "concurrent worker must NOT launch parallel duplicate search");
+  assert.equal(cacheInfl.get(albumCacheKey(album.id)), null, "must not write negative cache while primary search is in-flight");
+
+  // 3. If Worker 1 timed out / died (>6s ago without updating memo), subsequent call does NOT
+  //    re-fire the same query within the 5m dedup window.
+  nowInfl += 10_000;
+  const afterTimeout = resolverInfl.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(afterTimeout.pending, undefined);
+  assert.equal(afterTimeout.sources.length, 0);
+  assert.equal(inflSearches, 0, "must not repeat timed-out search within 5m dedup window");
 });

@@ -1,7 +1,7 @@
 {
   "id": "ether.music",
   "name": "Music",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Curated music discovery, live catalogue search across artists, albums, tracks and video concerts, and playback through your Ether indexers and debrid sources.",
   "ether": {
     "protocol": 1,
