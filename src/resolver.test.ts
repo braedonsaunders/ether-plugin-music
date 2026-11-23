@@ -1,0 +1,1486 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import type {
+  CanonicalAlbum,
+  HostEnv,
+  KindItem,
+  KindResolveRequest,
+  SourceCandidate,
+  SourceQuery,
+} from "./types.ts";
+import { KVCache, isHostFaultOrAbort } from "./kv.ts";
+import { DeezerClient } from "./deezer.ts";
+import { MusicBrainzClient } from "./musicbrainz.ts";
+import { MusicCatalog } from "./catalog.ts";
+import { stripEditionSuffix, normalizeText } from "./normalize.ts";
+import {
+  AlbumResolver,
+  albumCacheKey,
+  buildArchiveTrackHint,
+  classifyReleaseQuality,
+  classifyVideoQuality,
+  expandReleaseFiles,
+  isUsenetCandidate,
+  matchAlbumReleaseFiles,
+  matchConcertReleaseFiles,
+  preScoreAlbumCandidate,
+  preScoreConcertCandidate,
+} from "./resolver.ts";
+import { buildConcertItem, getCuratedConcertById } from "./concerts.ts";
+import { isRejectedReleaseForRequest, parseTrackFilename } from "./normalize.ts";
+
+function makeFakeHost(opts: {
+  onResolve?: (q: SourceQuery) => { candidates?: SourceCandidate[] };
+  settings?: Record<string, unknown>;
+} = {}): { env: HostEnv; kvMap: Map<string, string>; calls: SourceQuery[] } {
+  const kvMap = new Map<string, string>();
+  const calls: SourceQuery[] = [];
+  let now = 1_760_000_000_000;
+  const env: HostEnv = {
+    now: () => now,
+    log: () => {},
+    kv: {
+      get: (k) => kvMap.get(k) ?? null,
+      put: (k, v) => { kvMap.set(k, v); },
+      delete: (k) => { kvMap.delete(k); },
+      list: (prefix = "") => Array.from(kvMap.keys()).filter((k) => k.startsWith(prefix)),
+    },
+    http: {
+      fetch: () => ({ status: 404, body: "" }),
+    },
+    settings: {
+      get: () => opts.settings || {},
+    },
+    sources: {
+      resolve: (q) => {
+        calls.push(q);
+        return opts.onResolve ? opts.onResolve(q) : { candidates: [] };
+      },
+    },
+  };
+  return { env, kvMap, calls };
+}
+
+function sampleDiscoveryAlbum(): CanonicalAlbum {
+  return {
+    id: "al-302127",
+    deezerAlbumId: 302127,
+    artistId: "ar-27",
+    deezerArtistId: 27,
+    artistName: "Daft Punk",
+    title: "Discovery",
+    releaseDate: "2001-03-07",
+    year: 2001,
+    releaseType: "album",
+    genres: ["Electronic"],
+    label: "Daft Life Ltd.",
+    fans: 345823,
+    durationSec: 1200,
+    trackCount: 4,
+    discCount: 1,
+    coverXL: "https://example.test/cover.jpg",
+    coverBig: "https://example.test/cover500.jpg",
+    curation: ["classic-album"],
+    tracks: [
+      { id: "tr-1", deezerTrackId: 1, title: "One More Time", disc: 1, trackNumber: 1, durationSec: 320, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-2", deezerTrackId: 2, title: "Aerodynamic", disc: 1, trackNumber: 2, durationSec: 212, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-3", deezerTrackId: 3, title: "Digital Love", disc: 1, trackNumber: 3, durationSec: 301, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-4", deezerTrackId: 4, title: "Harder, Better, Faster, Stronger", disc: 1, trackNumber: 4, durationSec: 224, explicit: false, artistName: "Daft Punk" },
+    ],
+  };
+}
+
+function trackItemFor(album: CanonicalAlbum, trackIdx: number): KindItem {
+  const tr = album.tracks[trackIdx];
+  return {
+    id: tr.id,
+    level: "track",
+    parentId: album.id,
+    index: trackIdx + 1,
+    title: tr.title,
+    playable: true,
+    year: album.year,
+    fields: {
+      artistName: album.artistName,
+      albumTitle: album.title,
+      duration: tr.durationSec,
+      disc: tr.disc,
+    },
+    hints: {
+      albumId: album.id,
+      deezerAlbumId: album.deezerAlbumId,
+      deezerTrackId: tr.deezerTrackId,
+      artistName: album.artistName,
+      albumTitle: album.title,
+      year: album.year,
+      releaseType: album.releaseType,
+      disc: tr.disc,
+      trackNumber: tr.trackNumber,
+      durationSec: tr.durationSec,
+    },
+  };
+}
+
+test("rejects compilations, discographies, live bootlegs, and tributes for studio albums", () => {
+  assert.equal(isRejectedReleaseForRequest("Daft Punk - Greatest Hits (2010) FLAC", "Discovery", "album").rejected, true);
+  assert.equal(isRejectedReleaseForRequest("Daft Punk - Complete Discography 1997-2013 FLAC", "Discovery", "album").rejected, true);
+  assert.equal(isRejectedReleaseForRequest("Daft Punk - Live at Bercy (2007) FLAC", "Discovery", "album").rejected, true);
+  assert.equal(isRejectedReleaseForRequest("Piano Tribute to Daft Punk - Discovery (2015) MP3", "Discovery", "album").rejected, true);
+  assert.equal(isRejectedReleaseForRequest("Daft Punk - Discovery (2001) [WEB FLAC]", "Discovery", "album").rejected, false);
+  // Genuine live album request should NOT reject live recordings
+  assert.equal(isRejectedReleaseForRequest("Daft Punk - Alive 2007 (Live at Bercy) FLAC", "Alive 2007 (Live)", "live").rejected, false);
+});
+
+test("quality preference ranks FLAC > ALAC/WAV > MP3 320 > lower lossy and obeys lossless_only", () => {
+  const flac = classifyReleaseQuality("Daft Punk - Discovery (2001) [WEB FLAC]", undefined, "flac_preferred");
+  const alac = classifyReleaseQuality("Daft Punk - Discovery (2001) [ALAC]", undefined, "flac_preferred");
+  const mp3 = classifyReleaseQuality("Daft Punk - Discovery (2001) [MP3 320]", undefined, "flac_preferred");
+  const low = classifyReleaseQuality("Daft Punk - Discovery (2001) [MP3 128]", undefined, "flac_preferred");
+  assert.ok(flac.points > alac.points);
+  assert.ok(alac.points > mp3.points);
+  assert.ok(mp3.points > low.points);
+
+  const mp3LosslessOnly = classifyReleaseQuality("Daft Punk - Discovery (2001) [MP3 320]", undefined, "lossless_only");
+  assert.ok(mp3LosslessOnly.points < 0);
+});
+
+test("parses single-disc and multi-disc track filenames cleanly", () => {
+  assert.deepEqual(
+    { disc: parseTrackFilename("01 - One More Time.flac").disc, track: parseTrackFilename("01 - One More Time.flac").track, title: parseTrackFilename("01 - One More Time.flac").titleGuess },
+    { disc: null, track: 1, title: "One More Time" }
+  );
+  const d2 = parseTrackFilename("CD2/2-03. Daft Punk - Digital Love.flac", 2);
+  assert.equal(d2.disc, 2);
+  assert.equal(d2.track, 3);
+  assert.equal(d2.titleGuess, "Digital Love");
+
+  const compact = parseTrackFilename("204 - Harder Better Faster Stronger.flac", 2);
+  assert.equal(compact.disc, 2);
+  assert.equal(compact.track, 4);
+});
+
+test("matchAlbumReleaseFiles maps tracks uniquely, ignores artwork/log/cue, and rejects mismatched track counts", () => {
+  const album = sampleDiscoveryAlbum();
+
+  // Exact album + non-audio extras (cover.jpg, album.log, album.cue, par2)
+  const goodFiles = [
+    { index: 0, path: "Discovery/cover.jpg", size: 120_000 },
+    { index: 1, path: "Discovery/01 - One More Time.flac", size: 36_800_000 },
+    { index: 2, path: "Discovery/02 - Aerodynamic.flac", size: 24_400_000 },
+    { index: 3, path: "Discovery/03 - Digital Love.flac", size: 34_600_000 },
+    { index: 4, path: "Discovery/04 - Harder, Better, Faster, Stronger.flac", size: 25_700_000 },
+    { index: 5, path: "Discovery/Discovery.cue", size: 2_048 },
+    { index: 6, path: "Discovery/Discovery.log", size: 4_096 },
+  ];
+  const res = matchAlbumReleaseFiles(album, "Daft Punk - Discovery (2001) [FLAC]", goodFiles, "flac_preferred");
+  assert.equal(res.matched, true);
+  assert.equal(res.tracks["tr-1"].fileIndex, 1);
+  assert.equal(res.tracks["tr-1"].mime, "audio/flac");
+  assert.equal(res.tracks["tr-3"].fileIndex, 3);
+  assert.equal(res.tracks["tr-4"].file, "Discovery/04 - Harder, Better, Faster, Stronger.flac");
+
+  // Incomplete release (missing track 4) must be rejected
+  const incomplete = matchAlbumReleaseFiles(album, "Daft Punk - Discovery (2001) FLAC", goodFiles.slice(0, 4), "flac_preferred");
+  assert.equal(incomplete.matched, false);
+  assert.match(incomplete.reason || "", /incomplete/i);
+
+  // Huge multi-album pack (20 files vs 4 expected) must be rejected
+  const hugePack = Array.from({ length: 20 }, (_, i) => ({
+    index: i,
+    path: `Discography/${String(i + 1).padStart(2, "0")} - Track ${i + 1}.flac`,
+    size: 25_000_000,
+  }));
+  const tooMany = matchAlbumReleaseFiles(album, "Daft Punk - Discovery FLAC", hugePack, "flac_preferred");
+  assert.equal(tooMany.matched, false);
+  assert.match(tooMany.reason || "", /mismatched track count/i);
+});
+
+test("matchAlbumReleaseFiles handles multi-disc albums accurately", () => {
+  const multi: CanonicalAlbum = {
+    ...sampleDiscoveryAlbum(),
+    id: "al-multi",
+    title: "The Wall",
+    artistName: "Pink Floyd",
+    year: 1979,
+    trackCount: 4,
+    discCount: 2,
+    tracks: [
+      { id: "tr-d1-1", deezerTrackId: 101, title: "In the Flesh?", disc: 1, trackNumber: 1, durationSec: 199, explicit: false, artistName: "Pink Floyd" },
+      { id: "tr-d1-2", deezerTrackId: 102, title: "The Thin Ice", disc: 1, trackNumber: 2, durationSec: 147, explicit: false, artistName: "Pink Floyd" },
+      { id: "tr-d2-1", deezerTrackId: 201, title: "Hey You", disc: 2, trackNumber: 1, durationSec: 280, explicit: false, artistName: "Pink Floyd" },
+      { id: "tr-d2-2", deezerTrackId: 202, title: "Comfortably Numb", disc: 2, trackNumber: 2, durationSec: 382, explicit: false, artistName: "Pink Floyd" },
+    ],
+  };
+
+  const files = [
+    { index: 0, path: "CD1/01 - In the Flesh.flac", size: 22_000_000 },
+    { index: 1, path: "CD1/02 - The Thin Ice.flac", size: 17_000_000 },
+    { index: 2, path: "CD2/01 - Hey You.flac", size: 32_000_000 },
+    { index: 3, path: "CD2/02 - Comfortably Numb.flac", size: 44_000_000 },
+  ];
+  const res = matchAlbumReleaseFiles(multi, "Pink Floyd - The Wall (1979) [2CD FLAC]", files, "flac_preferred");
+  assert.equal(res.matched, true);
+  assert.equal(res.tracks["tr-d1-1"].fileIndex, 0);
+  assert.equal(res.tracks["tr-d2-1"].fileIndex, 2);
+  assert.equal(res.tracks["tr-d2-2"].fileIndex, 3);
+});
+
+test("album-unit resolution resolves ONCE for track 1, prefers FLAC over MP3 320, and serves track 2..4 instantaneously from KV with failover", () => {
+  const album = sampleDiscoveryAlbum();
+  const flacCand: SourceCandidate = {
+    infoHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    title: "Daft Punk - Discovery (2001) [WEB FLAC]",
+    size: 130_000_000,
+    indexer: "Redacted",
+  };
+  const mp3Cand: SourceCandidate = {
+    nzbUrl: "https://nzb.test/discovery-mp3.nzb",
+    title: "Daft Punk - Discovery (2001) [MP3 320]",
+    size: 42_000_000,
+    indexer: "NZBgeek",
+  };
+  const compCand: SourceCandidate = {
+    infoHash: "cccccccccccccccccccccccccccccccccccccccc",
+    title: "Daft Punk - Greatest Hits (2010) [FLAC]",
+    size: 200_000_000,
+    indexer: "Tracker",
+  };
+
+  const { env, calls } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") {
+        assert.equal(q.category, "3000,3010,3040");
+        return { candidates: [compCand, mp3Cand, flacCand] };
+      }
+      if (q.kind === "debrid_check") {
+        return {
+          candidates: (q.infoHashes || []).map((h) => ({ infoHash: h, cached: h === flacCand.infoHash })),
+        };
+      }
+      if (q.kind === "release_files") {
+        if (q.candidate?.infoHash === flacCand.infoHash) {
+          return {
+            candidates: [{
+              ...flacCand,
+              cached: true,
+              files: [
+                { index: 0, path: "01 - One More Time.flac", size: 36_800_000 },
+                { index: 1, path: "02 - Aerodynamic.flac", size: 24_400_000 },
+                { index: 2, path: "03 - Digital Love.flac", size: 34_600_000 },
+                { index: 3, path: "04 - Harder, Better, Faster, Stronger.flac", size: 25_700_000 },
+              ],
+            }],
+          };
+        }
+        if (q.candidate?.nzbUrl === mp3Cand.nzbUrl) {
+          return {
+            candidates: [{
+              ...mp3Cand,
+              files: [
+                { index: 0, path: "01. One More Time.mp3", size: 12_800_000 },
+                { index: 1, path: "02. Aerodynamic.mp3", size: 8_400_000 },
+                { index: 2, path: "03. Digital Love.mp3", size: 12_000_000 },
+                { index: 3, path: "04. Harder Better Faster Stronger.mp3", size: 8_900_000 },
+              ],
+            }],
+          };
+        }
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  // 1. Track 1 cold resolve completes album-unit resolution on first call when fast (preferring FLAC!)
+  const req1: KindResolveRequest = { item: trackItemFor(album, 0) };
+  const hot1 = resolver.resolve(req1);
+  assert.equal(hot1.pending, undefined);
+  assert.ok(hot1.sources.length >= 1);
+  assert.equal(hot1.sources[0].mime, "audio/flac");
+  assert.equal(hot1.sources[0].release?.fileIndex, 0);
+  assert.equal(hot1.sources[0].release?.file, "01 - One More Time.flac");
+  const callsAfterCold = calls.length;
+
+  // 2. Track 3 plays immediately from the SAME cached album release with ZERO source queries!
+  const hot3 = resolver.resolve({ item: trackItemFor(album, 2) });
+  assert.equal(hot3.pending, undefined);
+  assert.equal(hot3.sources[0].mime, "audio/flac");
+  assert.equal(hot3.sources[0].release?.fileIndex, 2);
+  assert.equal(hot3.sources[0].release?.file, "03 - Digital Love.flac");
+  assert.equal(calls.length, callsAfterCold);
+
+  // 3. Failover: if FLAC release is excluded by client, automatically yields MP3 320 release!
+  const failover = resolver.resolve({
+    item: trackItemFor(album, 2),
+    client: { exclude: [hot3.sources[0].id] },
+  });
+  assert.equal(failover.sources.length, 1);
+  assert.equal(failover.sources[0].mime, "audio/mpeg");
+  assert.equal(failover.sources[0].size, undefined);
+  assert.equal(failover.sources[0].release?.fileIndex, 2);
+  assert.equal(failover.sources[0].release?.file, "03. Digital Love.mp3");
+});
+
+test("preScoreAlbumCandidate rejects uncached torrents & honors compilation guard", () => {
+  const album = { artistName: "Daft Punk", title: "Discovery", year: 2001, releaseType: "album" as const, durationSec: 3662 };
+  const good = preScoreAlbumCandidate(
+    { title: "Daft Punk - Discovery (2001) [WEB FLAC]", cached: true, infoHash: "abc", size: 420_000_000 },
+    album,
+    "flac_preferred"
+  );
+  assert.equal(good.accepted, true);
+
+  const wrongArtist = preScoreAlbumCandidate(
+    { title: "Mike Oldfield - Discovery (1984) [FLAC]", cached: true, infoHash: "def", size: 300_000_000 },
+    album,
+    "flac_preferred"
+  );
+  assert.equal(wrongArtist.accepted, false);
+});
+
+test("isUsenetCandidate accepts real NZB candidates and rejects Cardigann torrent URLs", () => {
+  assert.equal(
+    isUsenetCandidate({
+      nzbUrl: "https://api.nzbgeek.info/api?t=get&id=abc123",
+      indexer: "NZBgeek",
+      title: "Miles Davis - Kind of Blue (1959) [FLAC]",
+    }),
+    true
+  );
+  assert.equal(
+    isUsenetCandidate({
+      nzbUrl: "https://www.limetorrents.fun/Miles-Davis-torrent-19999846.html",
+      indexer: "LimeTorrents",
+      seeders: 12,
+      title: "Miles Davis - Kind of Blue (1959) [FLAC]",
+    }),
+    false
+  );
+  assert.equal(
+    isUsenetCandidate({
+      nzbUrl: "https://example.org/download.torrent",
+      indexer: "SomeIndexer",
+      seeders: 4,
+      title: "Daft Punk - Discovery (2001) [FLAC]",
+    }),
+    false
+  );
+});
+
+test("stripEditionSuffix strips ordinal anniversary and reissue tags", () => {
+  assert.equal(stripEditionSuffix("Back To Black (20th Anniversary Edition)"), "Back To Black");
+  assert.equal(stripEditionSuffix("OK Computer (25th Anniversary Super Deluxe)"), "OK Computer");
+  assert.equal(stripEditionSuffix("1 (Remastered 2015)"), "1");
+  assert.equal(stripEditionSuffix("Rumours - 35th Anniversary Deluxe Edition"), "Rumours");
+  assert.equal(stripEditionSuffix("72 Seasons"), "72 Seasons");
+  assert.equal(normalizeText("Lux Æterna"), "lux aeterna");
+  assert.equal(normalizeText("Tool - Ænima"), "tool aenima");
+});
+
+test("matchAlbumReleaseFiles allows standard edition FLAC for expanded Anniversary editions", () => {
+  const expanded: CanonicalAlbum = {
+    id: "al-1122870082",
+    deezerAlbumId: 1122870082,
+    artistId: "ar-9052",
+    deezerArtistId: 9052,
+    artistName: "Amy Winehouse",
+    title: "Back To Black (20th Anniversary Edition)",
+    releaseDate: "2026-10-30",
+    year: 2026,
+    releaseType: "album",
+    genres: ["Soul"],
+    label: "Island",
+    fans: 100000,
+    durationSec: 6000,
+    trackCount: 16,
+    discCount: 2,
+    coverXL: "",
+    coverBig: "",
+    curation: [],
+    tracks: [
+      { id: "tr-1", deezerTrackId: 1, disc: 1, trackNumber: 1, title: "Rehab", artistName: "Amy Winehouse", durationSec: 214, explicit: false, rank: 900000 },
+      { id: "tr-2", deezerTrackId: 2, disc: 1, trackNumber: 2, title: "You Know I'm No Good", artistName: "Amy Winehouse", durationSec: 257, explicit: false, rank: 800000 },
+      { id: "tr-3", deezerTrackId: 3, disc: 1, trackNumber: 3, title: "Me & Mr Jones", artistName: "Amy Winehouse", durationSec: 153, explicit: false, rank: 700000 },
+      { id: "tr-4", deezerTrackId: 4, disc: 1, trackNumber: 4, title: "Just Friends", artistName: "Amy Winehouse", durationSec: 193, explicit: false, rank: 600000 },
+      { id: "tr-5", deezerTrackId: 5, disc: 1, trackNumber: 5, title: "Back To Black", artistName: "Amy Winehouse", durationSec: 241, explicit: false, rank: 950000 },
+      { id: "tr-6", deezerTrackId: 6, disc: 1, trackNumber: 6, title: "Love Is A Losing Game", artistName: "Amy Winehouse", durationSec: 155, explicit: false, rank: 850000 },
+      { id: "tr-7", deezerTrackId: 7, disc: 1, trackNumber: 7, title: "Tears Dry On Their Own", artistName: "Amy Winehouse", durationSec: 186, explicit: false, rank: 820000 },
+      { id: "tr-8", deezerTrackId: 8, disc: 1, trackNumber: 8, title: "Wake Up Alone", artistName: "Amy Winehouse", durationSec: 222, explicit: false, rank: 650000 },
+      { id: "tr-9", deezerTrackId: 9, disc: 1, trackNumber: 9, title: "Some Unholy War", artistName: "Amy Winehouse", durationSec: 142, explicit: false, rank: 610000 },
+      { id: "tr-10", deezerTrackId: 10, disc: 1, trackNumber: 10, title: "He Can Only Hold Her", artistName: "Amy Winehouse", durationSec: 166, explicit: false, rank: 600000 },
+      { id: "tr-11", deezerTrackId: 11, disc: 2, trackNumber: 1, title: "Rehab (Demo Version)", artistName: "Amy Winehouse", durationSec: 210, explicit: false, rank: 300000 },
+      { id: "tr-12", deezerTrackId: 12, disc: 2, trackNumber: 2, title: "Back To Black (Demo)", artistName: "Amy Winehouse", durationSec: 240, explicit: false, rank: 300000 },
+      { id: "tr-13", deezerTrackId: 13, disc: 2, trackNumber: 3, title: "Love Is A Losing Game (Live)", artistName: "Amy Winehouse", durationSec: 160, explicit: false, rank: 300000 },
+      { id: "tr-14", deezerTrackId: 14, disc: 2, trackNumber: 4, title: "Tears Dry (Live)", artistName: "Amy Winehouse", durationSec: 190, explicit: false, rank: 300000 },
+      { id: "tr-15", deezerTrackId: 15, disc: 2, trackNumber: 5, title: "Valerie (Live)", artistName: "Amy Winehouse", durationSec: 220, explicit: false, rank: 300000 },
+      { id: "tr-16", deezerTrackId: 16, disc: 2, trackNumber: 6, title: "Monkey Man", artistName: "Amy Winehouse", durationSec: 175, explicit: false, rank: 300000 },
+    ],
+  };
+
+  const standardFiles = expanded.tracks.slice(0, 10).map((t, i) => ({
+    index: i,
+    path: `Amy Winehouse - Back To Black/${String(i + 1).padStart(2, "0")} - ${t.title}.flac`,
+    size: 25_000_000,
+  }));
+  const res = matchAlbumReleaseFiles(expanded, "Amy Winehouse - Back To Black (2006) [FLAC]", standardFiles);
+  assert.equal(res.matched, true);
+  assert.equal(res.partial, true);
+  assert.equal(res.tracks["tr-1"].fileIndex, 0);
+  assert.equal(res.tracks["tr-5"].fileIndex, 4);
+
+  // Tiny 3-track sample is STILL rejected even on an Anniversary edition.
+  const tiny = matchAlbumReleaseFiles(expanded, "Amy Winehouse - Back To Black [FLAC]", standardFiles.slice(0, 3));
+  assert.equal(tiny.matched, false);
+});
+
+test("AlbumResolver probes cached Debrid FLAC before 6 Usenet RAR posts", () => {
+  const album = sampleDiscoveryAlbum();
+  const rarPosts: SourceCandidate[] = Array.from({ length: 6 }, (_, i) => ({
+    title: `Daft Punk - Discovery (2001) [24BIT-96kHz WEB-FLAC] Release${i}`,
+    indexer: "NinjaCentral",
+    nzbUrl: `https://ninjacentral.co.za/getnzb/rar-${i}.nzb`,
+    size: 1_200_000_000,
+  }));
+  const debridFlac: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [16bit FLAC]",
+    indexer: "TorrentGalaxy",
+    infoHash: "feedface1234567890abcdef1234567890abcdef",
+    size: 420_000_000,
+  };
+
+  const probedRefs: string[] = [];
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [...rarPosts, debridFlac] };
+      if (q.kind === "debrid_check") {
+        return {
+          candidates: (q.infoHashes || []).map((h) => ({ infoHash: h, cached: h === debridFlac.infoHash })),
+        };
+      }
+      if (q.kind === "release_files") {
+        const cand = q.candidate!;
+        probedRefs.push(cand.infoHash || cand.nzbUrl || "");
+        if (cand.infoHash === debridFlac.infoHash) {
+          return {
+            candidates: [
+              {
+                ...debridFlac,
+                cached: true,
+                files: album.tracks.map((t, idx) => ({
+                  index: idx,
+                  path: `${String(idx + 1).padStart(2, "0")} - ${t.title}.flac`,
+                  size: 30_000_000,
+                })),
+              },
+            ],
+          };
+        }
+        return {
+          candidates: [
+            {
+              ...cand,
+              files: [{ index: 0, path: "Daft.Punk.part01.rar", size: 50_000_000 }],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(res.pending, undefined);
+  assert.ok(res.sources.length >= 1);
+  assert.equal(res.sources[0].release?.candidate?.infoHash, debridFlac.infoHash);
+  assert.equal(probedRefs[0], debridFlac.infoHash);
+});
+
+test("AlbumResolver deduplicates scene Usenet reposts and prefers unpacked P2P FLAC", () => {
+  const album = sampleDiscoveryAlbum();
+  const dupScene: SourceCandidate[] = Array.from({ length: 4 }, (_, i) => ({
+    title: "Daft Punk-Discovery-24BIT-WEB-FLAC-2001-MOONBLOOD",
+    indexer: "NinjaCentral",
+    nzbUrl: `https://ninjacentral.co.za/getnzb/scene-${i}.nzb`,
+    size: 1_200_000_000 + i * 1000,
+  }));
+  const p2pFlac: SourceCandidate = {
+    title: "Daft Punk - Discovery 2001 [24Bit-48kHz] FLAC [PMEDIA]",
+    indexer: "NinjaCentral",
+    nzbUrl: "https://ninjacentral.co.za/getnzb/pmedia-unpacked.nzb",
+    size: 900_000_000,
+  };
+
+  const probedUrls: string[] = [];
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [...dupScene, p2pFlac] };
+      if (q.kind === "release_files") {
+        const cand = q.candidate!;
+        probedUrls.push(cand.nzbUrl || "");
+        if (cand.nzbUrl === p2pFlac.nzbUrl) {
+          return {
+            candidates: [
+              {
+                ...p2pFlac,
+                files: album.tracks.map((t, idx) => ({
+                  index: idx,
+                  path: `${String(idx + 1).padStart(2, "0")}. ${t.title}.flac`,
+                  size: 32_000_000,
+                })),
+              },
+            ],
+          };
+        }
+        return {
+          candidates: [
+            {
+              ...cand,
+              files: [{ index: 0, path: "release.part01.rar", size: 50_000_000 }],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(res.pending, undefined);
+  assert.equal(probedUrls[0], p2pFlac.nzbUrl);
+  assert.equal(res.sources[0].release?.candidate?.nzbUrl, p2pFlac.nzbUrl);
+  // All 4 identical scene titles deduplicated to at most 1 probe.
+  assert.ok(probedUrls.filter((u) => u.includes("scene-")).length <= 1);
+});
+
+test("AlbumResolver uses usenet_check to drop dead and playbackFailed NZBs before offering", () => {
+  const album = sampleDiscoveryAlbum();
+  const deadFlac: SourceCandidate = {
+    title: "Daft Punk - Discovery 2001 [24Bit-96kHz] FLAC [PMEDIA]",
+    indexer: "NinjaCentral",
+    nzbUrl: "https://ninjacentral.co.za/getnzb/dead-articles.nzb",
+    size: 1_100_000_000,
+  };
+  const failedRar: SourceCandidate = {
+    title: "Daft Punk-Discovery-24BIT-WEB-FLAC-2001-MOONBLOOD",
+    indexer: "NinjaCentral",
+    nzbUrl: "https://ninjacentral.co.za/getnzb/failed-rar.nzb",
+    size: 1_200_000_000,
+  };
+  const healthyFlac: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    indexer: "NZBgeek",
+    nzbUrl: "https://api.nzbgeek.info/api?t=get&id=healthy123",
+    size: 430_000_000,
+  };
+
+  const checkedUrls: string[] = [];
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [deadFlac, failedRar, healthyFlac] };
+      if (q.kind === "release_files") {
+        const cand = q.candidate!;
+        if (cand.nzbUrl === failedRar.nzbUrl) {
+          return { candidates: [{ ...cand, files: [{ index: 0, path: "album.part01.rar", size: 50_000_000 }] }] };
+        }
+        return {
+          candidates: [
+            {
+              ...cand,
+              files: album.tracks.map((t, idx) => ({
+                index: idx,
+                path: `${String(idx + 1).padStart(2, "0")} - ${t.title}.flac`,
+                size: 30_000_000,
+              })),
+            },
+          ],
+        };
+      }
+      if (q.kind === "usenet_check") {
+        const u = q.nzbUrl || q.candidate?.nzbUrl || "";
+        checkedUrls.push(u);
+        if (u === deadFlac.nzbUrl) {
+          return {
+            candidates: [
+              {
+                ...deadFlac,
+                usenetCheck: { available: false, checked: 32, missing: 12, reason: "articles_missing" },
+              },
+            ],
+          };
+        }
+        if (u === failedRar.nzbUrl) {
+          return {
+            candidates: [
+              {
+                ...failedRar,
+                usenetCheck: {
+                  available: false,
+                  checked: 0,
+                  missing: 1,
+                  cached: true,
+                  playbackFailed: true,
+                  reason: "playback_article_missing",
+                },
+              },
+            ],
+          };
+        }
+        return {
+          candidates: [
+            {
+              ...healthyFlac,
+              usenetCheck: { available: true, checked: 32, missing: 0, cached: false },
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(res.pending, undefined);
+  assert.equal(res.sources.length, 1);
+  assert.equal(res.sources[0].release?.candidate?.nzbUrl, healthyFlac.nzbUrl);
+  assert.ok(checkedUrls.includes(deadFlac.nzbUrl!));
+  assert.ok(checkedUrls.includes(healthyFlac.nzbUrl!));
+});
+
+test("AlbumResolver degrades gracefully when usenet_check is unavailable or rate-limited and skips it in background jobs", () => {
+  const album = sampleDiscoveryAlbum();
+  const nzbFlac: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    indexer: "NZBgeek",
+    nzbUrl: "https://api.nzbgeek.info/api?t=get&id=compat123",
+    size: 430_000_000,
+  };
+
+  let checkCalls = 0;
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [nzbFlac] };
+      if (q.kind === "release_files") {
+        return {
+          candidates: [
+            {
+              ...nzbFlac,
+              files: album.tracks.map((t, idx) => ({
+                index: idx,
+                path: `${String(idx + 1).padStart(2, "0")} - ${t.title}.flac`,
+                size: 30_000_000,
+              })),
+            },
+          ],
+        };
+      }
+      if (q.kind === "usenet_check") {
+        checkCalls++;
+        throw new Error("rate_limited: 429");
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  // 1. Background job must never invoke usenet_check.
+  const jobRes = resolver.runAlbumResolveJob({ item: trackItemFor(album, 0) });
+  assert.equal(jobRes.verifiedCount, 1);
+  assert.equal(checkCalls, 0);
+
+  // 2. Interactive resolve tolerates host error/429 and still offers the verified release.
+  cache.delete(albumCacheKey("al-302127"));
+  const liveRes = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(liveRes.sources.length, 1);
+  assert.equal(liveRes.sources[0].release?.candidate?.nzbUrl, nzbFlac.nzbUrl);
+  assert.equal(checkCalls, 1);
+});
+
+test("classifyVideoQuality ranks 4K HDR > 1080p BluRay > 720p > DVD and respects 1080p_preferred", () => {
+  const uhd = classifyVideoQuality("Stop.Making.Sense.1984.2160p.UHD.BluRay.HDR10.Atmos.x265", undefined, "uhd_preferred");
+  const hd = classifyVideoQuality("Stop.Making.Sense.1984.1080p.BluRay.DTS-HD.MA.5.1.x264", undefined, "uhd_preferred");
+  const p720 = classifyVideoQuality("Stop.Making.Sense.1984.720p.WEB-DL.x264", undefined, "uhd_preferred");
+  const dvd = classifyVideoQuality("Stop.Making.Sense.1984.DVDRip.x264", undefined, "uhd_preferred");
+  assert.equal(uhd.tier, "uhd");
+  assert.equal(hd.tier, "1080p");
+  assert.ok(uhd.points > hd.points && hd.points > p720.points && p720.points > dvd.points);
+
+  const hdPref = classifyVideoQuality("Stop.Making.Sense.1984.1080p.BluRay.x264", undefined, "1080p_preferred");
+  const uhdUnder1080 = classifyVideoQuality("Stop.Making.Sense.1984.2160p.BluRay.x265", undefined, "1080p_preferred");
+  assert.ok(hdPref.points > uhdUnder1080.points);
+});
+
+test("preScoreConcertCandidate rejects audio-only rips, accepts acronym/BluRay+FLAC, and matches standalone titles", () => {
+  const pulse = {
+    artistName: "Pink Floyd",
+    title: "P.U.L.S.E. Live at Earls Court",
+    year: 1995,
+    filmedYear: 1994,
+    standaloneTitle: false,
+  };
+  // Audio-only FLAC must be rejected for video concerts!
+  const audioOnly = preScoreConcertCandidate(
+    { title: "Pink Floyd - P.U.L.S.E. (1995) [FLAC]", cached: true, size: 950_000_000 },
+    pulse
+  );
+  assert.equal(audioOnly.accepted, false);
+
+  // Blu-ray video release with FLAC 5.1 audio track must be ACCEPTED (and acronym P.U.L.S.E. == PULSE).
+  const blurayWithFlac = preScoreConcertCandidate(
+    { title: "Pink.Floyd.PULSE.1995.1080p.BluRay.FLAC.5.1.x264-GROUP", cached: true, size: 12_000_000_000 },
+    pulse
+  );
+  assert.equal(blurayWithFlac.accepted, true);
+  assert.ok(blurayWithFlac.score > 90);
+
+  // Standalone theatrical concert film without artist name in release title must match!
+  const sms = {
+    artistName: "Talking Heads",
+    title: "Stop Making Sense",
+    year: 1984,
+    filmedYear: 1983,
+    standaloneTitle: true,
+  };
+  const smsUhd = preScoreConcertCandidate(
+    { title: "Stop.Making.Sense.1984.2160p.UHD.BluRay.HDR.Atmos.x265", cached: true, size: 18_500_000_000 },
+    sms
+  );
+  assert.equal(smsUhd.accepted, true);
+
+  // Generic concert title without matching artist must be rejected!
+  const wembley = {
+    artistName: "Queen",
+    title: "Live at Wembley Stadium",
+    year: 1986,
+    filmedYear: 1986,
+    standaloneTitle: false,
+  };
+  const wrongArtist = preScoreConcertCandidate(
+    { title: "Foo.Fighters.Live.at.Wembley.Stadium.2008.1080p.BluRay.x264", cached: true, size: 9_000_000_000 },
+    wembley
+  );
+  assert.equal(wrongArtist.accepted, false);
+});
+
+test("matchConcertReleaseFiles picks main feature video and ignores samples, extras, and audio-only packs", () => {
+  const mixed = matchConcertReleaseFiles("Stop.Making.Sense.1984.2160p.BluRay.x265", [
+    { index: 0, path: "Stop Making Sense/Sample/sample.mkv", size: 80_000_000 },
+    { index: 1, path: "Stop Making Sense/Extras/Bonus Interview.mkv", size: 650_000_000 },
+    { index: 2, path: "Stop Making Sense/Stop.Making.Sense.1984.2160p.mkv", size: 16_400_000_000 },
+    { index: 3, path: "Stop Making Sense/soundtrack.flac", size: 420_000_000 },
+  ]);
+  assert.equal(mixed.matched, true);
+  assert.equal(mixed.file?.index, 2);
+  assert.equal(mixed.quality.mime, "video/x-matroska");
+
+  const audioPack = matchConcertReleaseFiles("Pink Floyd - Pulse", [
+    { index: 0, path: "01 - Shine On.flac", size: 70_000_000 },
+    { index: 1, path: "02 - Learning to Fly.flac", size: 55_000_000 },
+  ]);
+  assert.equal(audioPack.matched, false);
+});
+
+test("AlbumResolver resolves video concerts via concertNewznabCategories, drops dead Usenet, and caches verified MKV", () => {
+  const curated = getCuratedConcertById("co-talking-heads-stop-making-sense")!;
+  assert.ok(curated);
+  const concertItem = buildConcertItem(curated);
+
+  const audioDecoy: SourceCandidate = {
+    title: "Talking Heads - Stop Making Sense (1984) [FLAC]",
+    infoHash: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+    size: 520_000_000,
+    cached: true,
+  };
+  const deadUsenet: SourceCandidate = {
+    title: "Stop.Making.Sense.1984.2160p.UHD.BluRay.x265",
+    indexer: "NZBgeek",
+    nzbUrl: "https://api.nzbgeek.info/api?t=get&id=dead-concert",
+    size: 19_000_000_000,
+  };
+  const cachedDebrid: SourceCandidate = {
+    title: "Stop.Making.Sense.1984.1080p.BluRay.DTS-HD.MA.5.1.x264",
+    infoHash: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+    size: 11_200_000_000,
+  };
+
+  let searchCalls = 0;
+  let lastCategory = "";
+  let firstSearchQuery: SourceQuery | null = null;
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") {
+        searchCalls++;
+        if (!firstSearchQuery) firstSearchQuery = q;
+        lastCategory = q.category || "";
+        return { candidates: [audioDecoy, deadUsenet, cachedDebrid] };
+      }
+      if (q.kind === "debrid_check") {
+        return { candidates: [{ infoHash: cachedDebrid.infoHash, cached: true }] };
+      }
+      if (q.kind === "release_files") {
+        if (q.infoHash === cachedDebrid.infoHash) {
+          return {
+            candidates: [
+              {
+                ...cachedDebrid,
+                cached: true,
+                files: [
+                  { index: 0, path: "Sample/sample.mkv", size: 60_000_000 },
+                  { index: 1, path: "Stop.Making.Sense.1984.1080p.BluRay.mkv", size: 11_100_000_000 },
+                ],
+              },
+            ],
+          };
+        }
+        return {
+          candidates: [
+            {
+              ...deadUsenet,
+              files: [{ index: 0, path: "Stop.Making.Sense.1984.2160p.mkv", size: 18_900_000_000 }],
+            },
+          ],
+        };
+      }
+      if (q.kind === "usenet_check") {
+        return {
+          candidates: [
+            { ...deadUsenet, usenetCheck: { available: false, checked: 32, missing: 32, reason: "dmca" } },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const first = resolver.resolve({ item: concertItem });
+  assert.equal(first.pending, undefined);
+  assert.equal(lastCategory, "2000,2040,2045,3020,5000");
+  assert.equal(firstSearchQuery?.firstResults, true);
+  assert.equal(firstSearchQuery?.settleMs, 300);
+  assert.equal(firstSearchQuery?.timeoutMs, 2500);
+  assert.equal(first.sources.length, 1);
+  assert.equal(first.sources[0].mime, "video/x-matroska");
+  assert.equal(first.sources[0].release?.fileIndex, 1);
+  assert.match(first.sources[0].label || "", /1080p.*Debrid/);
+
+  // Second call hits KV cache with zero indexer searches.
+  const callsAfterFirst = searchCalls;
+  const second = resolver.resolve({ item: concertItem });
+  assert.equal(second.sources.length, 1);
+  assert.equal(searchCalls, callsAfterFirst);
+});
+
+test("isHostFaultOrAbort propagates fatal lifecycle faults and allows non-fatal structured faults (like usenet_check invalid_input) to degrade cleanly", () => {
+  // Fatal faults MUST propagate.
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"timeout","message":"timed out"}')), true);
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"governance","message":"budget"}')), true);
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"aborted","message":"stop"}')), true);
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"deadline_exceeded","message":"deadline"}')), true);
+  assert.equal(isHostFaultOrAbort(new Error("__ETHER_FAULT__")), true);
+  assert.equal(isHostFaultOrAbort(Object.assign(new Error("aborted"), { name: "AbortError" })), true);
+
+  // Non-fatal host faults MUST be catchable so optional queries (usenet_check, enrichment) degrade gracefully.
+  assert.equal(
+    isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"invalid_input","message":"unknown source query kind \\"usenet_check\\""}')),
+    false
+  );
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"rate_limited","message":"429"}')), false);
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"host_error","message":"dns failed"}')), false);
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"upstream","message":"503"}')), false);
+  assert.equal(isHostFaultOrAbort(new Error('__ETHER_FAULT__{"code":"check_dependency","message":"offline"}')), false);
+
+  // End-to-end check: concert Usenet resolve survives Ether throwing __ETHER_FAULT__ invalid_input on usenet_check.
+  const kv = new Map<string, string>();
+  const env: HostEnv = {
+    now: () => 20_000,
+    log: () => {},
+    kv: {
+      get: (k) => kv.get(k) ?? null,
+      put: (k, v) => { kv.set(k, v); },
+      delete: (k) => { kv.delete(k); },
+      list: (p = "") => Array.from(kv.keys()).filter((k) => k.startsWith(p)),
+    },
+    http: { fetch: () => ({ status: 200, headers: {}, body: "{}" }) },
+    settings: { get: () => ({}) },
+    sources: {
+      resolve: (q: SourceQuery) => {
+        if (q.kind === "indexer_search") {
+          return {
+            candidates: [
+              {
+                id: "nzb-c1",
+                title: "Talking.Heads.Stop.Making.Sense.1984.1080p.BluRay.x264-GRP",
+                protocol: "usenet",
+                nzbUrl: "https://indexer.example/nzb/c1",
+                indexer: "NZBgeek",
+                size: 8_200_000_000,
+                seeders: 0,
+                cached: false,
+              },
+            ],
+          };
+        }
+        if (q.kind === "usenet_check") {
+          const e = new Error('__ETHER_FAULT__{"code":"invalid_input","message":"unknown source query kind \\"usenet_check\\""}');
+          (e as { code?: string }).code = "invalid_input";
+          throw e;
+        }
+        if (q.kind === "release_files") {
+          return {
+            candidates: [
+              {
+                id: "nzb-c1",
+                nzbUrl: "https://indexer.example/nzb/c1",
+                files: [
+                  { index: 0, path: "Talking.Heads.Stop.Making.Sense.1984.1080p.BluRay.mkv", size: 8_100_000_000 },
+                ],
+              },
+            ],
+          };
+        }
+        return { candidates: [] };
+      },
+    },
+  };
+  const cache = new KVCache(env);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({
+    item: {
+      id: "co-talking-heads-stop-making-sense-1984",
+      level: "concert",
+      parent: "ar-230",
+      title: "Stop Making Sense",
+      year: 1984,
+      fields: { artist: "Talking Heads", venue: "Pantages Theatre, Hollywood", imdbId: "tt0088178" },
+    },
+  });
+  assert.equal(res.sources.length, 1);
+  assert.equal(res.sources[0].mime, "video/x-matroska");
+  assert.equal(res.sources[0].release?.candidate?.nzbUrl, "https://indexer.example/nzb/c1");
+});
+
+test("Issue #753: RAR/ZIP archive with release_files.members expands exact inner member path into fileHint only", () => {
+  const album: CanonicalAlbum = {
+    id: "al-753001",
+    deezerAlbumId: 753001,
+    artistId: "ar-259",
+    deezerArtistId: 259,
+    artistName: "Michael Jackson",
+    title: "HIStory: Past, Present and Future, Book I",
+    releaseDate: "1995-06-16",
+    year: 1995,
+    releaseType: "album",
+    genres: ["Pop"],
+    label: "Epic",
+    fans: 1_200_000,
+    durationSec: 1200,
+    trackCount: 4,
+    discCount: 2,
+    coverXL: "",
+    coverBig: "",
+    curation: [],
+    tracks: [
+      { id: "tr-7531", deezerTrackId: 7531, title: "Billie Jean", disc: 1, trackNumber: 1, durationSec: 294, explicit: false, artistName: "Michael Jackson" },
+      { id: "tr-7532", deezerTrackId: 7532, title: "Beat It", disc: 1, trackNumber: 2, durationSec: 258, explicit: false, artistName: "Michael Jackson" },
+      { id: "tr-7533", deezerTrackId: 7533, title: "Scream (feat. Janet Jackson)", disc: 2, trackNumber: 1, durationSec: 278, explicit: false, artistName: "Michael Jackson" },
+      { id: "tr-7534", deezerTrackId: 7534, title: "They Don't Care About Us", disc: 2, trackNumber: 2, durationSec: 284, explicit: false, artistName: "Michael Jackson" },
+    ],
+  };
+
+  const rarCand: SourceCandidate = {
+    title: "Michael.Jackson-HIStory.Past.Present.and.Future.Book.I-1995-FLAC-GRP",
+    nzbUrl: "https://indexer.example/nzb/mj-rar",
+    indexer: "NZBgeek",
+    size: 160_000_000,
+  };
+
+  const zipCand: SourceCandidate = {
+    title: "Michael.Jackson-HIStory.Past.Present.and.Future.Book.I-1995-MP3-320-GRP",
+    nzbUrl: "https://indexer.example/nzb/mj-zip",
+    indexer: "NZBgeek",
+    size: 48_000_000,
+  };
+
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") {
+        return { candidates: [rarCand, zipCand] };
+      }
+      if (q.kind === "usenet_check") {
+        return { candidates: [{ nzbUrl: q.nzbUrl, usenetCheck: { available: true, checked: 4, missing: 0 } }] };
+      }
+      if (q.kind === "release_files") {
+        if (q.candidate?.nzbUrl === rarCand.nzbUrl) {
+          return {
+            candidates: [
+              {
+                ...rarCand,
+                files: [
+                  { index: 0, path: "release.nfo", size: 1200 },
+                  {
+                    index: 1,
+                    path: "mj-history.part01.rar",
+                    size: 80_000_000,
+                    members: [
+                      { index: 0, path: "CD1/01 - Michael Jackson - Billie Jean.flac", size: 32_000_000, stored: true },
+                      { index: 1, path: "CD1/02 - Michael Jackson - Beat It.flac", size: 28_000_000, stored: true },
+                      { index: 2, path: "CD2/01 - Michael Jackson - Scream.flac", size: 31_000_000, stored: true },
+                      { index: 3, path: "CD2/02 - Michael Jackson - They Don't Care About Us.flac", size: 33_000_000, stored: true },
+                      { index: 4, path: "cover.jpg", size: 250_000, stored: true },
+                    ],
+                  },
+                  { index: 2, path: "mj-history.part02.rar", size: 80_000_000 },
+                ],
+              },
+            ],
+          };
+        }
+        return {
+          candidates: [
+            {
+              ...zipCand,
+              files: [
+                {
+                  index: 0,
+                  path: "mj-history-mp3.zip",
+                  size: 48_000_000,
+                  members: [
+                    { index: 0, path: "Disc 1/01. Billie Jean.mp3", size: 11_700_000, stored: false },
+                    { index: 1, path: "Disc 1/02. Beat It.mp3", size: 10_300_000, stored: false },
+                    { index: 2, path: "Disc 2/01. Scream.mp3", size: 11_100_000, stored: false },
+                    { index: 3, path: "Disc 2/02. They Don't Care About Us.mp3", size: 11_400_000, stored: false },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-753001", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 3) });
+  assert.equal(res.sources.length, 2);
+
+  // First source: FLAC RAR expanded archive member -> exact inner member path as fileHint ONLY.
+  const s0 = res.sources[0];
+  assert.equal(s0.mime, "audio/flac");
+  assert.match(s0.label || "", /FLAC.*Usenet Archive/);
+  assert.equal(s0.release?.fileHint, "CD2/02 - Michael Jackson - They Don't Care About Us.flac");
+  assert.equal(s0.release?.fileIndex, undefined, "archive member must NOT set outer fileIndex");
+  assert.equal(s0.release?.file, undefined, "archive member must NOT set outer file");
+  assert.equal(s0.release?.track, undefined, "exact member match uses fileHint, not fallback track");
+
+  // Second source: MP3 ZIP expanded archive member -> exact inner member path as fileHint ONLY.
+  const s1 = res.sources[1];
+  assert.equal(s1.mime, "audio/mpeg");
+  assert.equal(s1.release?.fileHint, "Disc 2/02. They Don't Care About Us.mp3");
+  assert.equal(s1.release?.fileIndex, undefined);
+  assert.equal(s1.release?.file, undefined);
+});
+
+test("Issue #753: archive fallback without release_files.members sends structured release.track and omits synthetic fileHint", () => {
+  const album: CanonicalAlbum = {
+    id: "al-753002",
+    deezerAlbumId: 753002,
+    artistId: "ar-259",
+    deezerArtistId: 259,
+    artistName: "Michael Jackson",
+    title: "HIStory: Past, Present and Future, Book I",
+    releaseDate: "1995-06-16",
+    year: 1995,
+    releaseType: "album",
+    genres: ["Pop"],
+    label: "Epic",
+    fans: 1_200_000,
+    durationSec: 1200,
+    trackCount: 3,
+    discCount: 2,
+    coverXL: "",
+    coverBig: "",
+    curation: [],
+    tracks: [
+      { id: "tr-7541", deezerTrackId: 7541, title: "Billie Jean", disc: 1, trackNumber: 1, durationSec: 294, explicit: false, artistName: "Michael Jackson" },
+      { id: "tr-7542", deezerTrackId: 7542, title: "Scream (feat. Janet Jackson)", disc: 2, trackNumber: 1, durationSec: 278, explicit: false, artistName: "Michael Jackson" },
+      { id: "tr-7543", deezerTrackId: 7543, title: "They Don't Care About Us (2011 Remastered)", disc: 2, trackNumber: 3, durationSec: 284, explicit: false, artistName: "Michael Jackson" },
+    ],
+  };
+
+  const unexpandedRar: SourceCandidate = {
+    title: "Michael.Jackson-HIStory.Past.Present.and.Future.Book.I-1995-FLAC-FALLBACK",
+    nzbUrl: "https://indexer.example/nzb/mj-rar-nomembers",
+    indexer: "NZBgeek",
+    size: 150_000_000,
+  };
+
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [unexpandedRar] };
+      if (q.kind === "usenet_check") {
+        return { candidates: [{ nzbUrl: q.nzbUrl, usenetCheck: { available: true, checked: 3, missing: 0 } }] };
+      }
+      if (q.kind === "release_files") {
+        return {
+          candidates: [
+            {
+              ...unexpandedRar,
+              files: [
+                { index: 0, path: "mj-history.part01.rar", size: 75_000_000 },
+                { index: 1, path: "mj-history.part02.rar", size: 75_000_000 },
+              ],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-753002", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 2) });
+  assert.equal(res.sources.length, 1);
+  const rel = res.sources[0].release;
+  assert.ok(rel);
+  assert.equal(rel.fileHint, undefined, "archive fallback must NOT send synthetic fileHint");
+  assert.equal(rel.fileIndex, undefined, "archive fallback must NOT send fileIndex");
+  assert.equal(rel.file, undefined, "archive fallback must NOT send file");
+  assert.deepEqual(rel.track, {
+    disc: 2,
+    number: 3,
+    title: "They Don't Care About Us",
+  });
+});
+
+test("Issue #753: archive with expanded audio members of a wrong album is rejected without archive fallback", () => {
+  const album: CanonicalAlbum = {
+    id: "al-753003",
+    deezerAlbumId: 753003,
+    artistId: "ar-27",
+    deezerArtistId: 27,
+    artistName: "Daft Punk",
+    title: "Discovery",
+    releaseDate: "2001-03-12",
+    year: 2001,
+    releaseType: "album",
+    genres: ["Electronic"],
+    label: "Virgin",
+    fans: 1_500_000,
+    durationSec: 1200,
+    trackCount: 3,
+    discCount: 1,
+    coverXL: "",
+    coverBig: "",
+    curation: [],
+    tracks: [
+      { id: "tr-7551", deezerTrackId: 7551, title: "One More Time", disc: 1, trackNumber: 1, durationSec: 320, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-7552", deezerTrackId: 7552, title: "Aerodynamic", disc: 1, trackNumber: 2, durationSec: 212, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-7553", deezerTrackId: 7553, title: "Digital Love", disc: 1, trackNumber: 3, durationSec: 298, explicit: false, artistName: "Daft Punk" },
+    ],
+  };
+
+  const wrongArchive: SourceCandidate = {
+    title: "Daft.Punk-Discovery-2001-FLAC-MISLABELED",
+    nzbUrl: "https://indexer.example/nzb/dp-wrong-rar",
+    indexer: "NZBgeek",
+    size: 140_000_000,
+  };
+
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [wrongArchive] };
+      if (q.kind === "release_files") {
+        return {
+          candidates: [
+            {
+              ...wrongArchive,
+              files: [
+                {
+                  index: 0,
+                  path: "dp.part01.rar",
+                  size: 70_000_000,
+                  members: [
+                    { index: 0, path: "01 - Completely Different Song A.flac", size: 30_000_000 },
+                    { index: 1, path: "02 - Unrelated Track B.flac", size: 28_000_000 },
+                    { index: 2, path: "03 - Another Artist Song C.flac", size: 29_000_000 },
+                    { index: 3, path: "04 - Fourth Track D.flac", size: 31_000_000 },
+                    { index: 4, path: "05 - Fifth Track E.flac", size: 30_000_000 },
+                    { index: 5, path: "06 - Sixth Track F.flac", size: 30_000_000 },
+                  ],
+                },
+                { index: 1, path: "dp.part02.rar", size: 70_000_000 },
+              ],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-753003", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(res.sources.length, 0, "mislabeled archive whose expanded members failed matching must not fall back");
+});
+
+test("Issue #753: expandReleaseFiles handles split archives and matchConcertReleaseFiles expands RAR video members", () => {
+  const expanded = expandReleaseFiles([
+    { index: 0, path: "concert.nfo", size: 900 },
+    {
+      index: 1,
+      path: "concert.part01.rar",
+      size: 4_000_000_000,
+      members: [
+        { index: 0, path: "Stop.Making.Sense.1984.1080p.BluRay.mkv", size: 8_200_000_000, stored: true },
+        { index: 1, path: "sample.mkv", size: 60_000_000, stored: true },
+      ],
+    },
+    { index: 2, path: "concert.part02.rar", size: 4_200_000_000 },
+  ]);
+  assert.equal(expanded.length, 4);
+  assert.equal(expanded[1].isArchiveMember, true);
+  assert.equal(expanded[1].path, "Stop.Making.Sense.1984.1080p.BluRay.mkv");
+
+  const match = matchConcertReleaseFiles(
+    "Stop.Making.Sense.1984.1080p.BluRay.x264-GRP",
+    [
+      {
+        index: 0,
+        path: "concert.part01.rar",
+        size: 4_000_000_000,
+        members: [
+          { index: 0, path: "Stop.Making.Sense.1984.1080p.BluRay.mkv", size: 8_200_000_000, stored: true },
+        ],
+      },
+    ],
+    "uhd_preferred"
+  );
+  assert.equal(match.matched, true);
+  assert.equal(match.file?.isArchiveMember, true);
+  assert.equal(match.file?.path, "Stop.Making.Sense.1984.1080p.BluRay.mkv");
+
+  const th = buildArchiveTrackHint({
+    id: "tr-1",
+    deezerTrackId: 1,
+    title: "Song Name (2020 Remaster) (feat. Guest)",
+    disc: 1,
+    trackNumber: 5,
+    durationSec: 210,
+    explicit: false,
+    artistName: "Artist",
+  });
+  assert.deepEqual(th, { disc: 1, number: 5, title: "Song Name" });
+});
+
+test("Issue #753: multi-volume RAR with partial volume-1 members falls back to structured release.track", () => {
+  const album: CanonicalAlbum = {
+    id: "al-753004",
+    deezerAlbumId: 753004,
+    artistId: "ar-27",
+    deezerArtistId: 27,
+    artistName: "Daft Punk",
+    title: "Discovery",
+    releaseDate: "2001-03-12",
+    year: 2001,
+    releaseType: "album",
+    genres: ["Electronic"],
+    label: "Virgin",
+    fans: 1_500_000,
+    durationSec: 1200,
+    trackCount: 4,
+    discCount: 1,
+    coverXL: "",
+    coverBig: "",
+    curation: [],
+    tracks: [
+      { id: "tr-7561", deezerTrackId: 7561, title: "One More Time", disc: 1, trackNumber: 1, durationSec: 320, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-7562", deezerTrackId: 7562, title: "Aerodynamic", disc: 1, trackNumber: 2, durationSec: 212, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-7563", deezerTrackId: 7563, title: "Digital Love", disc: 1, trackNumber: 3, durationSec: 298, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-7564", deezerTrackId: 7564, title: "Harder, Better, Faster, Stronger", disc: 1, trackNumber: 4, durationSec: 224, explicit: false, artistName: "Daft Punk" },
+    ],
+  };
+
+  const multiRar: SourceCandidate = {
+    title: "Daft.Punk-Discovery-2001-FLAC-MULTIVOL",
+    nzbUrl: "https://indexer.example/nzb/dp-multivol-rar",
+    indexer: "NZBgeek",
+    size: 160_000_000,
+  };
+
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [multiRar] };
+      if (q.kind === "usenet_check") {
+        return { candidates: [{ nzbUrl: q.nzbUrl, usenetCheck: { available: true, checked: 6, missing: 0 } }] };
+      }
+      if (q.kind === "release_files") {
+        return {
+          candidates: [
+            {
+              ...multiRar,
+              files: [
+                {
+                  index: 0,
+                  path: "dp.part01.rar",
+                  size: 50_000_000,
+                  members: [
+                    // Only first 2 tracks visible in volume 1 (partialRARMembers)
+                    { index: 0, path: "01 - One More Time.flac", size: 32_000_000, stored: true },
+                    { index: 1, path: "02 - Aerodynamic.flac", size: 22_000_000, stored: true },
+                  ],
+                },
+                { index: 1, path: "dp.part02.rar", size: 50_000_000 },
+                { index: 2, path: "dp.part03.rar", size: 60_000_000 },
+              ],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-753004", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  // Track 4 lives in part03.rar -> must fall back cleanly to structured release.track (not drop release!)
+  const res = resolver.resolve({ item: trackItemFor(album, 3) });
+  assert.equal(res.sources.length, 1);
+  assert.equal(res.sources[0].release?.fileHint, undefined);
+  assert.deepEqual(res.sources[0].release?.track, {
+    disc: 1,
+    number: 4,
+    title: "Harder, Better, Faster, Stronger",
+  });
+});

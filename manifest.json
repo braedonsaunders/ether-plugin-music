@@ -1,0 +1,678 @@
+{
+  "id": "ether.music",
+  "name": "Music",
+  "version": "0.2.4",
+  "description": "Curated music discovery, live catalogue search across artists, albums, tracks and video concerts, and playback through your Ether indexers and debrid sources.",
+  "ether": {
+    "protocol": 1,
+    "kind": "content",
+    "summary": "Curated music, albums, and video concerts across your sources",
+    "author": {
+      "name": "Ether"
+    },
+    "license": "MIT",
+    "icon": "icon.svg",
+    "runtime": {
+      "kind": "hosted",
+      "entry": "src/index.ts",
+      "limits": {
+        "poolSize": 4
+      }
+    },
+    "capabilities": [
+      "catalog_provider",
+      "kind_resolver",
+      "matcher"
+    ],
+    "permissions": {
+      "sources": "search",
+      "network": [
+        "api.deezer.com",
+        "musicbrainz.org",
+        "coverartarchive.org",
+        "*.archive.org",
+        "lrclib.net",
+        "v3.sg.media-imdb.com"
+      ]
+    },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "qualityPreference": {
+          "type": "string",
+          "title": "Audio quality preference",
+          "description": "Preferred format when ranking album releases.",
+          "enum": [
+            "flac_preferred",
+            "lossless_only",
+            "high_bitrate"
+          ],
+          "default": "flac_preferred"
+        },
+        "newznabCategories": {
+          "type": "string",
+          "title": "Audio indexer categories",
+          "description": "Comma-separated Newznab audio categories searched for albums (3000 Audio, 3010 MP3, 3040 Lossless).",
+          "default": "3000,3010,3040"
+        },
+        "videoQualityPreference": {
+          "type": "string",
+          "title": "Concert video quality preference",
+          "description": "Preferred video resolution when ranking concert film releases.",
+          "enum": [
+            "uhd_preferred",
+            "1080p_preferred",
+            "balanced"
+          ],
+          "default": "uhd_preferred"
+        },
+        "concertNewznabCategories": {
+          "type": "string",
+          "title": "Concert video indexer categories",
+          "description": "Comma-separated Newznab video and music-video categories searched for concerts (2000 Movies, 2040 HD, 2045 UHD, 3020 Audio/Video, 5000 TV).",
+          "default": "2000,2040,2045,3020,5000"
+        },
+        "curatedSize": {
+          "type": "string",
+          "title": "Curated discovery size",
+          "description": "How many curated artists and their key albums to seed for Home, Charts and Genres. Live search always queries the full catalogue.",
+          "enum": [
+            "compact",
+            "standard",
+            "large"
+          ],
+          "default": "standard"
+        },
+        "enrichMusicBrainz": {
+          "type": "boolean",
+          "title": "Enrich releases with MusicBrainz",
+          "description": "Look up canonical MusicBrainz release types, MBIDs and Cover Art Archive art (rate limited to 1 request/second).",
+          "default": true
+        }
+      }
+    },
+    "contributes": {
+      "mediaKinds": [
+        {
+          "key": "music",
+          "label": "Music",
+          "media": "music",
+          "container": true,
+          "library": {
+            "name": "Music",
+            "icon": "icon.svg",
+            "card": "square",
+            "dateDisplay": "year",
+            "tabs": [
+              {
+                "key": "home",
+                "label": "Home",
+                "kind": "recommended"
+              },
+              {
+                "key": "artists",
+                "label": "Artists",
+                "kind": "view",
+                "level": "artist",
+                "sort": "rating",
+                "direction": "desc",
+                "layout": "grid",
+                "search": true,
+                "searchPlaceholder": "Search artists"
+              },
+              {
+                "key": "albums",
+                "label": "Albums",
+                "kind": "view",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "layout": "grid",
+                "search": true,
+                "searchPlaceholder": "Search albums"
+              },
+              {
+                "key": "concerts",
+                "label": "Concerts",
+                "kind": "recommended",
+                "card": "poster",
+                "shelves": [
+                  {
+                    "key": "concerts-trending",
+                    "label": "Trending concerts",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "curation",
+                    "value": "Trending"
+                  },
+                  {
+                    "key": "concerts-new",
+                    "label": "New & recent",
+                    "level": "concert",
+                    "sort": "released",
+                    "direction": "desc",
+                    "facet": "curation",
+                    "value": "New & Recent"
+                  },
+                  {
+                    "key": "concerts-iconic",
+                    "label": "Iconic concert films",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "curation",
+                    "value": "Iconic"
+                  },
+                  {
+                    "key": "concerts-stadium",
+                    "label": "Stadium spectacles",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "curation",
+                    "value": "Stadium"
+                  },
+                  {
+                    "key": "concerts-unplugged",
+                    "label": "Unplugged & intimate",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "curation",
+                    "value": "Unplugged"
+                  },
+                  {
+                    "key": "concerts-festivals",
+                    "label": "Festival legends",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "curation",
+                    "value": "Festivals"
+                  },
+                  {
+                    "key": "concerts-rock",
+                    "label": "Rock & classic rock",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "genres",
+                    "value": "Rock"
+                  },
+                  {
+                    "key": "concerts-pop-rnb",
+                    "label": "Pop & R&B live",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "genres",
+                    "values": [
+                      "Pop",
+                      "R&B & Soul"
+                    ]
+                  },
+                  {
+                    "key": "concerts-metal",
+                    "label": "Metal & hard rock",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "genres",
+                    "value": "Metal"
+                  },
+                  {
+                    "key": "concerts-electronic-indie",
+                    "label": "Electronic & indie",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "genres",
+                    "values": [
+                      "Electronic",
+                      "Indie & Alternative"
+                    ]
+                  },
+                  {
+                    "key": "concerts-classic",
+                    "label": "Classic concerts",
+                    "level": "concert",
+                    "sort": "rating",
+                    "direction": "desc",
+                    "facet": "curation",
+                    "value": "Classic"
+                  }
+                ]
+              },
+              {
+                "key": "genres",
+                "label": "Genres",
+                "kind": "collections",
+                "facet": "genres",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "order": "count",
+                "search": true,
+                "searchPlaceholder": "Filter genres"
+              },
+              {
+                "key": "eras",
+                "label": "Eras",
+                "kind": "collections",
+                "facet": "decade",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "order": "name"
+              },
+              {
+                "key": "library",
+                "label": "Browse",
+                "kind": "library"
+              },
+              {
+                "key": "history",
+                "label": "History",
+                "kind": "view",
+                "level": "track",
+                "sort": "lastViewed",
+                "direction": "desc",
+                "layout": "list",
+                "search": true,
+                "searchPlaceholder": "Search listening history",
+                "filters": {
+                  "match": "all",
+                  "rules": [
+                    {
+                      "field": "viewer",
+                      "op": "is",
+                      "value": {
+                        "history": true
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "shelves": [
+              {
+                "key": "new-releases",
+                "label": "New releases",
+                "level": "album",
+                "sort": "released",
+                "direction": "desc",
+                "facet": "curation",
+                "value": "New Release"
+              },
+              {
+                "key": "popular-charts",
+                "label": "Popular & charts",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "curation",
+                "value": "Charting"
+              },
+              {
+                "key": "trending-artists",
+                "label": "Trending artists",
+                "level": "artist",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "curation",
+                "value": "Trending"
+              },
+              {
+                "key": "pop-charts",
+                "label": "Pop",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "genres",
+                "value": "Pop"
+              },
+              {
+                "key": "rock-charts",
+                "label": "Rock",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "genres",
+                "value": "Rock"
+              },
+              {
+                "key": "hip-hop-charts",
+                "label": "Hip-Hop",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "genres",
+                "value": "Hip-Hop"
+              },
+              {
+                "key": "electronic-charts",
+                "label": "Electronic",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "genres",
+                "value": "Electronic"
+              },
+              {
+                "key": "indie-alternative",
+                "label": "Indie & alternative",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "genres",
+                "value": "Indie & Alternative"
+              },
+              {
+                "key": "rnb-soul",
+                "label": "R&B & soul",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "genres",
+                "value": "R&B & Soul"
+              },
+              {
+                "key": "jazz-charts",
+                "label": "Jazz",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "genres",
+                "value": "Jazz"
+              },
+              {
+                "key": "classic-albums",
+                "label": "Classic albums",
+                "level": "album",
+                "sort": "rating",
+                "direction": "desc",
+                "facet": "curation",
+                "value": "Classic"
+              },
+              {
+                "key": "jump-back-in",
+                "label": "Jump back in",
+                "level": "album",
+                "sort": "lastViewed",
+                "direction": "desc"
+              },
+              {
+                "key": "recently-played",
+                "label": "Recently played",
+                "level": "track",
+                "sort": "lastViewed",
+                "direction": "desc"
+              }
+            ]
+          },
+          "levels": [
+            {
+              "key": "artist",
+              "label": "Artist",
+              "role": "artist",
+              "container": true
+            },
+            {
+              "key": "album",
+              "label": "Album",
+              "parent": "artist",
+              "role": "album",
+              "container": true
+            },
+            {
+              "key": "track",
+              "label": "Track",
+              "parent": "album",
+              "role": "track",
+              "playable": true
+            },
+            {
+              "key": "concert",
+              "label": "Concert",
+              "parent": "artist",
+              "media": "video",
+              "role": "concert",
+              "playable": true
+            }
+          ],
+          "fields": [
+            {
+              "key": "genres",
+              "type": "strings",
+              "label": "Genres",
+              "indexed": true
+            },
+            {
+              "key": "decade",
+              "type": "enum",
+              "label": "Era",
+              "indexed": true,
+              "fact": false,
+              "enum": [
+                "2020s",
+                "2010s",
+                "2000s",
+                "1990s",
+                "1980s",
+                "1970s",
+                "1960s",
+                "Classic"
+              ]
+            },
+            {
+              "key": "curation",
+              "type": "strings",
+              "label": "Featured",
+              "indexed": true,
+              "fact": false
+            },
+            {
+              "key": "releaseType",
+              "type": "enum",
+              "label": "Release type",
+              "indexed": true,
+              "enum": [
+                "album",
+                "ep",
+                "single",
+                "live",
+                "compilation"
+              ]
+            },
+            {
+              "key": "popularity",
+              "type": "float",
+              "label": "Popularity",
+              "indexed": true,
+              "fact": false
+            },
+            {
+              "key": "artistName",
+              "type": "string",
+              "label": "Artist",
+              "indexed": true,
+              "fact": false
+            },
+            {
+              "key": "albumTitle",
+              "type": "string",
+              "label": "Album",
+              "indexed": true,
+              "fact": false
+            },
+            {
+              "key": "label",
+              "type": "string",
+              "label": "Label",
+              "indexed": true
+            },
+            {
+              "key": "country",
+              "type": "string",
+              "label": "Country",
+              "indexed": true
+            },
+            {
+              "key": "disc",
+              "type": "int",
+              "label": "Disc",
+              "fact": false
+            },
+            {
+              "key": "duration",
+              "type": "duration",
+              "label": "Duration",
+              "indexed": true
+            },
+            {
+              "key": "trackCount",
+              "type": "int",
+              "label": "Tracks",
+              "fact": false
+            },
+            {
+              "key": "discCount",
+              "type": "int",
+              "label": "Discs",
+              "fact": false
+            },
+            {
+              "key": "explicit",
+              "type": "bool",
+              "label": "Explicit",
+              "indexed": true
+            },
+            {
+              "key": "featuredArtists",
+              "type": "people",
+              "label": "Featured artists",
+              "indexed": true
+            },
+            {
+              "key": "artistMbid",
+              "type": "string",
+              "label": "MusicBrainz artist ID",
+              "fact": false
+            },
+            {
+              "key": "releaseGroupMbid",
+              "type": "string",
+              "label": "MusicBrainz release group ID",
+              "fact": false
+            },
+            {
+              "key": "releaseMbid",
+              "type": "string",
+              "label": "MusicBrainz release ID",
+              "fact": false
+            },
+            {
+              "key": "recordingMbid",
+              "type": "string",
+              "label": "MusicBrainz recording ID",
+              "fact": false
+            },
+            {
+              "key": "isrc",
+              "type": "string",
+              "label": "ISRC",
+              "fact": false
+            },
+            {
+              "key": "upc",
+              "type": "string",
+              "label": "UPC",
+              "fact": false
+            },
+            {
+              "key": "venue",
+              "type": "string",
+              "label": "Venue",
+              "indexed": true
+            },
+            {
+              "key": "imdbId",
+              "type": "string",
+              "label": "IMDb ID",
+              "fact": false
+            }
+          ],
+          "present": {
+            "vela": {
+              "type": "shows"
+            },
+            "plex": {
+              "base": "artist"
+            },
+            "mediaBrowser": {
+              "collectionType": "music",
+              "itemTypes": {
+                "artist": "MusicArtist",
+                "album": "MusicAlbum",
+                "track": "Audio",
+                "concert": "Video"
+              }
+            }
+          },
+          "browse": {
+            "sorts": [
+              "rating",
+              "released",
+              "title",
+              "year",
+              "added",
+              "index",
+              "lastViewed"
+            ],
+            "facets": [
+              "genres",
+              "decade",
+              "curation",
+              "releaseType",
+              "label",
+              "country",
+              "explicit",
+              "featuredArtists",
+              "year"
+            ],
+            "search": true,
+            "liveSearch": true,
+            "searchFields": [
+              "artistName",
+              "albumTitle",
+              "genres",
+              "label",
+              "featuredArtists",
+              "venue"
+            ],
+            "expand": {
+              "facets": [
+                "genres",
+                "decade",
+                "featuredArtists"
+              ],
+              "levels": [
+                "artist",
+                "album"
+              ],
+              "ttlHours": 168
+            }
+          },
+          "sync": {
+            "mode": "pull",
+            "refresh": "6h"
+          },
+          "match": {
+            "thresholdDefault": 0.72
+          }
+        }
+      ]
+    }
+  }
+}
