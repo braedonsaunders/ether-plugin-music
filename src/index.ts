@@ -53,7 +53,7 @@ export function createHandler(env?: HostEnv) {
     try {
       // Health, configure, and test routes (EPP/1)
       if (path === "/health" || path === "/ether/health") {
-        return { status: 200, body: { ok: true, status: "ok", plugin: "ether.music", version: "0.2.4" } };
+        return { status: 200, body: { ok: true, status: "ok", plugin: "ether.music", version: "0.2.5" } };
       }
       if (path === "/ether/test") {
         const startMs = host.now();
@@ -98,8 +98,17 @@ export function createHandler(env?: HostEnv) {
             }
           }
           details.push(
-            `Audio sources (cats ${settings.newznabCategories}): ${idxCount} releases (${usenetCount} Usenet, ${torrentCount} Torrent, ${cachedCount} Debrid cached)`
+            `Audio sources (cats ${settings.newznabCategories}): ${idxCount} releases (${usenetCount} Usenet, ${torrentCount} Torrent, ${cachedCount} Debrid bulk-cached)`
           );
+          if (idxCount === 0) {
+            details.push(
+              "No audio releases returned. Stremio addons (e.g. Torrentio) do not support audio category searches; configure a Newznab, Torznab (Prowlarr/Jackett), or audio-capable Cardigann indexer."
+            );
+          } else if (torrentCount > 0 && cachedCount === 0 && usenetCount === 0) {
+            details.push(
+              "Bulk debrid cache check returned 0 hits; providers without bulk cache checks (Real-Debrid, AllDebrid, Debrid-Link) are verified on demand during track resolution."
+            );
+          }
         } catch (err) {
           rethrowHostFault(err);
           details.push(`Audio source check error: ${err instanceof Error ? err.message : String(err)}`);
@@ -110,7 +119,9 @@ export function createHandler(env?: HostEnv) {
           body: {
             ok: deezerOk,
             message: deezerOk
-              ? `Music plugin ready (Deezer OK, ${idxCount} audio sample releases found; concert categories ${settings.concertNewznabCategories}).`
+              ? idxCount > 0
+                ? `Music plugin ready (Deezer OK, ${idxCount} audio sample releases found; concert categories ${settings.concertNewznabCategories}).`
+                : `Deezer OK, but 0 audio releases found for categories ${settings.newznabCategories} — add a Newznab, Torznab, or audio-capable Cardigann indexer.`
               : "Could not reach Deezer metadata API.",
             details,
           },

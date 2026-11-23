@@ -916,3 +916,108 @@ test("container expand on open: manifest declares browse.expand.levels, artist e
   assert.equal(tracks.length, 2);
   assert.ok(tracks.every((t) => t.parentId === "al-708673" && t.playable === true));
 });
+
+test("0.2.5: bulky Deezer album/discography/search responses stay memory-only in KV and collab parent overrides skip solo albums", () => {
+  const kvMap = new Map<string, string>();
+  const now = Date.UTC(2026, 10, 23, 12, 0, 0);
+
+  const fakeHttp: HostEnv["http"]["fetch"] = (req) => {
+    if (req.url.includes("/artist/27/albums")) {
+      return {
+        status: 200,
+        body: JSON.stringify({
+          data: [
+            {
+              id: 302127,
+              title: "Discovery",
+              release_date: "2001-03-07",
+              record_type: "album",
+              cover_xl: "https://cdn-images.dzcdn.net/images/cover/disc/1000x1000.jpg",
+              md5_image: "unused_bloat_md5",
+              link: "https://www.deezer.com/album/302127",
+              artist: { id: 27, name: "Daft Punk" },
+            },
+            {
+              id: 302999,
+              title: "Split Collab LP",
+              release_date: "2010-05-01",
+              record_type: "album",
+              cover_xl: "https://cdn-images.dzcdn.net/images/cover/collab/1000x1000.jpg",
+              artist: { id: 999, name: "Collaborator" },
+            },
+          ],
+          total: 2,
+        }),
+      };
+    }
+    if (req.url.includes("/artist/27")) {
+      return {
+        status: 200,
+        body: JSON.stringify({
+          id: 27,
+          name: "Daft Punk",
+          nb_fan: 5_000_000,
+          picture_xl: "https://cdn-images.dzcdn.net/images/artist/dp/1000x1000.jpg",
+          picture_small: "https://unused.example/s.jpg",
+          tracklist: "https://api.deezer.com/artist/27/top",
+        }),
+      };
+    }
+    if (req.url.includes("/album/302127")) {
+      return {
+        status: 200,
+        body: JSON.stringify({
+          id: 302127,
+          title: "Discovery",
+          release_date: "2001-03-07",
+          record_type: "album",
+          nb_tracks: 1,
+          duration: 320,
+          fans: 1_500_000,
+          artist: { id: 27, name: "Daft Punk" },
+          tracks: {
+            data: [{ id: 3135556, title: "One More Time", duration: 320, artist: { id: 27, name: "Daft Punk" } }],
+          },
+        }),
+      };
+    }
+    if (req.url.includes("/search/")) {
+      return { status: 200, body: JSON.stringify({ data: [] }) };
+    }
+    return { status: 404, body: "" };
+  };
+
+  const env: HostEnv = {
+    now: () => now,
+    log: () => {},
+    kv: {
+      get: (k) => kvMap.get(k) ?? null,
+      put: (k, v) => { kvMap.set(k, v); },
+      delete: (k) => { kvMap.delete(k); },
+      list: (prefix = "") => Array.from(kvMap.keys()).filter((k) => k.startsWith(prefix)),
+    },
+    http: { fetch: fakeHttp },
+    settings: { get: () => ({ curatedSize: "compact", enrichMusicBrainz: false }) },
+    sources: { resolve: () => ({ candidates: [] }) },
+  };
+  const handle = createHandler(env);
+
+  handle({ method: "POST", path: "/ether/v1/kinds/music/expand", body: { parentId: "ar-27", level: "artist", cursor: "" } });
+  handle({ method: "POST", path: "/ether/v1/kinds/music/expand", body: { parentId: "al-302127", level: "album", cursor: "" } });
+  handle({ method: "POST", path: "/ether/v1/kinds/music/search", body: { query: "Daft Punk", limit: 10 } });
+
+  const keys = Array.from(kvMap.keys());
+  assert.ok(!keys.some((k) => k.startsWith("dz:album:")), "raw dz:album:* must NOT be persisted in KV");
+  assert.ok(!keys.some((k) => k.includes(":albums:p:")), "paginated dz:artist:*:albums:p:* must NOT be persisted in KV");
+  assert.ok(!keys.some((k) => k.startsWith("dz:search:")), "ephemeral dz:search:* must NOT be persisted in KV");
+
+  const rawArtist = kvMap.get("dz:artist:27");
+  assert.ok(rawArtist, "slimmed dz:artist:27 should still be persisted");
+  assert.ok(!rawArtist!.includes("picture_small") && !rawArtist!.includes("tracklist"), "slimArtist must strip redundant URLs");
+
+  const rawParentMap = kvMap.get("exp:alb_parent:v1");
+  assert.ok(rawParentMap, "collab album parent override should be recorded");
+  const parentMap = JSON.parse(rawParentMap!).v as Record<string, number>;
+  assert.equal(parentMap["302999"], 27, "collab album should record artist override");
+  assert.equal(parentMap["302127"], undefined, "solo album owned by artist must not bloat exp:alb_parent:v1");
+});

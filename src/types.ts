@@ -313,6 +313,12 @@ export interface VerifiedAlbumRelease {
   score: number;
   candidate: SourceCandidate;
   isArchiveFallback?: boolean;
+  /**
+   * True when the torrent was not confirmed cached by bulk debrid_check (e.g.
+   * Real-Debrid / AllDebrid / Debrid-Link, which do not support CheckCached)
+   * and relies on Ether's acquire-time cache check + release.track selection.
+   */
+  isUnconfirmedDebridFallback?: boolean;
   /** Map from canonical track ID (e.g. "tr-3135553") -> matched file in release. */
   tracks: Record<string, TrackFileMapping>;
 }
@@ -335,6 +341,7 @@ export interface VerifiedConcertRelease {
   score: number;
   candidate: SourceCandidate;
   isArchiveFallback?: boolean;
+  isUnconfirmedDebridFallback?: boolean;
   isArchiveMember?: boolean;
   fileIndex?: number;
   file?: string;

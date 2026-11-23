@@ -1484,3 +1484,345 @@ test("Issue #753: multi-volume RAR with partial volume-1 members falls back to s
     title: "Harder, Better, Faster, Stronger",
   });
 });
+
+test("0.2.5: Real-Debrid/AllDebrid unconfirmed torrent (debrid_check cached=false) still probes release_files and verifies album tracks", () => {
+  const album: CanonicalAlbum = {
+    id: "al-900101",
+    deezerAlbumId: 900101,
+    deezerArtistId: 27,
+    artistName: "Daft Punk",
+    title: "Discovery",
+    year: 2001,
+    releaseDate: "2001-03-07",
+    releaseType: "album",
+    genres: ["Electronic"],
+    durationSec: 600,
+    fans: 1_500_000,
+    discCount: 1,
+    tracks: [
+      { id: "tr-9001", deezerTrackId: 9001, title: "One More Time", disc: 1, trackNumber: 1, durationSec: 320, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-9002", deezerTrackId: 9002, title: "Aerodynamic", disc: 1, trackNumber: 2, durationSec: 212, explicit: false, artistName: "Daft Punk" },
+    ],
+  };
+
+  const torrentCand: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    infoHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    magnet: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    indexer: "The Pirate Bay",
+    seeders: 42,
+    size: 420_000_000,
+  };
+
+  let releaseFilesCalled = 0;
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [torrentCand] };
+      // Simulate Real-Debrid / AllDebrid / Debrid-Link: bulk CheckCached unsupported -> cached=false.
+      if (q.kind === "debrid_check") {
+        return { candidates: [{ infoHash: torrentCand.infoHash, cached: false }] };
+      }
+      if (q.kind === "release_files") {
+        releaseFilesCalled++;
+        // Ether 0.3.19 ListReleaseFiles acquires on-demand and returns cached=true + complete files.
+        return {
+          candidates: [
+            {
+              ...torrentCand,
+              cached: true,
+              files: [
+                { index: 0, path: "Daft Punk - Discovery/01 - One More Time.flac", size: 36_000_000 },
+                { index: 1, path: "Daft Punk - Discovery/02 - Aerodynamic.flac", size: 24_000_000 },
+              ],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-900101", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(releaseFilesCalled, 1, "must probe release_files on top unconfirmed torrent when debrid_check has 0 hits");
+  assert.equal(res.sources.length, 1);
+  assert.equal(res.sources[0].mime, "audio/flac");
+  assert.equal(res.sources[0].release?.fileIndex, 1);
+  assert.equal(res.sources[0].release?.file, "Daft Punk - Discovery/02 - Aerodynamic.flac");
+  assert.equal(res.sources[0].release?.candidate?.cached, true);
+});
+
+test("0.2.5: cached Debrid torrent with empty file listing falls back to structured release.track; confirmed uncached is dropped", () => {
+  const album: CanonicalAlbum = {
+    id: "al-900102",
+    deezerAlbumId: 900102,
+    deezerArtistId: 27,
+    artistName: "Daft Punk",
+    title: "Discovery",
+    year: 2001,
+    releaseDate: "2001-03-07",
+    releaseType: "album",
+    genres: ["Electronic"],
+    durationSec: 600,
+    fans: 1_500_000,
+    discCount: 1,
+    tracks: [
+      { id: "tr-9011", deezerTrackId: 9011, title: "One More Time", disc: 1, trackNumber: 1, durationSec: 320, explicit: false, artistName: "Daft Punk" },
+      { id: "tr-9012", deezerTrackId: 9012, title: "Aerodynamic", disc: 1, trackNumber: 2, durationSec: 212, explicit: false, artistName: "Daft Punk" },
+    ],
+  };
+
+  const cachedNoFiles: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    infoHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    magnet: "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    indexer: "1337x",
+    seeders: 30,
+    size: 400_000_000,
+  };
+  const trulyUncached: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [MP3 320]",
+    infoHash: "cccccccccccccccccccccccccccccccccccccccc",
+    magnet: "magnet:?xt=urn:btih:cccccccccccccccccccccccccccccccccccccccc",
+    indexer: "1337x",
+    seeders: 15,
+    size: 130_000_000,
+  };
+
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [cachedNoFiles, trulyUncached] };
+      if (q.kind === "debrid_check") {
+        return {
+          candidates: [
+            { infoHash: cachedNoFiles.infoHash, cached: false },
+            { infoHash: trulyUncached.infoHash, cached: false },
+          ],
+        };
+      }
+      if (q.kind === "release_files") {
+        if (q.infoHash === cachedNoFiles.infoHash) {
+          return { candidates: [{ ...cachedNoFiles, cached: true, files: [] }] };
+        }
+        return { candidates: [{ ...trulyUncached, cached: false, files: [] }] };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-900102", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(res.sources.length, 1, "only cached Debrid fallback should be emitted; confirmed uncached dropped");
+  assert.equal(res.sources[0].release?.candidate?.infoHash, cachedNoFiles.infoHash);
+  assert.equal(res.sources[0].release?.fileHint, undefined);
+  assert.deepEqual(res.sources[0].release?.track, { disc: 1, number: 1, title: "One More Time" });
+});
+
+test("0.2.5: Real-Debrid/AllDebrid unconfirmed concert torrent probes release_files and verifies MKV", () => {
+  const concertCand: SourceCandidate = {
+    title: "Daft Punk - Alive 2007 (2007) 1080p BluRay x264",
+    infoHash: "dddddddddddddddddddddddddddddddddddddddd",
+    magnet: "magnet:?xt=urn:btih:dddddddddddddddddddddddddddddddddddddddd",
+    indexer: "1337x",
+    seeders: 25,
+    size: 8_500_000_000,
+  };
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [concertCand] };
+      if (q.kind === "debrid_check") return { candidates: [{ infoHash: concertCand.infoHash, cached: false }] };
+      if (q.kind === "release_files") {
+        return {
+          candidates: [
+            {
+              ...concertCand,
+              cached: true,
+              files: [{ index: 0, path: "Daft.Punk.Alive.2007.1080p.BluRay.mkv", size: 8_400_000_000 }],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({
+    item: {
+      id: "co-daft-punk-alive-2007",
+      level: "concert",
+      parentId: "ar-27",
+      title: "Alive 2007",
+      year: 2007,
+      playable: true,
+      fields: { artistName: "Daft Punk", duration: 5100 },
+      hints: { artistName: "Daft Punk", durationSec: 5100 },
+    },
+  });
+  assert.equal(res.sources.length, 1);
+  assert.equal(res.sources[0].release?.file, "Daft.Punk.Alive.2007.1080p.BluRay.mkv");
+  assert.equal(res.sources[0].release?.candidate?.cached, true);
+});
+
+test("0.2.5: single-volume archive with inspected non-audio members is rejected without archive fallback", () => {
+  const album: CanonicalAlbum = {
+    id: "al-900103",
+    deezerAlbumId: 900103,
+    deezerArtistId: 27,
+    artistName: "Daft Punk",
+    title: "Discovery",
+    year: 2001,
+    releaseDate: "2001-03-07",
+    releaseType: "album",
+    genres: ["Electronic"],
+    durationSec: 600,
+    fans: 1_500_000,
+    discCount: 1,
+    tracks: [
+      { id: "tr-9021", deezerTrackId: 9021, title: "One More Time", disc: 1, trackNumber: 1, durationSec: 320, explicit: false, artistName: "Daft Punk" },
+    ],
+  };
+
+  const scansOnlyZip: SourceCandidate = {
+    title: "Daft.Punk-Discovery-2001-FLAC-SCANS",
+    nzbUrl: "https://indexer.example/nzb/dp-scans",
+    indexer: "NZBgeek",
+    size: 80_000_000,
+  };
+
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: [scansOnlyZip] };
+      if (q.kind === "release_files") {
+        return {
+          candidates: [
+            {
+              ...scansOnlyZip,
+              files: [
+                {
+                  index: 0,
+                  path: "booklet.zip",
+                  size: 80_000_000,
+                  members: [
+                    { index: 0, path: "Booklet/Page01.jpg", size: 40_000_000, stored: true },
+                    { index: 1, path: "Booklet/Page02.jpg", size: 40_000_000, stored: true },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+      }
+      return { candidates: [] };
+    },
+  });
+
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-900103", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  const res = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(res.sources.length, 0, "single-volume archive with inspected non-audio members must be rejected");
+});
+
+test("0.2.5: KVCache auto-evicts low-priority dz:* entries on quota_exceeded and sweepLegacyBloat purges <=0.2.4 bloat", () => {
+  const store = new Map<string, string>();
+  const now = 1_700_000_000_000;
+  let maxKeys = 5;
+
+  const env: HostEnv = {
+    now: () => now,
+    log: () => {},
+    kv: {
+      get: (k) => store.get(k) ?? null,
+      put: (k, v) => {
+        if (!store.has(k) && store.size >= maxKeys) {
+          throw new Error('__ETHER_FAULT__{"code":"quota_exceeded","message":"kv quota exceeded"}');
+        }
+        store.set(k, v);
+      },
+      delete: (k) => { store.delete(k); },
+      list: (prefix = "") => Array.from(store.keys()).filter((k) => k.startsWith(prefix)),
+    },
+    http: { fetch: () => ({ status: 404, body: "" }) },
+    settings: { get: () => ({}) },
+    sources: { resolve: () => ({ candidates: [] }) },
+  };
+
+  // Fill store to quota with legacy & bulky dz:* entries + 1 protected alb_rel_v6 key.
+  store.set("alb_rel_v5:al-1", JSON.stringify({ v: {}, e: now + 60_000 }));
+  store.set("dz:album:123", JSON.stringify({ v: { big: "x".repeat(500) }, e: now + 60_000 }));
+  store.set("dz:artist:27:albums:p:0:100", JSON.stringify({ v: { data: [] }, e: now + 60_000 }));
+  store.set("dz:search:ar:daft:8", JSON.stringify({ v: { data: [] }, e: now + 60_000 }));
+  store.set("alb_rel_v6:al-keep", JSON.stringify({ v: { keep: true }, e: now + 60_000 }));
+
+  const cache = new KVCache(env);
+  // 1. Writing a new alb_rel_v6 key while at quota must auto-evict low-priority bloat and succeed!
+  cache.set("alb_rel_v6:al-new", { ok: true }, 60_000);
+  assert.ok(store.has("alb_rel_v6:al-new"), "new alb_rel_v6 write must succeed after quota auto-eviction");
+  assert.ok(store.has("alb_rel_v6:al-keep"), "existing alb_rel_v6 entry must be preserved");
+
+  // 2. sweepLegacyBloat cleans remaining legacy prefixes + bulky dz:* keys while keeping album_v2 & alb_rel_v6.
+  maxKeys = 50;
+  store.set("album_meta:al-old", JSON.stringify({ v: {}, e: now + 60_000 }));
+  store.set("alb_stage_v4:al-old", JSON.stringify({ v: {}, e: now + 60_000 }));
+  store.set("concert_rel_v1:co-old", JSON.stringify({ v: {}, e: now + 60_000 }));
+  store.set("dz:album:999", JSON.stringify({ v: {}, e: now + 60_000 }));
+  store.set("dz:artist:27:albums:p:100:100", JSON.stringify({ v: {}, e: now + 60_000 }));
+  store.set("album_v2:al-keep", JSON.stringify({ v: { keep: true }, e: now + 60_000 }));
+
+  const deleted = cache.sweepLegacyBloat(50);
+  assert.ok(deleted >= 5, `expected >= 5 legacy/bloat keys swept, got ${deleted}`);
+  assert.equal(store.has("album_meta:al-old"), false);
+  assert.equal(store.has("alb_stage_v4:al-old"), false);
+  assert.equal(store.has("concert_rel_v1:co-old"), false);
+  assert.equal(store.has("dz:album:999"), false);
+  assert.equal(store.has("dz:artist:27:albums:p:100:100"), false);
+  assert.equal(store.has("album_v2:al-keep"), true);
+  assert.equal(store.has("alb_rel_v6:al-keep"), true);
+  assert.equal(store.has("alb_rel_v6:al-new"), true);
+});

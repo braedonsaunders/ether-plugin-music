@@ -79,6 +79,7 @@ interface ConcertResolveStage {
   nextIdx: number;
   verified: VerifiedConcertRelease[];
   archiveFallbacks: VerifiedConcertRelease[];
+  debridFallbacks: VerifiedConcertRelease[];
   excludedSig: string;
   usenetChecksUsed?: number;
   usenetCheckDisabled?: boolean;
@@ -90,6 +91,7 @@ interface ResolveStage {
   nextIdx: number;
   verified: VerifiedAlbumRelease[];
   archiveFallbacks: VerifiedAlbumRelease[];
+  debridFallbacks: VerifiedAlbumRelease[];
   excludedSig: string;
   usenetChecksUsed?: number;
   usenetCheckDisabled?: boolean;
@@ -227,7 +229,8 @@ export function preScoreAlbumCandidate(
     releaseType: ReleaseType;
     durationSec: number;
   },
-  pref: QualityPreference
+  pref: QualityPreference,
+  options?: { allowUnconfirmedTorrent?: boolean }
 ): { accepted: boolean; score: number; reasons: string[] } {
   const relTitle = String(candidate.title || "").trim();
   if (!relTitle) return { accepted: false, score: 0, reasons: ["empty candidate title"] };
@@ -317,6 +320,23 @@ export function preScoreAlbumCandidate(
     } else if (looksSceneRar) {
       score -= 14;
       reasons.push("scene RAR likely");
+    }
+  } else if (options?.allowUnconfirmedTorrent && (candidate.infoHash || candidate.magnet)) {
+    // Providers without a bulk cache-check API (Real-Debrid, AllDebrid, Debrid-Link)
+    // return cached=false on debrid_check and verify cache at acquire time.
+    const seeders = typeof candidate.seeders === "number" ? candidate.seeders : 0;
+    if (seeders >= 20) {
+      score += 10;
+      reasons.push("Debrid fallback (well-seeded)");
+    } else if (seeders >= 5) {
+      score += 6;
+      reasons.push("Debrid fallback (seeded)");
+    } else if (seeders >= 1) {
+      score += 3;
+      reasons.push("Debrid fallback");
+    } else {
+      score -= 8;
+      reasons.push("Debrid fallback (unconfirmed seeders)");
     }
   } else {
     // Uncached torrents cannot have release_files inspected and won't play instantly.
@@ -797,7 +817,8 @@ export function preScoreConcertCandidate(
     durationSec?: number;
     standaloneTitle?: boolean;
   },
-  pref: VideoQualityPreference = "uhd_preferred"
+  pref: VideoQualityPreference = "uhd_preferred",
+  options?: { allowUnconfirmedTorrent?: boolean }
 ): { accepted: boolean; score: number; reasons: string[] } {
   const relTitle = String(candidate.title || "").trim();
   if (!relTitle) return { accepted: false, score: 0, reasons: ["empty candidate title"] };
@@ -912,6 +933,21 @@ export function preScoreConcertCandidate(
   } else if (isUsenet) {
     score += 6;
     reasons.push("Usenet");
+  } else if (options?.allowUnconfirmedTorrent && (candidate.infoHash || candidate.magnet)) {
+    const seeders = typeof candidate.seeders === "number" ? candidate.seeders : 0;
+    if (seeders >= 20) {
+      score += 10;
+      reasons.push("Debrid fallback (well-seeded)");
+    } else if (seeders >= 5) {
+      score += 6;
+      reasons.push("Debrid fallback (seeded)");
+    } else if (seeders >= 1) {
+      score += 3;
+      reasons.push("Debrid fallback");
+    } else {
+      score -= 8;
+      reasons.push("Debrid fallback (unconfirmed seeders)");
+    }
   } else {
     score -= 40;
   }
@@ -1085,6 +1121,8 @@ export class AlbumResolver {
     }
 
     if (!stage) {
+      // Self-heal legacy KV bloat from <=0.2.4 installs before persisting stage/release entries.
+      this.cache.sweepLegacyBloat(64);
       const album = this.loadAlbumForResolve(albumId, item);
       if (!album) {
         this.env.log("warn", `resolve-album: could not load metadata for ${albumId}`);
@@ -1102,6 +1140,7 @@ export class AlbumResolver {
         nextIdx: 0,
         verified: [],
         archiveFallbacks: [],
+        debridFallbacks: [],
         excludedSig,
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
@@ -1135,9 +1174,15 @@ export class AlbumResolver {
       }
 
       const { cand, score: preScore } = stage.preRanked[stage.nextIdx];
-      // Usenet release_files fetches an NZB over HTTP (1-3s); if we already spent >900ms
-      // on this call, yield cleanly so the NZB fetch gets a fresh 5s route budget.
+      // Usenet release_files fetches an NZB over HTTP (1-3s), and unconfirmed Debrid probes
+      // (Real-Debrid / AllDebrid / Debrid-Link) may invoke acquireOn (~0.5-1.5s); yield
+      // cleanly if we already consumed part of the 5s route budget.
       if (isUsenetCandidate(cand) && this.env.now() - startMs >= 900) {
+        if (stage.verified.length > 0) break;
+        this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
+        return { done: false, verifiedCount: 0 };
+      }
+      if (!isUsenetCandidate(cand) && !cand.cached && this.env.now() - startMs >= 1500) {
         if (stage.verified.length > 0) break;
         this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
         return { done: false, verifiedCount: 0 };
@@ -1175,8 +1220,9 @@ export class AlbumResolver {
     if (stage.verified.length > 0) {
       finalReleases = stage.verified.slice(0, MAX_CACHED_RELEASES);
     } else {
-      stage.archiveFallbacks.sort((a, b) => b.score - a.score);
-      finalReleases = stage.archiveFallbacks.slice(0, 2);
+      const archiveFallbacks = [...(stage.archiveFallbacks || [])].sort((a, b) => b.score - a.score);
+      const debridFallbacks = [...(stage.debridFallbacks || [])].sort((a, b) => b.score - a.score);
+      finalReleases = [...archiveFallbacks.slice(0, 2), ...debridFallbacks.slice(0, 2)].slice(0, 3);
     }
 
     const now = this.env.now();
@@ -1365,10 +1411,36 @@ export class AlbumResolver {
       if (tk) seenUsenetTitle.add(tk);
       usenetDedup.push(u);
     }
-    const ordered = [...debridRanked.slice(0, 6), ...usenetDedup.slice(0, 8)];
+
+    // Real-Debrid, AllDebrid, and Debrid-Link return ErrUnsupported from bulk debrid_check,
+    // so debrid_check reports cached=false for every hash even when torrents are cached.
+    // When bulk debrid_check confirmed 0 cached torrents, pass the top 4 well-matched torrents
+    // to release_files so Ether's ListReleaseFiles can probe cache & file lists on demand.
+    const unconfirmedDebrid: Array<{ cand: SourceCandidate; score: number }> = [];
+    if (debridRanked.length === 0) {
+      for (const cand of rawCandidates) {
+        if (isUsenetCandidate(cand) || cand.cached) continue;
+        if (!cand.infoHash && !cand.magnet) continue;
+        const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference, {
+          allowUnconfirmedTorrent: true,
+        });
+        if (!pre.accepted || pre.score < 45) continue;
+        unconfirmedDebrid.push({ cand, score: pre.score });
+      }
+      unconfirmedDebrid.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return (b.cand.seeders || 0) - (a.cand.seeders || 0);
+      });
+    }
+
+    const ordered = [
+      ...debridRanked.slice(0, 6),
+      ...usenetDedup.slice(0, 8),
+      ...unconfirmedDebrid.slice(0, 4),
+    ];
     this.env.log(
       "info",
-      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length}`
+      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
     );
     return ordered;
   }
@@ -1434,6 +1506,7 @@ export class AlbumResolver {
     const album = stage.album;
     const verified = stage.verified;
     const archiveFallbacks = stage.archiveFallbacks;
+    const debridFallbacks = stage.debridFallbacks || (stage.debridFallbacks = []);
 
     let files: ReleaseFile[] = [];
     let isCached = Boolean(cand.cached);
@@ -1450,6 +1523,8 @@ export class AlbumResolver {
       }
       if (typeof first?.cached === "boolean") {
         isCached = first.cached;
+      } else if (files.length > 0) {
+        isCached = true;
       }
     } catch (err) {
       rethrowHostFault(err);
@@ -1458,7 +1533,37 @@ export class AlbumResolver {
 
     const isUsenet = isUsenetCandidate(cand);
     if (!isUsenet && !isCached) return;
-    if (files.length === 0) return;
+    if (files.length === 0) {
+      // Cached Debrid torrent whose provider did not return a file list: keep a structured
+      // release.track fallback so Ether's debrid.ChooseFile can select the track at acquire time.
+      if (!isUsenet && isCached && preScore >= 55) {
+        const qual = classifyReleaseQuality(cand.title || "", undefined, this.settings.qualityPreference);
+        if (qual.points >= 0) {
+          const trackMap: Record<string, TrackFileMapping> = {};
+          for (const tr of album.tracks) {
+            trackMap[tr.id] = {
+              track: buildArchiveTrackHint(tr),
+              size: 0,
+              mime: qual.mime,
+              confidence: 0.65,
+            };
+          }
+          debridFallbacks.push({
+            releaseId: candidateRefOf(cand),
+            sourceKind: "debrid",
+            qualityTier: qual.tier,
+            codec: qual.codec,
+            mime: qual.mime,
+            label: `${qual.label} · Debrid`,
+            score: Math.round(preScore * 0.65 * 10) / 10,
+            candidate: { ...cand, cached: true },
+            isUnconfirmedDebridFallback: true,
+            tracks: trackMap,
+          });
+        }
+      }
+      return;
+    }
 
     const match = matchAlbumReleaseFiles(album, cand.title || "", files, this.settings.qualityPreference);
     const archiveFiles = files.filter((f) => isArchivePath(f.path));
@@ -1467,11 +1572,11 @@ export class AlbumResolver {
         ? f.members.filter((m) => Boolean(m?.path && audioFormatOfPath(m.path)))
         : []
     );
+    const totalMembers = files.reduce((n, f) => n + (Array.isArray(f.members) ? f.members.length : 0), 0);
     if (archiveFiles.length > 0) {
       const archExts = Array.from(
         new Set(archiveFiles.map((f) => f.path.split(".").pop()?.toLowerCase() || ""))
       ).join(",");
-      const totalMembers = files.reduce((n, f) => n + (Array.isArray(f.members) ? f.members.length : 0), 0);
       this.env.log(
         "debug",
         `resolve-album: archive ${album.id} "${(cand.title || "").slice(0, 60)}" exts=${archExts} vols=${archiveFiles.length} members=${totalMembers} audioMembers=${expandedAudioFiles.length} matched=${match.matched} reason=${match.reason || "ok"}`
@@ -1500,19 +1605,21 @@ export class AlbumResolver {
         mime: match.quality.mime,
         label: `${match.quality.label} · ${srcTag}`,
         score: Math.round((preScore + coverageBonus + healthBonus + archivePenalty + match.averageConfidence * 40 + match.quality.points * 0.5) * 10) / 10,
-        candidate: cand,
+        candidate: isUsenet ? cand : { ...cand, cached: true },
         tracks: match.tracks,
       });
       return;
     }
 
-    // Complete expanded member listing (single-volume archive or multi-volume listing covering
-    // >= canonical track count) already revealed the real audio files and failed album matching.
-    // Multi-volume RARs where only volume 1 was peeked (partialRARMembers < canonical tracks)
-    // still qualify for the structured release.track fallback unless quality itself was rejected.
+    // Complete expanded member listing (single-volume archive — including inspected archives
+    // with zero audio members — or multi-volume listing covering >= canonical track count)
+    // already revealed the real members and failed album matching. Multi-volume RARs where only
+    // volume 1 was peeked still qualify for the structured release.track fallback unless quality
+    // itself was rejected.
     const expandedCompleteListing =
-      expandedAudioFiles.length > 0 &&
-      (archiveFiles.length <= 1 || expandedAudioFiles.length >= album.tracks.length);
+      (expandedAudioFiles.length > 0 &&
+        (archiveFiles.length <= 1 || expandedAudioFiles.length >= album.tracks.length)) ||
+      (archiveFiles.length <= 1 && totalMembers > 0 && expandedAudioFiles.length === 0);
     const expandedQualityRejected =
       expandedAudioFiles.length > 0 &&
       classifyReleaseQuality(cand.title || "", expandedAudioFiles, this.settings.qualityPreference).points < 0;
@@ -1584,8 +1691,8 @@ export class AlbumResolver {
       const releaseHint: PlayableSource["release"] = {
         candidate: rel.candidate,
       };
-      if (rel.isArchiveFallback) {
-        // Archive fallback without expanded inner members: send structured release.track
+      if (rel.isArchiveFallback || rel.isUnconfirmedDebridFallback) {
+        // Archive or file-list-less Debrid fallback: send structured release.track
         // for fuzzy scene-track matching instead of a synthetic fileHint (Issue #753).
         const trackHint = trackMap.track || buildTrackHintFromItem(item);
         if (trackHint) {
@@ -1819,10 +1926,32 @@ export class AlbumResolver {
       usenetDedup.push(u);
     }
 
-    const ordered = [...debridRanked.slice(0, 6), ...usenetDedup.slice(0, 8)];
+    const orderedDebrid = debridRanked.slice(0, 6);
+    const unconfirmedDebrid: Array<{ cand: SourceCandidate; score: number }> = [];
+    if (orderedDebrid.length === 0) {
+      for (const cand of rawCandidates) {
+        if (isUsenetCandidate(cand) || cand.cached) continue;
+        if (!cand.infoHash && !cand.magnet) continue;
+        const pre = preScoreConcertCandidate(cand, concert, this.settings.videoQualityPreference, {
+          allowUnconfirmedTorrent: true,
+        });
+        if (!pre.accepted || pre.score < 55) continue;
+        unconfirmedDebrid.push({ cand, score: pre.score });
+      }
+      unconfirmedDebrid.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return (b.cand.seeders || 0) - (a.cand.seeders || 0);
+      });
+    }
+
+    const ordered = [
+      ...orderedDebrid,
+      ...usenetDedup.slice(0, 8),
+      ...unconfirmedDebrid.slice(0, 4),
+    ];
     this.env.log(
       "info",
-      `resolve-concert: ${concert.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length}`
+      `resolve-concert: ${concert.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
     );
     return ordered;
   }
@@ -1842,6 +1971,7 @@ export class AlbumResolver {
     }
 
     if (!stage) {
+      this.cache.sweepLegacyBloat(64);
       const concert = this.loadConcertTarget(concertId, item);
       if (!concert) {
         this.env.log("warn", `resolve-concert: could not load metadata for ${concertId}`);
@@ -1859,6 +1989,7 @@ export class AlbumResolver {
         nextIdx: 0,
         verified: [],
         archiveFallbacks: [],
+        debridFallbacks: [],
         excludedSig,
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
@@ -1886,6 +2017,11 @@ export class AlbumResolver {
 
       const { cand, score: preScore } = stage.preRanked[stage.nextIdx];
       if (isUsenetCandidate(cand) && this.env.now() - startMs >= 900) {
+        if (stage.verified.length > 0) break;
+        this.cache.set(concertStageKey(concertId), stage, STAGE_CACHE_TTL_MS);
+        return { done: false, verifiedCount: 0 };
+      }
+      if (!isUsenetCandidate(cand) && !cand.cached && this.env.now() - startMs >= 1500) {
         if (stage.verified.length > 0) break;
         this.cache.set(concertStageKey(concertId), stage, STAGE_CACHE_TTL_MS);
         return { done: false, verifiedCount: 0 };
@@ -1929,6 +2065,8 @@ export class AlbumResolver {
       }
       if (typeof first?.cached === "boolean") {
         isCached = first.cached;
+      } else if (files.length > 0) {
+        isCached = true;
       }
     } catch (err) {
       rethrowHostFault(err);
@@ -1937,7 +2075,25 @@ export class AlbumResolver {
 
     const isUsenet = isUsenetCandidate(cand);
     if (!isUsenet && !isCached) return;
-    if (files.length === 0) return;
+    if (files.length === 0) {
+      if (!isUsenet && isCached && preScore >= 60) {
+        const qual = classifyVideoQuality(cand.title || "", undefined, this.settings.videoQualityPreference);
+        const debridFallbacks = stage.debridFallbacks || (stage.debridFallbacks = []);
+        debridFallbacks.push({
+          releaseId: candidateRefOf(cand),
+          sourceKind: "debrid",
+          qualityTier: qual.tier,
+          codec: qual.codec,
+          mime: qual.mime,
+          label: `${qual.label} · Debrid`,
+          score: Math.round(preScore * 0.65 * 10) / 10,
+          candidate: { ...cand, cached: true },
+          isUnconfirmedDebridFallback: true,
+          size: 0,
+        });
+      }
+      return;
+    }
 
     const match = matchConcertReleaseFiles(cand.title || "", files, this.settings.videoQualityPreference);
     if (match.matched && match.file) {
@@ -1963,7 +2119,7 @@ export class AlbumResolver {
         mime: match.quality.mime,
         label: `${match.quality.label} · ${srcTag}`,
         score: Math.round((preScore + healthBonus + archivePenalty + match.quality.points * 0.5) * 10) / 10,
-        candidate: cand,
+        candidate: isUsenet ? cand : { ...cand, cached: true },
         isArchiveMember: match.file.isArchiveMember,
         fileIndex: match.file.isArchiveMember ? undefined : match.file.index,
         file: match.file.isArchiveMember ? undefined : match.file.path,
@@ -2020,8 +2176,9 @@ export class AlbumResolver {
     if (stage.verified.length > 0) {
       finalReleases = stage.verified.slice(0, MAX_CACHED_RELEASES);
     } else {
-      stage.archiveFallbacks.sort((a, b) => b.score - a.score);
-      finalReleases = stage.archiveFallbacks.slice(0, 2);
+      const archiveFallbacks = [...(stage.archiveFallbacks || [])].sort((a, b) => b.score - a.score);
+      const debridFallbacks = [...(stage.debridFallbacks || [])].sort((a, b) => b.score - a.score);
+      finalReleases = [...archiveFallbacks.slice(0, 2), ...debridFallbacks.slice(0, 2)].slice(0, 3);
     }
 
     const now = this.env.now();
@@ -2061,9 +2218,9 @@ export class AlbumResolver {
       const releaseHint: PlayableSource["release"] = {
         candidate: rel.candidate,
       };
-      if (rel.isArchiveFallback) {
-        // Video archive fallback without expanded members: omit synthetic fileHint so Ether's
-        // video archive engine selects the main video member automatically.
+      if (rel.isArchiveFallback || rel.isUnconfirmedDebridFallback) {
+        // Video archive or file-list-less Debrid fallback: omit synthetic fileHint so Ether's
+        // video selection engine picks the main concert video file automatically.
       } else if (rel.isArchiveMember) {
         releaseHint.fileHint = rel.fileHint || rel.file;
       } else {

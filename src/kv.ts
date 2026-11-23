@@ -126,6 +126,37 @@ interface CacheEnvelope<T> {
   exp: number;
 }
 
+const LEGACY_BLOAT_PREFIXES = [
+  "album_meta:",
+  "alb_rel:",
+  "alb_rel_v2:",
+  "alb_rel_v3:",
+  "alb_rel_v4:",
+  "alb_rel_v5:",
+  "alb_stage:",
+  "alb_stage_v4:",
+  "concert_rel_v1:",
+];
+
+const BULKY_RAW_DEEZER_PREFIXES = [
+  "dz:album:",
+  "dz:search:",
+  "dz:artist:",
+];
+
+const BLOAT_SWEPT_KEY = "kv:bloat_swept:v1";
+
+function isQuotaError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = typeof err === "string" ? err : String((err as { message?: unknown }).message || err);
+  const code = extractFaultCode(err, msg);
+  return code === "quota_exceeded" || /quota/i.test(msg);
+}
+
+function isBulkyArtistAlbumsPageKey(k: string): boolean {
+  return k.startsWith("dz:artist:") && k.includes(":albums:p:");
+}
+
 export class KVCache {
   private env: HostEnv;
   private mem = new Map<string, { v: unknown; exp: number }>();
@@ -134,13 +165,14 @@ export class KVCache {
     this.env = env;
   }
 
-  get<T>(key: string): T | null {
+  get<T>(key: string, options?: { memOnly?: boolean }): T | null {
     const now = this.env.now();
     const hit = this.mem.get(key);
     if (hit) {
       if (hit.exp > now) return hit.v as T;
       this.mem.delete(key);
     }
+    if (options?.memOnly) return null;
     try {
       const raw = this.env.kv.get(key);
       if (!raw) return null;
@@ -155,9 +187,10 @@ export class KVCache {
     }
   }
 
-  getStale<T>(key: string): T | null {
+  getStale<T>(key: string, options?: { memOnly?: boolean }): T | null {
     const hit = this.mem.get(key);
     if (hit) return hit.v as T;
+    if (options?.memOnly) return null;
     try {
       const raw = this.env.kv.get(key);
       if (!raw) return null;
@@ -169,15 +202,29 @@ export class KVCache {
     }
   }
 
-  set<T>(key: string, value: T, ttlMs: number): void {
+  set<T>(key: string, value: T, ttlMs: number, options?: { persist?: boolean }): void {
     const exp = this.env.now() + ttlMs;
     const envObj: CacheEnvelope<T> = { v: value, exp };
     this.mem.set(key, envObj);
+    if (options?.persist === false) return;
+    const payload = JSON.stringify(envObj);
     try {
-      this.env.kv.put(key, JSON.stringify(envObj));
+      this.env.kv.put(key, payload);
     } catch (err) {
       rethrowHostFault(err);
-      // KV quota or transient write fault: keep in-memory cache for this call.
+      if (isQuotaError(err)) {
+        const evicted = this.evictForSpace(64, key);
+        if (evicted > 0) {
+          try {
+            this.env.kv.put(key, payload);
+            this.env.log("info", `kv: reclaimed ${evicted} stale/bulky keys after quota_exceeded`);
+            return;
+          } catch (retryErr) {
+            rethrowHostFault(retryErr);
+          }
+        }
+      }
+      // Transient write fault or exhausted quota: keep in-memory cache for this call.
     }
   }
 
@@ -189,6 +236,151 @@ export class KVCache {
       rethrowHostFault(err);
       // ignore
     }
+  }
+
+  /**
+   * Reclaim space when plugins_kv hits Ether's 50 MiB quota (e.g. legacy 0.2.4 installs
+   * that persisted raw 86 KB Deezer responses). Deletes legacy versioned prefixes first,
+   * then bulky raw dz:* entries, then expired/oldest album_v2:* entries.
+   */
+  evictForSpace(maxDeletes = 64, keepKey = ""): number {
+    let deleted = 0;
+    const tryDelete = (k: string): boolean => {
+      if (!k || k === keepKey || k.startsWith("rl:")) return false;
+      try {
+        this.env.kv.delete(k);
+        this.mem.delete(k);
+        deleted++;
+        return true;
+      } catch (err) {
+        rethrowHostFault(err);
+        return false;
+      }
+    };
+
+    const listSafe = (prefix: string): string[] => {
+      try {
+        return this.env.kv.list(prefix);
+      } catch (err) {
+        rethrowHostFault(err);
+        return [];
+      }
+    };
+
+    // 1. Dead legacy versioned prefixes (zero live readers).
+    for (const prefix of LEGACY_BLOAT_PREFIXES) {
+      if (deleted >= maxDeletes) return deleted;
+      for (const k of listSafe(prefix)) {
+        if (deleted >= maxDeletes) return deleted;
+        tryDelete(k);
+      }
+    }
+
+    // 2. Bulky raw Deezer payloads (rebuilt on demand / already stored compactly in album_v2:*).
+    for (const prefix of BULKY_RAW_DEEZER_PREFIXES) {
+      if (deleted >= maxDeletes) return deleted;
+      const keys = listSafe(prefix);
+      // Prioritize 86 KB paginated artist-albums payloads first when listing dz:artist:
+      if (prefix === "dz:artist:") {
+        for (const k of keys) {
+          if (deleted >= maxDeletes) return deleted;
+          if (isBulkyArtistAlbumsPageKey(k)) tryDelete(k);
+        }
+      }
+      for (const k of keys) {
+        if (deleted >= maxDeletes) return deleted;
+        if (prefix === "dz:artist:" && isBulkyArtistAlbumsPageKey(k)) continue;
+        tryDelete(k);
+      }
+    }
+
+    // 3. Fallback: evict oldest/expired album_v2:* entries if still tight.
+    if (deleted < maxDeletes) {
+      const now = this.env.now();
+      const albumKeys = listSafe("album_v2:");
+      for (const k of albumKeys) {
+        if (deleted >= maxDeletes) return deleted;
+        try {
+          const raw = this.env.kv.get(k);
+          if (raw) {
+            const parsed = JSON.parse(raw) as CacheEnvelope<unknown>;
+            if (typeof parsed?.exp === "number" && parsed.exp <= now) {
+              tryDelete(k);
+            }
+          }
+        } catch (err) {
+          rethrowHostFault(err);
+        }
+      }
+      for (const k of albumKeys) {
+        if (deleted >= maxDeletes) return deleted;
+        tryDelete(k);
+      }
+    }
+
+    return deleted;
+  }
+
+  /**
+   * Bounded incremental sweep run on background sync / resolve to clean up legacy
+   * versioned prefixes and bulky raw Deezer payloads left by <=0.2.4 installs so
+   * existing deployments automatically recover well below Ether's 50 MiB KV quota.
+   */
+  sweepLegacyBloat(maxDeletes = 120): number {
+    if (this.get<boolean>(BLOAT_SWEPT_KEY)) return 0;
+
+    let deleted = 0;
+    const listSafe = (prefix: string): string[] => {
+      try {
+        return this.env.kv.list(prefix);
+      } catch (err) {
+        rethrowHostFault(err);
+        return [];
+      }
+    };
+
+    const deleteKey = (k: string): void => {
+      try {
+        this.env.kv.delete(k);
+        this.mem.delete(k);
+        deleted++;
+      } catch (err) {
+        rethrowHostFault(err);
+      }
+    };
+
+    let moreRemains = false;
+    for (const prefix of [...LEGACY_BLOAT_PREFIXES, "dz:album:", "dz:search:"]) {
+      const keys = listSafe(prefix);
+      for (const k of keys) {
+        if (deleted >= maxDeletes) {
+          moreRemains = true;
+          break;
+        }
+        deleteKey(k);
+      }
+      if (moreRemains) break;
+    }
+
+    if (!moreRemains) {
+      const artistKeys = listSafe("dz:artist:");
+      for (const k of artistKeys) {
+        if (!isBulkyArtistAlbumsPageKey(k)) continue;
+        if (deleted >= maxDeletes) {
+          moreRemains = true;
+          break;
+        }
+        deleteKey(k);
+      }
+    }
+
+    if (deleted > 0) {
+      this.env.log("info", `kv: swept ${deleted} legacy/bulky cache keys${moreRemains ? " (more remaining)" : " (clean)"}`);
+    }
+    if (!moreRemains) {
+      this.set(BLOAT_SWEPT_KEY, true, 24 * HOUR_MS);
+    }
+    return deleted;
   }
 
   /**

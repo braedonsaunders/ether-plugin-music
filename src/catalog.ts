@@ -955,6 +955,9 @@ export class MusicCatalog {
     const caps = sizeCaps(this.settings.curatedSize);
 
     if (level === "artist") {
+      if (offset === 0) {
+        this.cache.sweepLegacyBloat(120);
+      }
       const seed = this.getCuratedSeed(false);
       // Paginate artist hydration in chunks of <= 18 per page so Wave 0 stays well under Deezer's 50/5s window.
       const pageSize = Math.min(limit, 18);
@@ -994,6 +997,9 @@ export class MusicCatalog {
         if (!canonical) continue;
         // Ensure parentId matches requested artist (for collab/featured albums that credit another primary artist)
         const item = this.buildAlbumItem(canonical, seedEntry?.chartBonus || 0);
+        if (canonical.deezerArtistId && canonical.deezerArtistId !== deezerArtistId) {
+          this.recordAlbumParentOverrides([[canonical.deezerAlbumId, deezerArtistId]]);
+        }
         item.parentId = artistExternalId(deezerArtistId);
         albums.push(item);
       }
@@ -1219,6 +1225,7 @@ export class MusicCatalog {
    * expanded, saved, and played items are NEVER wiped out by a full rewalk diff.
    */
   changes(since: string): KindChangePage {
+    this.cache.sweepLegacyBloat(120);
     const bucket = this.currentBucket();
     // Initial probe after /browse walk: record baseline cursor without duplicating work.
     if (!since) {
@@ -1835,17 +1842,12 @@ export class MusicCatalog {
     // Record expanded album -> artist parent overrides in one bounded KV map so clicking
     // a collab/split album from an artist page never re-parents it away from that artist.
     if (deduped.length > 0) {
-      const parentMap = this.cache.get<Record<string, number>>("exp:alb_parent:v1") || {};
+      const overrides: Array<[number, number]> = [];
       for (const al of deduped) {
-        parentMap[String(al.id)] = deezerArtistId;
+        if (al.artist?.id && al.artist.id === deezerArtistId) continue;
+        overrides.push([al.id, deezerArtistId]);
       }
-      const keys = Object.keys(parentMap);
-      if (keys.length > 500) {
-        for (const oldKey of keys.slice(0, keys.length - 500)) {
-          delete parentMap[oldKey];
-        }
-      }
-      this.cache.set("exp:alb_parent:v1", parentMap, 7 * DAY_MS);
+      this.recordAlbumParentOverrides(overrides);
     }
 
     const nextOffset = offset + 100;
@@ -1860,6 +1862,28 @@ export class MusicCatalog {
       items,
       cursor: hasMore ? String(nextOffset) : "",
     };
+  }
+
+  private recordAlbumParentOverrides(pairs: Array<[number, number]>): void {
+    if (!pairs.length) return;
+    const parentMap = this.cache.get<Record<string, number>>("exp:alb_parent:v1") || {};
+    let changed = false;
+    for (const [albumId, artistId] of pairs) {
+      if (!albumId || !artistId) continue;
+      const key = String(albumId);
+      if (parentMap[key] !== artistId) {
+        parentMap[key] = artistId;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    const keys = Object.keys(parentMap);
+    if (keys.length > 500) {
+      for (const oldKey of keys.slice(0, keys.length - 500)) {
+        delete parentMap[oldKey];
+      }
+    }
+    this.cache.set("exp:alb_parent:v1", parentMap, 7 * DAY_MS);
   }
 
   /**
