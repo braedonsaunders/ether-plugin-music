@@ -1082,3 +1082,18 @@ test("playlist level: an editorial playlist with its members and the albums and 
   assert.ok(at("al-302127") >= 0 && at("al-302127") < at("tr-3135554"));
   assert.equal(items.find((i) => i.id === "tr-501")?.playable, true);
 });
+
+test("changes brings in chart playlists once per bucket, even mid-bucket after an upgrade", () => {
+  const { env } = makeMockCatalogHost();
+  const handle = createHandler(env);
+  const probe = handle({ method: "POST", path: "/ether/v1/kinds/music/changes", body: { since: "" } });
+  const bucket = (probe.body as { nextCursor: string }).nextCursor;
+  const first = handle({ method: "POST", path: "/ether/v1/kinds/music/changes", body: { since: bucket } });
+  const ups = (first.body as { upserts: KindItem[] }).upserts;
+  const playlist = ups.find((i) => i.id === "pl-3155776842") as KindItem & { members: string[] };
+  assert.ok(playlist && playlist.level === "playlist");
+  assert.deepEqual(playlist.members, ["tr-3135554", "tr-501"]);
+  assert.ok(ups.findIndex((i) => i.id === "tr-501") < ups.findIndex((i) => i.id === "pl-3155776842"));
+  const again = handle({ method: "POST", path: "/ether/v1/kinds/music/changes", body: { since: bucket } });
+  assert.ok(!(again.body as { upserts: KindItem[] }).upserts.some((i) => i.level === "playlist"));
+});

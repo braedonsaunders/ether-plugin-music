@@ -156,6 +156,7 @@ export const ARTIST_ART_KEY = "artist_art_v1:";
 /** Editorial playlists the library offers, and how many of each one's songs. */
 export const PLAYLIST_PICKS = 10;
 export const PLAYLIST_MEMBERS = 50;
+const PLAYLISTS_BUCKET_KEY = "playlists_bucket";
 export const MAX_BACKFILL_TRIED = 400;
 const BACKFILL_RETRY_MS = 3 * DAY_MS;
 const BACKFILL_QUEUE_TTL_MS = 14 * DAY_MS;
@@ -1303,8 +1304,19 @@ export class MusicCatalog {
       return { upserts: [], deletes: [], nextCursor: bucket, complete: true };
     }
     if (since === bucket) {
-      const backfilled = this.drainStubBackfill(18_000);
-      return { upserts: backfilled, deletes: [], nextCursor: bucket, complete: true };
+      const sameStart = this.env.now();
+      const upserts: KindItem[] = [];
+      const seen = new Set<string>();
+      this.refreshPlaylists(bucket, 12_000, (it) => {
+        if (it?.id && !seen.has(it.id)) {
+          seen.add(it.id);
+          upserts.push(it);
+        }
+      });
+      for (const it of this.drainStubBackfill(18_000 - (this.env.now() - sameStart))) {
+        if (!seen.has(it.id)) upserts.push(it);
+      }
+      return { upserts, deletes: [], nextCursor: bucket, complete: true };
     }
 
     // Refresh curated artists, video concerts & top albums cleanly (broader refresh on v6 migration).
@@ -1386,6 +1398,7 @@ export class MusicCatalog {
       }
     }
 
+    this.refreshPlaylists(bucket, 20_000 - (this.env.now() - startMs), pushItem);
     this.recordArtlessArtists(upserts);
     // Drain any queued stub artists/albums from prior search()/expand() calls within remaining budget.
     const remainingBudget = 26_000 - (this.env.now() - startMs);
@@ -2191,8 +2204,14 @@ export class MusicCatalog {
     const pick = picks[at];
     if (!pick) return { items: [] };
     const next = at + 1 < picks.length ? String(at + 1) : undefined;
-    const playlist = this.dz.getPlaylist(pick.id, 4000);
-    if (!playlist || playlist.tracks.length === 0) return { items: [], nextCursor: next };
+    return { items: this.playlistItems(pick.id), nextCursor: next };
+  }
+
+  /** One chart playlist as stored items: its tracks (with their albums and artists) first,
+   * then the playlist itself listing them as members. */
+  private playlistItems(id: number): KindItem[] {
+    const playlist = this.dz.getPlaylist(id, 4000);
+    if (!playlist || playlist.tracks.length === 0) return [];
     const out: KindItem[] = [];
     const members: string[] = [];
     const artists = new Set<number>();
@@ -2214,7 +2233,24 @@ export class MusicCatalog {
       fields: { curation: ["Editorial Playlist"], popularity: playlist.fans || 0 },
       members,
     } as KindItem);
-    return { items: out, nextCursor: next };
+    return out;
+  }
+
+  /** Chart playlists once per change bucket (charts move; a plugin upgrade mid-bucket still
+   * brings them in without a full walk), within the time left of this /changes call. */
+  private refreshPlaylists(bucket: string, budgetMs: number, push: (it: KindItem) => void): void {
+    if (budgetMs <= 0 || this.cache.get<string>(PLAYLISTS_BUCKET_KEY) === bucket) return;
+    const startMs = this.env.now();
+    try {
+      for (const pick of this.playlistPicks()) {
+        if (this.env.now() - startMs > budgetMs) return;
+        for (const it of this.playlistItems(pick.id)) push(it);
+      }
+    } catch (err) {
+      rethrowHostFault(err);
+      return;
+    }
+    this.cache.set(PLAYLISTS_BUCKET_KEY, bucket, 12 * HOUR_MS);
   }
 
   /**
