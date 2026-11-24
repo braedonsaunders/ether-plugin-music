@@ -28,7 +28,9 @@ export interface KindArtRef {
 
 export interface KindItem {
   id: string;
-  level: "artist" | "album" | "track" | "concert";
+  level: "artist" | "album" | "track" | "concert" | "playlist";
+  /** A playlist's ordered members (external ids of tracks). */
+  members?: string[];
   parentId?: string;
   index?: number;
   title: string;

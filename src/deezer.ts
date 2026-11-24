@@ -94,6 +94,18 @@ export interface DeezerAlbumSummary {
   artist?: { id: number; name: string; picture_xl?: string; picture_big?: string };
 }
 
+export interface DeezerPlaylist {
+  id: number;
+  title: string;
+  description?: string;
+  nb_tracks?: number;
+  fans?: number;
+  picture_xl?: string;
+  picture_big?: string;
+  user?: { name?: string };
+  tracks: DeezerTrack[];
+}
+
 export interface DeezerTrack {
   id: number;
   title: string;
@@ -321,6 +333,36 @@ export class DeezerClient {
       { compact: (r) => ({ data: Array.isArray(r?.data) ? r.data.map(slimArtist) : [] }) }
     );
     return Array.isArray(res?.data) ? res!.data : [];
+  }
+
+  /** Keyless chart playlists (genre 0: worldwide). */
+  getChartPlaylists(genreId = 0, limit = 10): Array<Omit<DeezerPlaylist, "tracks">> {
+    const res = this.getJson<{ data?: Array<Omit<DeezerPlaylist, "tracks">> }>(
+      `/chart/${genreId}/playlists?limit=${limit}`,
+      `dz:chart:${genreId}:playlists:${limit}`,
+      6 * HOUR_MS,
+      4000,
+      { compact: (r) => ({ data: Array.isArray(r?.data) ? r.data.map((p) => ({ id: p.id, title: p.title, nb_tracks: p.nb_tracks, fans: p.fans, picture_xl: p.picture_xl, picture_big: p.picture_big, user: p.user ? { name: p.user.name } : undefined })) : [] }) }
+    );
+    return Array.isArray(res?.data) ? res!.data : [];
+  }
+
+  /** A public playlist and its first tracks (keyless). */
+  getPlaylist(playlistId: number, timeoutMs = 4000): DeezerPlaylist | null {
+    const res = this.getJson<any>(
+      `/playlist/${playlistId}`,
+      `dz:playlist:${playlistId}`,
+      6 * HOUR_MS,
+      timeoutMs,
+      {
+        compact: (r) => ({
+          id: r?.id, title: r?.title, description: r?.description || "", nb_tracks: r?.nb_tracks, fans: r?.fans,
+          picture_xl: r?.picture_xl, picture_big: r?.picture_big, user: r?.creator ? { name: r.creator.name } : undefined,
+          tracks: Array.isArray(r?.tracks?.data) ? r.tracks.data.slice(0, 100).map((t: DeezerTrack) => slimTrack(t, true)) : [],
+        }),
+      }
+    );
+    return res && res.id ? (res as DeezerPlaylist) : null;
   }
 
   /** Deezer's keyless artist radio: tracks by the artist and artists like them. */

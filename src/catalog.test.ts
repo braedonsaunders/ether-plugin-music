@@ -27,6 +27,15 @@ function makeMockCatalogHost(): {
 
   const fakeHttp = (req: HttpFetchRequest): HttpFetchResponse => {
     httpCalls.push(req.url);
+    if (req.url.includes("/chart/0/playlists")) {
+      return { status: 200, body: JSON.stringify({ data: [{ id: 3155776842, title: "Top Worldwide", nb_tracks: 2, fans: 878_000, picture_xl: "https://cdn.test/top-xl.jpg" }] }) };
+    }
+    if (req.url.endsWith("/playlist/3155776842")) {
+      return { status: 200, body: JSON.stringify({ id: 3155776842, title: "Top Worldwide", description: "", nb_tracks: 2, fans: 878_000, picture_xl: "https://cdn.test/top-xl.jpg", creator: { name: "Alex - Deezer Editor" }, tracks: { data: [
+        { id: 3135554, title: "Aerodynamic", duration: 212, artist: { id: 27, name: "Daft Punk" }, album: { id: 302127, title: "Discovery", cover_xl: "https://cdn.test/disc-xl.jpg" } },
+        { id: 501, title: "Newcomer", duration: 180, artist: { id: 9001, name: "Someone New" }, album: { id: 7001, title: "Debut", cover_xl: "https://cdn.test/debut-xl.jpg" } },
+      ] } }) };
+    }
     if (req.url.includes("/artist/27/related")) {
       return { status: 200, body: JSON.stringify({ data: [
         { id: 1069, name: "Portishead", picture_xl: "https://cdn.test/ph-xl.jpg" },
@@ -1052,4 +1061,24 @@ test("related: similar artists and a radio continuation that brings its albums",
   assert.deepEqual(cont.order, ["tr-3135554"]);
   assert.ok(cont.items.some((i) => i.id === "al-302127" && i.level === "album"));
   assert.ok(cont.items.some((i) => i.id === "tr-3135554" && i.playable));
+});
+
+test("playlist level: an editorial playlist with its members and the albums and artists they need", () => {
+  const { env } = makeMockCatalogHost();
+  const handle = createHandler(env);
+  // Discovery is canonical in the cache once its album has been read.
+  handle({ method: "POST", path: "/ether/v1/kinds/music/browse", body: { level: "track", parentId: "al-302127", limit: 50 } });
+  const res = handle({ method: "POST", path: "/ether/v1/kinds/music/browse", body: { level: "playlist", limit: 200 } });
+  assert.equal(res.status, 200);
+  const items = (res.body as { items: KindItem[] }).items;
+  const playlist = items[items.length - 1] as KindItem & { members: string[] };
+  assert.equal(playlist.level, "playlist");
+  assert.equal(playlist.id, "pl-3155776842");
+  assert.equal(playlist.parentId, undefined);
+  assert.deepEqual(playlist.members, ["tr-3135554", "tr-501"]);
+  // Parents come before what they parent; the unknown album is described by the playlist.
+  const at = (id: string) => items.findIndex((i) => i.id === id);
+  assert.ok(at("ar-9001") >= 0 && at("ar-9001") < at("al-7001") && at("al-7001") < at("tr-501"));
+  assert.ok(at("al-302127") >= 0 && at("al-302127") < at("tr-3135554"));
+  assert.equal(items.find((i) => i.id === "tr-501")?.playable, true);
 });

@@ -153,6 +153,9 @@ export const BACKFILL_QUEUE_KEY = "backfill:queue:v1";
 export const BACKFILL_TRIED_KEY = "backfill:tried:v1";
 export const MAX_BACKFILL_QUEUE = 200;
 export const ARTIST_ART_KEY = "artist_art_v1:";
+/** Editorial playlists the library offers, and how many of each one's songs. */
+export const PLAYLIST_PICKS = 10;
+export const PLAYLIST_MEMBERS = 50;
 export const MAX_BACKFILL_TRIED = 400;
 const BACKFILL_RETRY_MS = 3 * DAY_MS;
 const BACKFILL_QUEUE_TTL_MS = 14 * DAY_MS;
@@ -983,6 +986,7 @@ export class MusicCatalog {
    * Walks artist -> album -> track and artist -> concert cleanly with cursor pagination.
    */
   browse(req: KindBrowseRequest): KindPage {
+    if (req.level === "playlist") return this.browsePlaylists(String(req.cursor || ""));
     const level = (req.level || "artist") as "artist" | "album" | "track" | "concert";
     const limit = Math.max(1, Math.min(200, Number(req.limit || 200)));
     const offset = Math.max(0, Number(req.cursor || 0) || 0);
@@ -2121,6 +2125,96 @@ export class MusicCatalog {
       latestReleaseSec: 0,
       latestYear: 0,
     });
+  }
+
+  /** The editorial playlists the library offers: Deezer's worldwide chart playlists. */
+  private playlistPicks(): Array<{ id: number }> {
+    return this.dz.getChartPlaylists(0, PLAYLIST_PICKS).filter((p) => p && p.id);
+  }
+
+  /** A playlist's tracks as stored items: the canonical album and its tracks when cached, else
+   * the album and track as the playlist describes them (the album is filled in when opened). */
+  private playlistTrackItems(tr: DeezerTrack, artists: Set<number>, albums: Set<number>, out: KindItem[]): string | null {
+    const albumId = tr.album?.id;
+    const artistId = tr.artist?.id;
+    if (!tr.id || !albumId || !artistId) return null;
+    const canonical = this.cache.get<CanonicalAlbum>(`album_v2:${albumExternalId(albumId)}`);
+    const parentArtist = canonical?.deezerArtistId || artistId;
+    if (!artists.has(parentArtist)) {
+      artists.add(parentArtist);
+      out.push(this.artistItemFor(parentArtist, canonical?.artistName || tr.artist?.name || ""));
+    }
+    if (canonical && canonical.tracks.some((t) => t.id === trackExternalId(tr.id))) {
+      if (!albums.has(albumId)) {
+        albums.add(albumId);
+        out.push(this.buildAlbumItem(canonical), ...this.buildTrackItems(canonical));
+      }
+      return trackExternalId(tr.id);
+    }
+    if (!albums.has(albumId)) {
+      albums.add(albumId);
+      const art = makeArt(tr.album?.cover_xl, tr.album?.cover_big);
+      out.push({
+        id: albumExternalId(albumId),
+        level: "album",
+        parentId: artistExternalId(parentArtist),
+        title: tr.album?.title || tr.title,
+        art,
+        fields: { artistName: tr.artist?.name || "", albumTitle: tr.album?.title || "" },
+        hints: { albumId: albumExternalId(albumId), deezerAlbumId: albumId, deezerArtistId: parentArtist, artistName: tr.artist?.name || "", albumTitle: tr.album?.title || "" },
+      });
+    }
+    out.push({
+      id: trackExternalId(tr.id),
+      level: "track",
+      parentId: albumExternalId(albumId),
+      title: tr.title,
+      playable: true,
+      art: makeArt(tr.album?.cover_xl, tr.album?.cover_big),
+      fields: { artistName: tr.artist?.name || "", albumTitle: tr.album?.title || "", duration: tr.duration, explicit: Boolean(tr.explicit_lyrics) },
+      hints: {
+        albumId: albumExternalId(albumId), deezerAlbumId: albumId, deezerTrackId: tr.id, deezerArtistId: parentArtist,
+        artistName: tr.album ? tr.artist?.name || "" : "", trackArtistName: tr.artist?.name || "", albumTitle: tr.album?.title || "",
+        durationSec: tr.duration, isrc: tr.isrc,
+      },
+    });
+    return trackExternalId(tr.id);
+  }
+
+  /**
+   * Browse the playlist level: one editorial playlist per page, its tracks first (with the albums
+   * and artists they need) and the playlist with its members last. Cursor: the playlist's place.
+   */
+  private browsePlaylists(cursor: string): KindPage {
+    const picks = this.playlistPicks();
+    const at = Math.max(0, Number(cursor || 0) || 0);
+    const pick = picks[at];
+    if (!pick) return { items: [] };
+    const next = at + 1 < picks.length ? String(at + 1) : undefined;
+    const playlist = this.dz.getPlaylist(pick.id, 4000);
+    if (!playlist || playlist.tracks.length === 0) return { items: [], nextCursor: next };
+    const out: KindItem[] = [];
+    const members: string[] = [];
+    const artists = new Set<number>();
+    const albums = new Set<number>();
+    for (const tr of playlist.tracks.slice(0, PLAYLIST_MEMBERS)) {
+      const id = this.playlistTrackItems(tr, artists, albums, out);
+      if (id && !members.includes(id)) members.push(id);
+    }
+    const by = playlist.user?.name ? playlist.user.name.replace(/\s*-\s*Deezer\s+/i, " · ") : "";
+    out.push({
+      id: `pl-${playlist.id}`,
+      level: "playlist",
+      title: playlist.title,
+      summary: [playlist.description, by].filter(Boolean).join(" · ") || `${members.length} songs`,
+      rating: popularityToRating(playlist.fans || 0, 0),
+      art: makeArt(playlist.picture_xl, playlist.picture_big),
+      childCount: members.length,
+      leafCount: members.length,
+      fields: { curation: ["Editorial Playlist"], popularity: playlist.fans || 0 },
+      members,
+    } as KindItem);
+    return { items: out, nextCursor: next };
   }
 
   /**
