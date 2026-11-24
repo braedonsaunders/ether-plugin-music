@@ -62,7 +62,16 @@ function fakeHost(stored: KindItem[]) {
       return { items: list.slice(0, q.limit || 200) };
     },
     get: (ids) => ids.map((id) => items.get(id)).filter((x): x is KindItem => Boolean(x)),
-    upsert: (list) => list.forEach((i) => items.set(i.id, i)),
+    // Ether fetches a container's children from the catalogue and stores them.
+    expand: (parentId) => {
+      calls.push(`expand:${parentId}`);
+      if (parentId === "al-10") [album, ...tracks].forEach((i) => items.set(i.id, i));
+      return { pending: false };
+    },
+    search: (query) => {
+      calls.push(`search:${query}`);
+      return { found: 0 };
+    },
     state: (ids) => ids.map((id) => ({ id, playCount: plays.get(id) || 0, favorite: favs.has(id) })),
     favorite: (ids, on) => ids.forEach((id) => (on ? favs.add(id) : favs.delete(id))),
     played: (id) => void plays.set(id, (plays.get(id) || 0) + 1),
@@ -88,8 +97,6 @@ function fakeHost(stored: KindItem[]) {
 }
 
 const catalog = {
-  expand: ({ parentId }: { parentId: string }) => ({ items: parentId === "al-10" ? [album, ...tracks] : [] }),
-  search: () => ({ items: [] }),
   lyrics: () => ({ syncedLyrics: "[00:01.50]Hello\n[00:03.00]World", source: "lrclib" as const }),
 };
 
@@ -115,7 +122,7 @@ test("getAlbum materialises missing tracks and renders songs", () => {
   assert.equal(r.album.song[0].id, "tr-101");
   assert.equal(r.album.song[0].artistId, "ar-1");
   assert.equal(r.album.song[0].coverArt, "al-10");
-  assert.ok(f.items.has("tr-102"), "expanded tracks are upserted into Ether");
+  assert.ok(f.calls.includes("expand:al-10"), "the album is opened through Ether");
 });
 
 test("XML output escapes and nests", () => {

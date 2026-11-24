@@ -29,8 +29,6 @@ const NOW_PLAYING_KEY = "ss:np:v1";
 const NOW_PLAYING_TTL_MS = 15 * 60 * 1000;
 const CURSOR_KEY_PREFIX = "ss:cur:v1:";
 const MAX_CURSORS = 64;
-const LIVE_SEARCH_KEY = "ss:live:v1";
-const LIVE_SEARCH_TTL_MS = 30 * 60 * 1000;
 const GENRES_KEY = "ss:genres:v1";
 const GENRES_TTL_MS = 60 * 60 * 1000;
 
@@ -83,7 +81,10 @@ export interface BrowsePage {
 export interface SubsonicHost {
   browse(q: BrowseQuery): BrowsePage;
   get(ids: string[]): KindItem[];
-  upsert(items: KindItem[]): void;
+  /** Opens a container the way an Ether app does; Ether fetches and stores its children. */
+  expand(parentId: string): { pending: boolean };
+  /** Searches the way an Ether app does, live search included; Ether stores what it finds. */
+  search(query: string, limit: number): { found: number };
   state(ids: string[]): ItemState[];
   favorite(ids: string[], on: boolean): void;
   played(id: string): void;
@@ -98,8 +99,6 @@ export interface SubsonicHost {
 
 /** The catalogue and lyrics operations the adapter borrows from the plugin. */
 export interface SubsonicCatalog {
-  expand(req: { parentId: string; level: string }): { items?: KindItem[] };
-  search(query: string, limit: number): { items: KindItem[] };
   lyrics(q: { artistName: string; trackTitle: string; albumTitle?: string; durationSec?: number }): LyricsResult | null;
 }
 
@@ -110,9 +109,8 @@ export function hostedSubsonicHost(): SubsonicHost {
   return {
     browse: (q) => k.browse(KIND, q),
     get: (ids) => (ids.length ? k.get(KIND, ids) : []),
-    upsert: (items) => {
-      if (items.length) k.upsert(KIND, items);
-    },
+    expand: (parentId) => k.expand(KIND, parentId),
+    search: (query, limit) => k.search(KIND, query, { limit }),
     state: (ids) => (ids.length ? k.state(KIND, ids) : []),
     favorite: (ids, on) => {
       if (ids.length) k.favorite(KIND, ids, on);
@@ -816,12 +814,10 @@ export class SubsonicAdapter {
     const expected = level === "track" ? num(field(parent, "trackCount")) || parent.childCount || 0 : 0;
     if (items.length === 0 || (expected > 0 && items.length < expected)) {
       try {
-        const expanded = this.catalog.expand({ parentId: parent.id, level: parent.level }).items || [];
-        const fresh = expanded.filter((x) => x.level === "artist" || x.level === "album" || x.level === "track");
-        if (fresh.length) {
-          this.host.upsert(fresh);
-          items = this.host.browse(q).items || [];
-        }
+        // Music is pull-synced: Ether fetches and stores the children, the
+        // same as opening this in any Ether app.
+        this.host.expand(parent.id);
+        items = this.host.browse(q).items || [];
       } catch (err) {
         rethrowHostFault(err);
         this.env.log("warn", `subsonic expand ${parent.id}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1137,24 +1133,10 @@ export class SubsonicAdapter {
 
   // --- search -------------------------------------------------------------------
 
-  /** Searches the live catalogue once per query (30 min); true when it added items. */
+  /** Asks Ether to search the live catalogue (Ether stores and memoizes the finds); true when it holds matches. */
   private liveSearch(query: string): boolean {
-    const key = query.toLowerCase();
     try {
-      const raw = this.env.kv.get(LIVE_SEARCH_KEY);
-      const seen = raw ? (JSON.parse(raw) as Record<string, number>) : {};
-      const now = this.env.now();
-      if (seen[key] && now - seen[key] < LIVE_SEARCH_TTL_MS) return false;
-      const found = (this.catalog.search(query, 40).items || []).filter(
-        (x) => x.level === "artist" || x.level === "album" || x.level === "track"
-      );
-      if (found.length) this.host.upsert(found);
-      const kept: Record<string, number> = { [key]: now };
-      for (const [k, at] of Object.entries(seen)) {
-        if (now - at < LIVE_SEARCH_TTL_MS && Object.keys(kept).length < 200) kept[k] = at;
-      }
-      this.env.kv.put(LIVE_SEARCH_KEY, JSON.stringify(kept));
-      return found.length > 0;
+      return this.host.search(query, 40).found > 0;
     } catch (err) {
       rethrowHostFault(err);
       this.env.log("warn", `subsonic live search: ${err instanceof Error ? err.message : String(err)}`);
@@ -1182,7 +1164,7 @@ export class SubsonicAdapter {
     let albums = level("album", albumOffset, albumCount);
     let songs = level("track", songOffset, songCount);
     // Ether's library holds what has been browsed or searched before; when it
-    // has little for this query, search the live catalogue once and add it.
+    // has little for this query, Ether searches the live catalogue and stores it.
     const wanted = Math.min(artistCount, 1) + Math.min(albumCount, 3) + Math.min(songCount, 5);
     const have = Math.min(artists.length, 1) + Math.min(albums.length, 3) + Math.min(songs.length, 5);
     if (query && artistOffset === 0 && albumOffset === 0 && songOffset === 0 && have < wanted && this.liveSearch(query)) {

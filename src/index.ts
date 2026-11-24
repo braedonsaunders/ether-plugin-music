@@ -140,8 +140,6 @@ export function createHandler(env?: HostEnv, subsonicHost?: () => import("./subs
         const adapter = new SubsonicAdapter(
           (subsonicHost || hostedSubsonicHost)(),
           {
-            expand: (r) => catalog.expand(r),
-            search: (q, limit) => catalog.search(q, limit),
             lyrics: (q) => lrc.getLyrics(q),
           },
           host,
