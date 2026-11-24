@@ -1117,3 +1117,67 @@ test("tracks carry their recording identity from the ISRC", async () => {
   assert.equal(recordingOf(""), undefined);
   assert.equal(recordingOf("not-an-isrc"), undefined);
 });
+
+function importHost(routes: Record<string, unknown>): HostEnv {
+  const kv = new Map<string, string>();
+  return {
+    now: () => 1_760_000_000_000,
+    log: () => {},
+    kv: { get: (k) => kv.get(k) ?? null, put: (k, v) => { kv.set(k, v); }, delete: (k) => { kv.delete(k); }, list: (p = "") => [...kv.keys()].filter((k) => k.startsWith(p)) },
+    http: {
+      fetch: (req) => {
+        for (const [frag, body] of Object.entries(routes)) {
+          if (req.url.includes(frag)) return { status: 200, body: typeof body === "string" ? body : JSON.stringify(body) };
+        }
+        return { status: 404, body: "" };
+      },
+    },
+    settings: { get: () => ({ curatedSize: "compact", enrichMusicBrainz: false }) },
+    sources: { resolve: () => ({ candidates: [] }) },
+  };
+}
+
+const dzTrack = (id: number, title: string, isrc: string, albumId: number, albumTitle: string, duration = 320) =>
+  ({ id, title, isrc, duration, artist: { id: 27, name: "Daft Punk" }, album: { id: albumId, title: albumTitle, cover_xl: "https://cdn.test/c.jpg" } });
+
+test("import reads Deezer and Spotify playlist links; other links are not ours", () => {
+  const handle = createHandler(importHost({
+    "/playlist/908622995/tracks": { data: [dzTrack(3135556, "One More Time", "GBDUW0000053", 302127, "Discovery")], total: 1 },
+    "/playlist/908622995": { id: 908622995, title: "Road Trip", description: "Driving", tracks: { data: [] } },
+    "open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGoYBM5M": `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify({ props: { pageProps: { state: { data: { entity: { name: "Today's Top Hits", trackList: [{ title: "Teardrop", subtitle: "Massive Attack, Elizabeth Fraser", duration: 330000 }] } } } } } })}</script></html>`,
+  }));
+  const dz = handle({ method: "POST", path: "/ether/v1/kinds/music/import", body: { url: "https://www.deezer.com/en/playlist/908622995" } });
+  const dzBody = dz.body as { name: string; tracks: Array<{ title: string; isrc?: string }> };
+  assert.equal(dz.status, 200);
+  assert.equal(dzBody.name, "Road Trip");
+  assert.equal(dzBody.tracks[0].isrc, "GBDUW0000053");
+  const sp = handle({ method: "POST", path: "/ether/v1/kinds/music/import", body: { url: "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M?si=x" } });
+  const spBody = sp.body as { name: string; tracks: Array<{ title: string; artist: string; durationSec?: number }> };
+  assert.equal(sp.status, 200);
+  assert.equal(spBody.name, "Today's Top Hits");
+  assert.deepEqual(spBody.tracks[0], { title: "Teardrop", artist: "Massive Attack", durationSec: 330 });
+  assert.equal(handle({ method: "POST", path: "/ether/v1/kinds/music/import", body: { url: "https://example.com/playlist/1" } }).status, 404);
+});
+
+test("identify matches by ISRC, then by artist and title; equal releases come back as candidates", () => {
+  const handle = createHandler(importHost({
+    "/track/isrc:GBDUW0000053": dzTrack(3135556, "One More Time", "GBDUW0000053", 302127, "Discovery"),
+    "track%3A%22Digital%20Love%22": { data: [dzTrack(3135557, "Digital Love", "GBDUW0000054", 302127, "Discovery", 301)] },
+    "track%3A%22Aerodynamic%22": { data: [dzTrack(3135555, "Aerodynamic", "GBDUW0000052", 302127, "Discovery", 212), dzTrack(9000001, "Aerodynamic", "GBDUW0000099", 900001, "Alive 1997", 212)] },
+  }));
+  const res = handle({ method: "POST", path: "/ether/v1/kinds/music/identify", body: { tracks: [
+    { title: "One More Time", artist: "Daft Punk", isrc: "GBDUW0000053" },
+    { title: "Digital Love", artist: "Daft Punk", durationSec: 300 },
+    { title: "Aerodynamic", artist: "Daft Punk" },
+    { title: "Unknown Song", artist: "Nobody" },
+  ] } });
+  const body = res.body as { items: KindItem[]; matches: Array<{ index: number; id?: string; by?: string; candidates?: string[] }> };
+  assert.equal(res.status, 200);
+  assert.deepEqual(body.matches[0], { index: 0, id: "tr-3135556", by: "isrc" });
+  assert.deepEqual(body.matches[1], { index: 1, id: "tr-3135557", by: "title" });
+  assert.deepEqual(body.matches[2].candidates, ["tr-3135555", "tr-9000001"]);
+  assert.deepEqual(body.matches[3], { index: 3 });
+  // Every matched track arrives with its album and artist, parents first.
+  const at = (id: string) => body.items.findIndex((i) => i.id === id);
+  assert.ok(at("ar-27") >= 0 && at("ar-27") < at("al-302127") && at("al-302127") < at("tr-3135556"));
+});

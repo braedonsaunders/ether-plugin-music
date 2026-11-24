@@ -218,6 +218,15 @@ export function createHandler(env?: HostEnv, subsonicHost?: () => import("./subs
         return { status: 200, body: resolver.matchCandidates(matchReq) };
       }
 
+      // Playlist import: read a link; find items for imported tracks
+      if (path === "/ether/v1/kinds/music/import") {
+        const res = catalog.importLink(String(body?.url || ""));
+        return { status: res.status, body: res.body ?? { error: "unsupported link" } };
+      }
+      if (path === "/ether/v1/kinds/music/identify") {
+        return { status: 200, body: catalog.identify(body || {}) };
+      }
+
       // 9. Related items: similar artists and radio continuation
       if (path === "/ether/v1/kinds/music/related") {
         return { status: 200, body: catalog.related(body) };

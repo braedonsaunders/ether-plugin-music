@@ -403,6 +403,25 @@ export class DeezerClient {
     return Array.isArray(res?.data) ? res!.data : [];
   }
 
+  /** One track by its ISRC (keyless); null when Deezer has none. */
+  getTrackByIsrc(isrc: string, timeoutMs = 2500): DeezerTrack | null {
+    const code = isrc.trim().toUpperCase();
+    if (!/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(code)) return null;
+    const res = this.getJson<any>(`/track/isrc:${code}`, `dz:isrc:${code}`, 7 * 24 * HOUR_MS, timeoutMs, {
+      compact: (r) => (r && r.id ? slimTrack(r as DeezerTrack, true) : { miss: true }),
+    });
+    return res && res.id ? (res as DeezerTrack) : null;
+  }
+
+  /** One page of a public playlist's tracks (keyless), for imports. */
+  getPlaylistTracksPage(playlistId: number, index: number, limit = 100, timeoutMs = 4000): { tracks: DeezerTrack[]; total: number } {
+    const res = this.getJson<any>(`/playlist/${playlistId}/tracks?index=${index}&limit=${limit}`, `dz:playlist:${playlistId}:tracks:${index}:${limit}`, HOUR_MS, timeoutMs, { persist: false });
+    return {
+      tracks: Array.isArray(res?.data) ? res.data.map((t: DeezerTrack) => slimTrack(t, true)) : [],
+      total: Number(res?.total) || 0,
+    };
+  }
+
   searchArtists(query: string, limit = 8, timeoutMs = 1500): DeezerArtist[] {
     const q = encodeURIComponent(query.trim());
     if (!q) return [];

@@ -11,6 +11,7 @@ import type {
   KindPage,
   PluginSettings,
   ReleaseType,
+  ImportTrack,
 } from "./types.ts";
 import { KVCache, HOUR_MS, DAY_MS, rethrowHostFault } from "./kv.ts";
 import {
@@ -49,6 +50,8 @@ import {
   parseReleaseDate,
   popularityToRating,
   stripEditionSuffix,
+  stripFeaturing,
+  textSimilarity,
 } from "./normalize.ts";
 
 interface ArtistSeedEntry {
@@ -161,6 +164,21 @@ export function recordingOf(isrc?: string): string | undefined {
 }
 
 export const PLAYLIST_PICKS = 10;
+/** At most this many tracks are read from one imported link. */
+const IMPORT_MAX_TRACKS = 500;
+/** One /identify call stops starting new lookups after this long (its deadline is 10 s). */
+const IDENTIFY_BUDGET_MS = 6500;
+
+/** A Deezer track as an imported playlist entry. */
+function importTrackOf(t: DeezerTrack): ImportTrack {
+  return {
+    title: t.title || "",
+    artist: t.artist?.name || "",
+    album: t.album?.title || undefined,
+    isrc: t.isrc || undefined,
+    durationSec: t.duration || undefined,
+  };
+}
 export const PLAYLIST_MEMBERS = 50;
 const PLAYLISTS_BUCKET_KEY = "playlists_bucket";
 export const MAX_BACKFILL_TRIED = 400;
@@ -2263,6 +2281,147 @@ export class MusicCatalog {
       return;
     }
     this.cache.set(PLAYLISTS_BUCKET_KEY, bucket, 12 * HOUR_MS);
+  }
+
+  /**
+   * POST /ether/v1/kinds/music/import
+   * A Deezer playlist or album link (keyless API, with ISRCs) or a Spotify playlist or album link
+   * (its public embed page: titles, artists and durations) as a track list. 404 for anything else.
+   */
+  importLink(url: string): { status: number; body?: unknown } {
+    const link = String(url || "").trim();
+    const dz = link.match(/^https?:\/\/(?:www\.)?deezer\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(playlist|album)\/(\d+)/i);
+    if (dz) {
+      const id = Number(dz[2]);
+      return dz[1].toLowerCase() === "playlist" ? this.importDeezerPlaylist(id) : this.importDeezerAlbum(id);
+    }
+    const sp = link.match(/^https?:\/\/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album)\/([A-Za-z0-9]{10,40})/i);
+    if (sp) return this.importSpotify(sp[1].toLowerCase(), sp[2]);
+    return { status: 404 };
+  }
+
+  private importDeezerPlaylist(id: number): { status: number; body?: unknown } {
+    const pl = this.dz.getPlaylist(id, 4000);
+    if (!pl) return { status: 404 };
+    const tracks: ImportTrack[] = [];
+    const startMs = this.env.now();
+    for (let index = 0; tracks.length < IMPORT_MAX_TRACKS && this.env.now() - startMs < 7000; index += 100) {
+      const page = this.dz.getPlaylistTracksPage(id, index, 100, 3000);
+      for (const t of page.tracks) tracks.push(importTrackOf(t));
+      if (page.tracks.length < 100 || index + 100 >= page.total) break;
+    }
+    return { status: 200, body: { name: pl.title, description: pl.description || undefined, tracks: tracks.slice(0, IMPORT_MAX_TRACKS) } };
+  }
+
+  private importDeezerAlbum(id: number): { status: number; body?: unknown } {
+    const album = this.dz.getAlbum(id, 4000);
+    if (!album) return { status: 404 };
+    const tracks = this.dz.getAlbumTracks(id, 200, 4000).map((t) => importTrackOf({ ...t, album: { id, title: album.title } as DeezerTrack["album"] }));
+    return { status: 200, body: { name: album.title, tracks } };
+  }
+
+  private importSpotify(type: string, id: string): { status: number; body?: unknown } {
+    let html = "";
+    try {
+      const resp = this.env.http.fetch({ method: "GET", url: `https://open.spotify.com/embed/${type}/${id}`, headers: { "User-Agent": "Mozilla/5.0 (compatible; Ether)", "Accept": "text/html" }, timeoutMs: 6000 });
+      if (resp.status !== 200 || !resp.body) return { status: 404 };
+      html = resp.body;
+    } catch (err) {
+      rethrowHostFault(err);
+      return { status: 404 };
+    }
+    const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+    if (!m) return { status: 404 };
+    let data: any;
+    try {
+      data = JSON.parse(m[1]);
+    } catch {
+      return { status: 404 };
+    }
+    const entity = data?.props?.pageProps?.state?.data?.entity || {};
+    const list: any[] = Array.isArray(entity.trackList) ? entity.trackList : [];
+    const tracks: ImportTrack[] = list
+      .filter((t) => t && t.title)
+      .slice(0, IMPORT_MAX_TRACKS)
+      .map((t) => ({
+        title: String(t.title),
+        artist: String(t.subtitle || "").split(/,\s*/)[0] || "",
+        durationSec: Number(t.duration) > 0 ? Math.round(Number(t.duration) / 1000) : undefined,
+      }));
+    if (tracks.length === 0) return { status: 404 };
+    return { status: 200, body: { name: String(entity.name || entity.title || "Imported playlist"), tracks } };
+  }
+
+  /**
+   * POST /ether/v1/kinds/music/identify
+   * Finds the stored-to-be items for imported tracks: by ISRC first (Deezer /track/isrc:), then by
+   * artist and title with a duration check. Several releases fitting equally come back as
+   * candidates. Tracks not reached within the time budget are left out (Ether asks again).
+   */
+  identify(req: { tracks?: ImportTrack[] }): { items: KindItem[]; matches: Array<{ index: number; id?: string; by?: string; candidates?: string[] }> } {
+    const tracks = Array.isArray(req.tracks) ? req.tracks.slice(0, 50) : [];
+    const items: KindItem[] = [];
+    const artists = new Set<number>();
+    const albums = new Set<number>();
+    const matches: Array<{ index: number; id?: string; by?: string; candidates?: string[] }> = [];
+    const startMs = this.env.now();
+    for (let index = 0; index < tracks.length; index++) {
+      if (this.env.now() - startMs > IDENTIFY_BUDGET_MS) break;
+      const t = tracks[index];
+      try {
+        if (t.isrc) {
+          const hit = this.dz.getTrackByIsrc(t.isrc);
+          if (hit) {
+            const id = this.playlistTrackItems(hit, artists, albums, items);
+            if (id) {
+              matches.push({ index, id, by: "isrc" });
+              continue;
+            }
+          }
+        }
+        const found = this.findTrackByTitle(t);
+        if (found.length === 1) {
+          const id = this.playlistTrackItems(found[0], artists, albums, items);
+          matches.push(id ? { index, id, by: "title" } : { index });
+        } else if (found.length > 1) {
+          const candidates = found.map((f) => this.playlistTrackItems(f, artists, albums, items)).filter((x): x is string => Boolean(x));
+          matches.push({ index, candidates });
+        } else {
+          matches.push({ index });
+        }
+      } catch (err) {
+        rethrowHostFault(err);
+        break; // rate-limited: leave the rest for the next ask
+      }
+    }
+    return { items, matches };
+  }
+
+  /**
+   * Deezer tracks matching an imported track's artist and title (duration within 3 s when known),
+   * best first. One when a single release clearly fits; several when distinct releases fit equally.
+   */
+  private findTrackByTitle(t: ImportTrack): DeezerTrack[] {
+    const title = stripFeaturing(String(t.title || "")).trim();
+    if (!title) return [];
+    const artist = String(t.artist || "").trim();
+    const q = artist ? `artist:"${artist.replace(/"/g, "")}" track:"${title.replace(/"/g, "")}"` : title;
+    const scored = this.dz.searchTracks(q, 15, 2500)
+      .map((tr) => {
+        const tSim = textSimilarity(title, stripFeaturing(tr.title_short || tr.title || ""));
+        const aSim = artist ? textSimilarity(artist, tr.artist?.name || "") : 1;
+        const durOk = !t.durationSec || !tr.duration || Math.abs(tr.duration - t.durationSec) <= 3;
+        return { tr, score: tSim * 0.6 + aSim * 0.4, ok: tSim >= 0.85 && aSim >= 0.75 && durOk };
+      })
+      .filter((x) => x.ok)
+      .sort((a, b) => b.score - a.score);
+    if (scored.length === 0) return [];
+    const best = scored[0].score;
+    const tied = scored.filter((x) => best - x.score < 0.02);
+    // The same recording on several albums: one when they share an ISRC (it is one song), else candidates.
+    const isrcs = new Set(tied.map((x) => x.tr.isrc || `id:${x.tr.id}`));
+    if (tied.length === 1 || isrcs.size === 1) return [tied[0].tr];
+    return tied.slice(0, 8).map((x) => x.tr);
   }
 
   /**

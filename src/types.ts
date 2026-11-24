@@ -380,3 +380,12 @@ export interface LyricsResult {
   instrumental?: boolean;
   source: "lrclib";
 }
+
+/** One track of a playlist being imported (POST /ether/v1/kinds/{kind}/import and /identify). */
+export interface ImportTrack {
+  title: string;
+  artist: string;
+  album?: string;
+  isrc?: string;
+  durationSec?: number;
+}
