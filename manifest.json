@@ -335,6 +335,14 @@
                 "value": "Charting"
               },
               {
+                "key": "top-songs",
+                "label": "Top songs",
+                "level": "track",
+                "sort": "rating",
+                "direction": "desc",
+                "layout": "tracks"
+              },
+              {
                 "key": "trending-artists",
                 "label": "Trending artists",
                 "level": "artist",
@@ -420,14 +428,25 @@
                 "label": "Jump back in",
                 "level": "album",
                 "sort": "lastViewed",
-                "direction": "desc"
+                "direction": "desc",
+                "purpose": "recentContexts"
               },
               {
                 "key": "recently-played",
                 "label": "Recently played",
                 "level": "track",
                 "sort": "lastViewed",
-                "direction": "desc"
+                "direction": "desc",
+                "layout": "tracks"
+              },
+              {
+                "key": "liked-songs",
+                "label": "Liked songs",
+                "level": "track",
+                "sort": "added",
+                "direction": "desc",
+                "filters": [{ "field": "viewer", "value": { "favorite": true } }],
+                "purpose": "liked"
               }
             ]
           },
