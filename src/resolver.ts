@@ -48,6 +48,12 @@ const SEARCH_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const SEARCH_INFLIGHT_WAIT_MS = 6_000;
 const SEARCH_MEMO_MAX_CANDIDATES = 25;
 const RESOLVE_STEP_BUDGET_MS = 1400;
+/**
+ * Latest point in a /resolve slice at which a usenet_check may start. Ether kills a /resolve
+ * call at 5 s; a usenet_check of a multi-volume release takes up to ~3 s, so a later check is
+ * deferred to the next slice (with the release_files answer kept) instead of being killed.
+ */
+const USENET_CHECK_START_CUTOFF_MS = 1800;
 const MAX_CACHED_RELEASES = 3;
 const MAX_FILE_LIST_PROBES = 8;
 const MAX_USENET_PROBES = 5;
@@ -123,6 +129,12 @@ interface ConcertResolveTarget {
   standaloneTitle?: boolean;
 }
 
+interface ListedCandidate {
+  ref: string;
+  files: ReleaseFile[];
+  cached: boolean;
+}
+
 interface ConcertResolveStage {
   concert: ConcertResolveTarget;
   preRanked: Array<{ cand: SourceCandidate; score: number }>;
@@ -134,6 +146,8 @@ interface ConcertResolveStage {
   rawCandidateCount?: number;
   usenetChecksUsed?: number;
   usenetCheckDisabled?: boolean;
+  /** release_files of the candidate at nextIdx whose usenet_check was deferred to this slice. */
+  listed?: ListedCandidate;
 }
 
 interface ResolveStage {
@@ -147,6 +161,8 @@ interface ResolveStage {
   rawCandidateCount?: number;
   usenetChecksUsed?: number;
   usenetCheckDisabled?: boolean;
+  /** release_files of the candidate at nextIdx whose usenet_check was deferred to this slice. */
+  listed?: ListedCandidate;
 }
 
 export function candidateRefOf(c: SourceCandidate): string {
@@ -1372,13 +1388,12 @@ export class AlbumResolver {
         return { done: false, verifiedCount: 0 };
       }
       stage.nextIdx++;
-      this.probeSingleCandidate(
-        stage,
-        cand,
-        preScore,
-        allowUsenetCheck,
-        startMs
-      );
+      if (this.probeSingleCandidate(stage, cand, preScore, allowUsenetCheck, startMs)) {
+        // Its usenet_check did not fit this slice: it runs first in the next one.
+        if (stage.verified.length > 0) break;
+        this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
+        return { done: false, verifiedCount: 0 };
+      }
 
       // Fast-finish as soon as we have a FULL-coverage verified release matching quality preference
       // (or any full-coverage verified release when no lossless candidates remain to probe).
@@ -1696,12 +1711,12 @@ export class AlbumResolver {
     stage: ResolveStage,
     allowUsenetCheck: boolean,
     startMs: number
-  ): "available" | "dead" | "unknown" {
+  ): "available" | "dead" | "unknown" | "defer" {
     if (!allowUsenetCheck || stage.usenetCheckDisabled || !cand.nzbUrl) return "unknown";
     const used = stage.usenetChecksUsed || 0;
     if (used >= MAX_USENET_CHECKS_PER_ALBUM) return "unknown";
-    // Leave comfortable headroom inside Ether's 5s interactive route budget.
-    if (this.env.now() - startMs >= 2600) return "unknown";
+    // Too late in this slice to fit inside Ether's 5 s deadline: check first thing next slice.
+    if (this.env.now() - startMs >= USENET_CHECK_START_CUTOFF_MS) return "defer";
 
     stage.usenetChecksUsed = used + 1;
     try {
@@ -1736,43 +1751,64 @@ export class AlbumResolver {
     }
   }
 
+  /** A candidate's release_files: the answer kept from the slice that deferred its usenet_check,
+   * else asked now. Null when listing failed. */
+  private listReleaseFiles(stage: { listed?: ListedCandidate }, cand: SourceCandidate): ListedCandidate | null {
+    const ref = candidateRefOf(cand);
+    const kept = stage.listed;
+    stage.listed = undefined;
+    if (kept && kept.ref === ref) return kept;
+    let files: ReleaseFile[] = [];
+    let cached = Boolean(cand.cached);
+    try {
+      const res = this.env.sources.resolve({
+        kind: "release_files",
+        candidate: cand,
+        infoHash: cand.infoHash,
+        magnet: cand.magnet,
+      });
+      const first = res?.candidates?.[0];
+      if (first?.files && Array.isArray(first.files)) {
+        files = first.files;
+      }
+      if (typeof first?.cached === "boolean") {
+        cached = first.cached;
+      } else if (files.length > 0) {
+        cached = true;
+      }
+    } catch (err) {
+      rethrowHostFault(err);
+      return null;
+    }
+    return { ref, files, cached };
+  }
+
+  /** Keeps a candidate's listing and rewinds to it: its usenet_check runs first next slice. */
+  private deferProbe(stage: { listed?: ListedCandidate; nextIdx: number }, listed: ListedCandidate): true {
+    stage.listed = listed;
+    stage.nextIdx--;
+    return true;
+  }
+
   private probeSingleCandidate(
     stage: ResolveStage,
     cand: SourceCandidate,
     preScore: number,
     allowUsenetCheck: boolean,
     startMs: number
-  ): void {
+  ): boolean {
     const album = stage.album;
     const verified = stage.verified;
     const archiveFallbacks = stage.archiveFallbacks;
     const debridFallbacks = stage.debridFallbacks || (stage.debridFallbacks = []);
 
-    let files: ReleaseFile[] = [];
-    let isCached = Boolean(cand.cached);
-    try {
-      const listed = this.env.sources.resolve({
-        kind: "release_files",
-        candidate: cand,
-        infoHash: cand.infoHash,
-        magnet: cand.magnet,
-      });
-      const first = listed?.candidates?.[0];
-      if (first?.files && Array.isArray(first.files)) {
-        files = first.files;
-      }
-      if (typeof first?.cached === "boolean") {
-        isCached = first.cached;
-      } else if (files.length > 0) {
-        isCached = true;
-      }
-    } catch (err) {
-      rethrowHostFault(err);
-      return;
-    }
+    const listed = this.listReleaseFiles(stage, cand);
+    if (!listed) return false;
+    const files = listed.files;
+    const isCached = listed.cached;
 
     const isUsenet = isUsenetCandidate(cand);
-    if (!isUsenet && !isCached) return;
+    if (!isUsenet && !isCached) return false;
     if (files.length === 0) {
       // Cached Debrid torrent whose provider did not return a file list: keep a structured
       // release.track fallback so Ether's debrid.ChooseFile can select the track at acquire time.
@@ -1802,7 +1838,7 @@ export class AlbumResolver {
           });
         }
       }
-      return;
+      return false;
     }
 
     const match = matchAlbumReleaseFiles(album, cand.title || "", files, this.settings.qualityPreference);
@@ -1827,8 +1863,9 @@ export class AlbumResolver {
       let healthBonus = 0;
       if (isUsenet) {
         const health = this.checkUsenetAvailability(album.id, cand, stage, allowUsenetCheck, startMs);
+        if (health === "defer") return this.deferProbe(stage, listed);
         if (health === "dead") {
-          return;
+          return false;
         }
         if (health === "available") {
           healthBonus = 8;
@@ -1848,7 +1885,7 @@ export class AlbumResolver {
         candidate: isUsenet ? cand : { ...cand, cached: true },
         tracks: match.tracks,
       });
-      return;
+      return false;
     }
 
     // Complete expanded member listing (single-volume archive — including inspected archives
@@ -1884,8 +1921,9 @@ export class AlbumResolver {
       const qual = classifyReleaseQuality(cand.title || "", undefined, this.settings.qualityPreference);
       if (qual.points >= 0) {
         const health = this.checkUsenetAvailability(album.id, cand, stage, allowUsenetCheck, startMs);
+        if (health === "defer") return this.deferProbe(stage, listed);
         if (health === "dead") {
-          return;
+          return false;
         }
         const healthBonus = health === "available" ? 8 : 0;
         const trackMap: Record<string, TrackFileMapping> = {};
@@ -1911,6 +1949,7 @@ export class AlbumResolver {
         });
       }
     }
+    return false;
   }
 
   private buildTrackSources(
@@ -2317,7 +2356,11 @@ export class AlbumResolver {
         return { done: false, verifiedCount: 0 };
       }
       stage.nextIdx++;
-      this.probeSingleConcertCandidate(stage, cand, preScore, allowUsenetCheck, startMs);
+      if (this.probeSingleConcertCandidate(stage, cand, preScore, allowUsenetCheck, startMs)) {
+        if (stage.verified.length > 0) break;
+        this.cache.set(concertStageKey(concertId), stage, STAGE_CACHE_TTL_MS);
+        return { done: false, verifiedCount: 0 };
+      }
 
       // Fast-finish on first verified HD/4K concert film (Debrid or Usenet).
       if (
@@ -2341,32 +2384,14 @@ export class AlbumResolver {
     preScore: number,
     allowUsenetCheck: boolean,
     startMs: number
-  ): void {
-    let files: ReleaseFile[] = [];
-    let isCached = Boolean(cand.cached);
-    try {
-      const listed = this.env.sources.resolve({
-        kind: "release_files",
-        candidate: cand,
-        infoHash: cand.infoHash,
-        magnet: cand.magnet,
-      });
-      const first = listed?.candidates?.[0];
-      if (first?.files && Array.isArray(first.files)) {
-        files = first.files;
-      }
-      if (typeof first?.cached === "boolean") {
-        isCached = first.cached;
-      } else if (files.length > 0) {
-        isCached = true;
-      }
-    } catch (err) {
-      rethrowHostFault(err);
-      return;
-    }
+  ): boolean {
+    const listed = this.listReleaseFiles(stage, cand);
+    if (!listed) return false;
+    const files = listed.files;
+    const isCached = listed.cached;
 
     const isUsenet = isUsenetCandidate(cand);
-    if (!isUsenet && !isCached) return;
+    if (!isUsenet && !isCached) return false;
     if (files.length === 0) {
       if (!isUsenet && isCached && preScore >= 60) {
         const qual = classifyVideoQuality(cand.title || "", undefined, this.settings.videoQualityPreference);
@@ -2384,7 +2409,7 @@ export class AlbumResolver {
           size: 0,
         });
       }
-      return;
+      return false;
     }
 
     const match = matchConcertReleaseFiles(cand.title || "", files, this.settings.videoQualityPreference);
@@ -2398,7 +2423,8 @@ export class AlbumResolver {
           allowUsenetCheck,
           startMs
         );
-        if (health === "dead") return;
+        if (health === "defer") return this.deferProbe(stage, listed);
+        if (health === "dead") return false;
         if (health === "available") healthBonus = 8;
       }
       const srcTag = isUsenet ? (match.file.isArchiveMember ? "Usenet Archive" : "Usenet") : "Debrid";
@@ -2418,7 +2444,7 @@ export class AlbumResolver {
         fileHint: match.file.path,
         size: match.file.size,
       });
-      return;
+      return false;
     }
 
     const expandedHasVideo = files.some(
@@ -2441,7 +2467,8 @@ export class AlbumResolver {
         allowUsenetCheck,
         startMs
       );
-      if (health === "dead") return;
+      if (health === "defer") return this.deferProbe(stage, listed);
+        if (health === "dead") return false;
       const healthBonus = health === "available" ? 8 : 0;
       const qual = classifyVideoQuality(cand.title || "", undefined, this.settings.videoQualityPreference);
       stage.archiveFallbacks.push({
@@ -2457,6 +2484,7 @@ export class AlbumResolver {
         size: 0,
       });
     }
+    return false;
   }
 
   private finalizeConcertResolution(

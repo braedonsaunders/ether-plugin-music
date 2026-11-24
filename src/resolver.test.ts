@@ -2200,3 +2200,61 @@ test("0.2.6: never repeats the same (album, query) within the short dedup window
   assert.equal(afterTimeout.sources.length, 0);
   assert.equal(inflSearches, 0, "must not repeat timed-out search within 5m dedup window");
 });
+
+test("#781: a usenet_check that would not fit the 5 s /resolve deadline is deferred to the next slice without re-listing", () => {
+  const album = sampleDiscoveryAlbum();
+  const flac: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    indexer: "NZBgeek",
+    nzbUrl: "https://api.nzbgeek.info/api?t=get&id=slow-archive",
+    size: 430_000_000,
+  };
+  let clock = 1_760_000_000_000;
+  // Host timings from the issue: a quick search, a slow multi-volume listing, a slow check.
+  const cost: Record<string, number> = { indexer_search: 300, release_files: 2000, usenet_check: 3000 };
+  const { env, calls } = makeFakeHost({
+    onResolve: (q) => {
+      clock += cost[q.kind] || 0;
+      if (q.kind === "indexer_search") return { candidates: [flac] };
+      if (q.kind === "release_files") {
+        return {
+          candidates: [{
+            ...q.candidate!,
+            files: album.tracks.map((t, idx) => ({ index: idx, path: `${String(idx + 1).padStart(2, "0")} - ${t.title}.flac`, size: 30_000_000 })),
+          }],
+        };
+      }
+      if (q.kind === "usenet_check") {
+        return { candidates: [{ ...flac, usenetCheck: { available: true, checked: 32, missing: 0, cached: false } }] };
+      }
+      return { candidates: [] };
+    },
+  });
+  env.now = () => clock;
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+
+  let res: ReturnType<typeof resolver.resolve> = { sources: [], pending: true };
+  let slices = 0;
+  while (res.pending && slices < 8) {
+    const before = clock;
+    res = resolver.resolve({ item: trackItemFor(album, 0) });
+    slices++;
+    assert.ok(clock - before < 5000, `slice ${slices} took ${clock - before} ms`);
+  }
+  assert.equal(res.pending, undefined);
+  assert.equal(res.sources[0]?.release?.candidate?.nzbUrl, flac.nzbUrl);
+  assert.equal(calls.filter((q) => q.kind === "release_files").length, 1);
+  assert.equal(calls.filter((q) => q.kind === "usenet_check").length, 1);
+  assert.equal(slices, 2);
+});
