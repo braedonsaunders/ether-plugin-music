@@ -419,7 +419,9 @@ export function songOf(it: KindItem, st?: ItemState): Record<string, unknown> {
     displayArtist: artist,
     albumArtists: artistId ? [{ id: artistId, name: albumArtist }] : [],
     displayAlbumArtist: albumArtist,
-    explicitStatus: explicit === true ? "explicit" : explicit === false ? "clean" : "",
+    // Deezer's explicit flag is false for most tracks that are simply not
+    // explicit, not edited "clean" versions; only flag explicit ones.
+    explicitStatus: explicit === true ? "explicit" : "",
     ...stateFields(st),
   };
 }
@@ -1189,11 +1191,26 @@ export class SubsonicAdapter {
       songs = level("track", songOffset, songCount);
     }
     const states = this.states([...artists, ...albums, ...songs]);
+    const albumCounts = this.albumCounts(artists);
     return {
-      artist: artists.map((a) => (id3 ? artistOf(a, states.get(a.id)) : { id: a.id, name: a.title, coverArt: a.id, starred: artistOf(a, states.get(a.id)).starred })),
+      artist: artists.map((a) => (id3 ? { ...artistOf(a, states.get(a.id)), albumCount: albumCounts.get(a.id) ?? 0 } : { id: a.id, name: a.title, coverArt: a.id, starred: artistOf(a, states.get(a.id)).starred })),
       album: albums.map((a) => (id3 ? albumOf(a, states.get(a.id)) : albumDirOf(a, states.get(a.id)))),
       song: songs.map((s) => songOf(s, states.get(s.id))),
     };
+  }
+
+  /** Album counts for a few artists, from Ether's cheap per-parent totals. */
+  private albumCounts(artists: KindItem[]): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const a of artists.slice(0, 20)) {
+      if (a.childCount) {
+        out.set(a.id, a.childCount);
+        continue;
+      }
+      const page = this.host.browse({ parentId: a.id, level: "album", limit: 1, total: "cheap" });
+      out.set(a.id, page.total ?? (page.items || []).length);
+    }
+    return out;
   }
 
   // --- stars, ratings, plays --------------------------------------------------
@@ -1290,7 +1307,7 @@ export class SubsonicAdapter {
       public: false,
       songCount: (pl.items || []).length,
       duration,
-      created: iso(pl.createdAt) || new Date(0).toISOString(),
+      created: iso(pl.createdAt) || iso(pl.updatedAt) || new Date(0).toISOString(),
       changed: iso(pl.updatedAt) || iso(pl.createdAt) || new Date(0).toISOString(),
       coverArt: first ? first.parentId || first.id : undefined,
     };
