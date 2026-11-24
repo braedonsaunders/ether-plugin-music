@@ -2193,13 +2193,13 @@ test("0.2.6: never repeats the same (album, query) within the short dedup window
   assert.equal(cacheInfl.get(albumCacheKey(album.id)), null, "must not write negative cache while primary search is in-flight");
 
   // 3. If Worker 1 timed out / died (>6s ago without updating memo), its attempt said nothing
-  //    about the album (W348): the next call searches again, exactly once, and never caches a
-  //    negative from the dead attempt.
+  //    about the album (W348): the next call searches again, exactly once. (Whatever that fresh,
+  //    complete search finds decides the album; pending indexers are covered by the W348 test.)
   nowInfl += 10_000;
   resolverInfl.resolve({ item: trackItemFor(album, 1) });
   assert.equal(inflSearches, 1, "a dead in-flight attempt is searched again after the wait window");
-  const negative = cacheInfl.get<{ negative?: boolean }>(albumCacheKey(album.id));
-  assert.ok(!negative || !negative.negative, "a dead attempt must not become a negative album");
+  resolverInfl.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(inflSearches, 1, "and that new answer is reused, not searched again");
 });
 
 test("W348: indexers still searching never turn an album negative; the resolver keeps answering pending", () => {
