@@ -140,6 +140,21 @@ interface SearchQueryMemo {
   rawCount: number;
   candidates?: SourceCandidate[];
   errored?: boolean;
+  /** Some indexers were still running, timed out or failed: the answer may grow. */
+  incomplete?: boolean;
+}
+
+/** How many times one album's or concert's inconclusive search is tried again in a few minutes. */
+const MAX_INCONCLUSIVE_SEARCHES = 8;
+const INCONCLUSIVE_WINDOW_MS = 3 * 60 * 1000;
+/** An answer some indexers did not finish is reused only briefly. */
+const INCOMPLETE_MEMO_TTL_MS = 30 * 1000;
+
+/** Whether an indexer_search answer is final: every indexer answered or was skipped. */
+export function searchIncomplete(res: { pending?: unknown[]; indexers?: Array<{ status?: string }> } | null | undefined): boolean {
+  if (!res) return true;
+  if (Array.isArray(res.pending) && res.pending.length > 0) return true;
+  return (res.indexers || []).some((s) => s.status === "pending" || s.status === "timed_out" || s.status === "error");
 }
 
 function compactCandidateForMemo(c: SourceCandidate): SourceCandidate {
@@ -202,6 +217,8 @@ interface ConcertResolveStage {
   usenetCheckDisabled?: boolean;
   /** release_files of the candidate at nextIdx whose usenet_check was deferred to this slice. */
   listed?: ListedCandidate;
+  /** The search behind this stage had indexers still running, timed out or failed. */
+  searchIncomplete?: boolean;
 }
 
 interface ResolveStage {
@@ -217,6 +234,8 @@ interface ResolveStage {
   usenetCheckDisabled?: boolean;
   /** release_files of the candidate at nextIdx whose usenet_check was deferred to this slice. */
   listed?: ListedCandidate;
+  /** The search behind this stage had indexers still running, timed out or failed. */
+  searchIncomplete?: boolean;
 }
 
 export function candidateRefOf(c: SourceCandidate): string {
@@ -1197,6 +1216,7 @@ export class AlbumResolver {
         sources: [],
       };
     }
+    if (step.inconclusive) return { sources: [], ttlSec: 30 };
 
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (!fresh || fresh.releases.length === 0) {
@@ -1247,6 +1267,7 @@ export class AlbumResolver {
     this.env.log("info", `resolve-recording: ${recording} "${item.title}" try ${plan.idx + 1}/${plan.candidates.length} "${cand.artistName} - ${cand.title}" (${cand.releaseType})`);
     const step = this.stepResolveAlbum(synthId, item, excluded, RESOLVE_STEP_BUDGET_MS, true);
     if (!step.done) return { pending: true, retryInMs: step.retryInMs ?? 250, sources: [] };
+    if (step.inconclusive) return { sources: [], ttlSec: 30 };
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(synthId));
     if (fresh && !fresh.negative && fresh.releases.length > 0) {
       this.cache.set(albumCacheKey(recId), fresh, ALBUM_CACHE_TTL_MS);
@@ -1354,6 +1375,7 @@ export class AlbumResolver {
     errored: boolean;
     deferredInFlight: boolean;
     elapsedMs: number;
+    incomplete: boolean;
   } {
     const memoKey = searchMemoKey(entityId, query);
     const memo = this.cache.get<SearchQueryMemo>(memoKey, { fresh: true });
@@ -1366,6 +1388,7 @@ export class AlbumResolver {
           errored: Boolean(memo.errored),
           deferredInFlight: false,
           elapsedMs: 0,
+          incomplete: Boolean(memo.incomplete || memo.errored),
         };
       }
       if (this.env.now() - memo.at < SEARCH_INFLIGHT_WAIT_MS) {
@@ -1376,18 +1399,12 @@ export class AlbumResolver {
           errored: false,
           deferredInFlight: true,
           elapsedMs: 0,
+          incomplete: true,
         };
       }
-      // Previous search attempt never completed within the active window (e.g. host timeout);
-      // do not re-hit the indexer for the remainder of SEARCH_DEDUP_WINDOW_MS.
-      return {
-        candidates: [],
-        rawCount: 0,
-        fromCache: true,
-        errored: true,
-        deferredInFlight: false,
-        elapsedMs: 0,
-      };
+      // The previous attempt never finished (a host timeout cut it off): it says nothing about
+      // the album, so search again rather than calling it an error.
+      this.cache.delete(memoKey);
     }
 
     const reqAt = this.env.now();
@@ -1408,12 +1425,19 @@ export class AlbumResolver {
       });
       const list = Array.isArray(res?.candidates) ? res.candidates : [];
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
+      const incomplete = searchIncomplete(res);
+      if (incomplete && list.length === 0) {
+        // Indexers still running (or cut off) and nothing yet: not an answer. Keep it marked in
+        // flight so concurrent tracks wait, and search again after the wait window.
+        this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
+        return { candidates: [], rawCount: 0, fromCache: false, errored: false, deferredInFlight: false, elapsedMs, incomplete: true };
+      }
       const ordered = prioritize ? prioritize(list) : list;
       const compacted = ordered.slice(0, SEARCH_MEMO_MAX_CANDIDATES).map(compactCandidateForMemo);
       this.cache.set<SearchQueryMemo>(
         memoKey,
-        { status: "done", at: this.env.now(), rawCount: list.length, candidates: compacted },
-        SEARCH_DEDUP_WINDOW_MS
+        { status: "done", at: this.env.now(), rawCount: list.length, candidates: compacted, incomplete: incomplete || undefined },
+        incomplete ? INCOMPLETE_MEMO_TTL_MS : SEARCH_DEDUP_WINDOW_MS
       );
       return {
         candidates: list,
@@ -1422,15 +1446,14 @@ export class AlbumResolver {
         errored: false,
         deferredInFlight: false,
         elapsedMs,
+        incomplete,
       };
     } catch (err) {
       rethrowHostFault(err);
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
-      this.cache.set<SearchQueryMemo>(
-        memoKey,
-        { status: "done", at: this.env.now(), rawCount: 0, candidates: [], errored: true },
-        SEARCH_DEDUP_WINDOW_MS
-      );
+      // A failed search says nothing about the album: keep it in flight for the wait window
+      // (concurrent tracks wait), then search again.
+      this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
       this.env.log("debug", `indexer_search failed ${entityId} "${query}": ${String(err).slice(0, 120)}`);
       return {
         candidates: [],
@@ -1439,6 +1462,7 @@ export class AlbumResolver {
         errored: true,
         deferredInFlight: false,
         elapsedMs,
+        incomplete: true,
       };
     }
   }
@@ -1463,7 +1487,7 @@ export class AlbumResolver {
     excluded: Set<string>,
     budgetMs: number,
     allowUsenetCheck: boolean
-  ): { done: boolean; verifiedCount: number; retryInMs?: number } {
+  ): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
     const startMs = this.env.now();
     const excludedSig = Array.from(excluded).sort().join("|");
     let stage = this.cache.get<ResolveStage>(albumStageKey(albumId));
@@ -1490,6 +1514,9 @@ export class AlbumResolver {
         // firing a duplicate parallel search or caching a premature negative result.
         return { done: false, verifiedCount: 0, retryInMs: 350 };
       }
+      if (searched.incomplete && searched.ordered.length === 0) {
+        return this.inconclusive(albumId);
+      }
       stage = {
         album,
         preRanked: searched.ordered.slice(0, MAX_FILE_LIST_PROBES),
@@ -1499,6 +1526,7 @@ export class AlbumResolver {
         debridFallbacks: [],
         excludedSig,
         rawCandidateCount: searched.rawCount,
+        searchIncomplete: searched.incomplete || undefined,
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
       };
@@ -1579,7 +1607,23 @@ export class AlbumResolver {
     return this.finalizeAlbumResolution(albumId, stage);
   }
 
-  private finalizeAlbumResolution(albumId: string, stage: ResolveStage): { done: boolean; verifiedCount: number } {
+  /**
+   * A search whose indexers had not all answered (still running, timed out or failed) gave no
+   * verdict. Ask again shortly while the budget lasts; after that answer nothing for now, still
+   * without remembering a negative, so the next play searches afresh.
+   */
+  private inconclusive(entityId: string): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
+    const key = `search_retry:${entityId}`;
+    const tries = (this.cache.get<number>(key) || 0) + 1;
+    this.cache.set(key, tries, INCONCLUSIVE_WINDOW_MS);
+    if (tries <= MAX_INCONCLUSIVE_SEARCHES) {
+      return { done: false, verifiedCount: 0, retryInMs: 1000 };
+    }
+    this.env.log("info", `resolve: ${entityId} search still inconclusive after ${MAX_INCONCLUSIVE_SEARCHES} tries; not caching a negative`);
+    return { done: true, verifiedCount: 0, inconclusive: true };
+  }
+
+  private finalizeAlbumResolution(albumId: string, stage: ResolveStage): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
     stage.verified.sort((a, b) => b.score - a.score);
     let finalReleases: VerifiedAlbumRelease[];
     if (stage.verified.length > 0) {
@@ -1588,6 +1632,11 @@ export class AlbumResolver {
       const archiveFallbacks = [...(stage.archiveFallbacks || [])].sort((a, b) => b.score - a.score);
       const debridFallbacks = [...(stage.debridFallbacks || [])].sort((a, b) => b.score - a.score);
       finalReleases = [...archiveFallbacks.slice(0, 2), ...debridFallbacks.slice(0, 2)].slice(0, 3);
+    }
+    if (finalReleases.length === 0 && stage.searchIncomplete) {
+      // Nothing playable among what the indexers had answered so far: no verdict yet.
+      this.cache.delete(albumStageKey(albumId));
+      return this.inconclusive(albumId);
     }
 
     const now = this.env.now();
@@ -1675,6 +1724,7 @@ export class AlbumResolver {
     ordered: Array<{ cand: SourceCandidate; score: number }>;
     rawCount: number;
     deferredInFlight: boolean;
+    incomplete?: boolean;
   } {
     const cleanArtist = album.artistName.trim();
     const cleanAlbum = stripEditionSuffix(album.title).trim();
@@ -1692,6 +1742,7 @@ export class AlbumResolver {
     const emptyQueries: string[] = [];
     let hasWellMatched = false;
     let totalRawFromIndexer = 0;
+    let incomplete = false;
 
     const isWellMatched = (cand: SourceCandidate): boolean => {
       if (!isUsenetCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
@@ -1740,6 +1791,7 @@ export class AlbumResolver {
         break;
       }
       totalRawFromIndexer += res.rawCount;
+      if (res.incomplete) incomplete = true;
       if (res.rawCount === 0) {
         emptyQueries.push(q);
       }
@@ -1760,7 +1812,7 @@ export class AlbumResolver {
     }
 
     if (rawCandidates.length === 0) {
-      return { ordered: [], rawCount: totalRawFromIndexer, deferredInFlight: false };
+      return { ordered: [], rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
     }
 
     // Batch debrid_check for top torrent infoHashes (capped at 25, prioritizing lossless + seeders)
@@ -1854,7 +1906,7 @@ export class AlbumResolver {
       "info",
       `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
     );
-    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false };
+    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
   }
 
   /**
@@ -2201,6 +2253,7 @@ export class AlbumResolver {
         sources: [],
       };
     }
+    if (step.inconclusive) return { sources: [], ttlSec: 30 };
 
     const fresh = this.cache.get<CachedConcertResolution>(concertCacheKey(concertId));
     if (!fresh || fresh.releases.length === 0) {
@@ -2253,6 +2306,7 @@ export class AlbumResolver {
     ordered: Array<{ cand: SourceCandidate; score: number }>;
     rawCount: number;
     deferredInFlight: boolean;
+    incomplete?: boolean;
   } {
     const cleanArtist = concert.artistName.trim();
     const cleanTitle = stripEditionSuffix(concert.title).trim();
@@ -2284,6 +2338,7 @@ export class AlbumResolver {
     const emptyQueries: string[] = [];
     let hasWellMatched = false;
     let totalRawFromIndexer = 0;
+    let incomplete = false;
 
     const isWellMatched = (cand: SourceCandidate): boolean => {
       if (!isUsenetCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
@@ -2330,6 +2385,7 @@ export class AlbumResolver {
         break;
       }
       totalRawFromIndexer += res.rawCount;
+      if (res.incomplete) incomplete = true;
       if (res.rawCount === 0) {
         emptyQueries.push(q);
       }
@@ -2350,7 +2406,7 @@ export class AlbumResolver {
     }
 
     if (rawCandidates.length === 0) {
-      return { ordered: [], rawCount: totalRawFromIndexer, deferredInFlight: false };
+      return { ordered: [], rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
     }
 
     // Batch debrid_check for top 25 video torrent infoHashes sorted by video quality + seeders.
@@ -2435,7 +2491,7 @@ export class AlbumResolver {
       "info",
       `resolve-concert: ${concert.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
     );
-    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false };
+    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
   }
 
   private stepResolveConcert(
@@ -2444,7 +2500,7 @@ export class AlbumResolver {
     excluded: Set<string>,
     budgetMs: number,
     allowUsenetCheck: boolean
-  ): { done: boolean; verifiedCount: number; retryInMs?: number } {
+  ): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
     const startMs = this.env.now();
     const excludedSig = Array.from(excluded).sort().join("|");
     let stage = this.cache.get<ConcertResolveStage>(concertStageKey(concertId));
@@ -2468,6 +2524,9 @@ export class AlbumResolver {
       if (searched.deferredInFlight) {
         return { done: false, verifiedCount: 0, retryInMs: 350 };
       }
+      if (searched.incomplete && searched.ordered.length === 0) {
+        return this.inconclusive(concertId);
+      }
       stage = {
         concert,
         preRanked: searched.ordered.slice(0, MAX_FILE_LIST_PROBES),
@@ -2477,6 +2536,7 @@ export class AlbumResolver {
         debridFallbacks: [],
         excludedSig,
         rawCandidateCount: searched.rawCount,
+        searchIncomplete: searched.incomplete || undefined,
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
       };
@@ -2647,7 +2707,7 @@ export class AlbumResolver {
   private finalizeConcertResolution(
     concertId: string,
     stage: ConcertResolveStage
-  ): { done: boolean; verifiedCount: number } {
+  ): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
     stage.verified.sort((a, b) => b.score - a.score);
     let finalReleases: VerifiedConcertRelease[];
     if (stage.verified.length > 0) {
@@ -2656,6 +2716,11 @@ export class AlbumResolver {
       const archiveFallbacks = [...(stage.archiveFallbacks || [])].sort((a, b) => b.score - a.score);
       const debridFallbacks = [...(stage.debridFallbacks || [])].sort((a, b) => b.score - a.score);
       finalReleases = [...archiveFallbacks.slice(0, 2), ...debridFallbacks.slice(0, 2)].slice(0, 3);
+    }
+    if (finalReleases.length === 0 && stage.searchIncomplete) {
+      // Nothing playable among what the indexers had answered so far: no verdict yet.
+      this.cache.delete(concertStageKey(concertId));
+      return this.inconclusive(concertId);
     }
 
     const now = this.env.now();

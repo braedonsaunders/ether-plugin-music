@@ -2192,13 +2192,69 @@ test("0.2.6: never repeats the same (album, query) within the short dedup window
   assert.equal(inflSearches, 0, "concurrent worker must NOT launch parallel duplicate search");
   assert.equal(cacheInfl.get(albumCacheKey(album.id)), null, "must not write negative cache while primary search is in-flight");
 
-  // 3. If Worker 1 timed out / died (>6s ago without updating memo), subsequent call does NOT
-  //    re-fire the same query within the 5m dedup window.
+  // 3. If Worker 1 timed out / died (>6s ago without updating memo), its attempt said nothing
+  //    about the album (W348): the next call searches again, exactly once, and never caches a
+  //    negative from the dead attempt.
   nowInfl += 10_000;
-  const afterTimeout = resolverInfl.resolve({ item: trackItemFor(album, 1) });
-  assert.equal(afterTimeout.pending, undefined);
-  assert.equal(afterTimeout.sources.length, 0);
-  assert.equal(inflSearches, 0, "must not repeat timed-out search within 5m dedup window");
+  resolverInfl.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(inflSearches, 1, "a dead in-flight attempt is searched again after the wait window");
+  const negative = cacheInfl.get<{ negative?: boolean }>(albumCacheKey(album.id));
+  assert.ok(!negative || !negative.negative, "a dead attempt must not become a negative album");
+});
+
+test("W348: indexers still searching never turn an album negative; the resolver keeps answering pending", () => {
+  const album = sampleDiscoveryAlbum();
+  const late: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    indexer: "SlowIndexer",
+    nzbUrl: "https://slow.test/discovery.nzb",
+    size: 430_000_000,
+  };
+  let clock = 1_760_000_000_000;
+  let searches = 0;
+  const { env } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") {
+        searches++;
+        // First answers: nothing yet, one indexer still running; then it answers.
+        return searches < 3
+          ? { candidates: [], pending: [{ indexerId: "slow", indexer: "SlowIndexer" }], indexers: [{ indexerId: "slow", status: "pending" }] }
+          : { candidates: [late], indexers: [{ indexerId: "slow", status: "answered", results: 1 }] };
+      }
+      if (q.kind === "release_files") {
+        return { candidates: [{ ...q.candidate!, files: album.tracks.map((t, i) => ({ index: i, path: `${String(i + 1).padStart(2, "0")} - ${t.title}.flac`, size: 30_000_000 })) }] };
+      }
+      if (q.kind === "usenet_check") return { candidates: [{ ...late, usenetCheck: { available: true, checked: 8, missing: 0 } }] };
+      return { candidates: [] };
+    },
+  });
+  env.now = () => clock;
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 24 * 60 * 60 * 1000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const resolver = new AlbumResolver(env, cache, new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings), settings);
+
+  const first = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(first.pending, true, "an empty answer with indexers pending is not a verdict");
+  assert.equal(cache.get(albumCacheKey(album.id)), null, "no negative album while indexers are pending");
+  // Every track of the album asks meanwhile; none gets a cached empty answer.
+  assert.equal(resolver.resolve({ item: trackItemFor(album, 3) }).pending, true);
+
+  let res = first;
+  for (let i = 0; res.pending && i < 10; i++) {
+    clock += 7_000; // past the in-flight wait window
+    res = resolver.resolve({ item: trackItemFor(album, 0) });
+  }
+  assert.equal(res.pending, undefined);
+  assert.equal(res.sources[0]?.release?.candidate?.nzbUrl, late.nzbUrl);
+  assert.equal(searches, 3);
 });
 
 test("#781: a usenet_check that would not fit the 5 s /resolve deadline is deferred to the next slice without re-listing", () => {

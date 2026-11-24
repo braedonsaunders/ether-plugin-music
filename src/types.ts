@@ -243,7 +243,13 @@ export interface HostEnv {
     get: () => Record<string, unknown>;
   };
   sources: {
-    resolve: (q: SourceQuery) => { candidates?: SourceCandidate[] };
+    resolve: (q: SourceQuery) => {
+      candidates?: SourceCandidate[];
+      /** Indexers still searching in the background (early-returning indexer_search). */
+      pending?: Array<{ indexerId?: string; indexer?: string }>;
+      /** Per-indexer outcome: answered, pending, timed_out, skipped or error. */
+      indexers?: Array<{ indexerId?: string; indexer?: string; status?: string; results?: number }>;
+    };
   };
 }
 
