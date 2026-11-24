@@ -152,12 +152,14 @@ function uniqueStrings(list: Array<string | null | undefined>): string[] {
 export const BACKFILL_QUEUE_KEY = "backfill:queue:v1";
 export const BACKFILL_TRIED_KEY = "backfill:tried:v1";
 export const MAX_BACKFILL_QUEUE = 200;
+export const ARTIST_ART_KEY = "artist_art_v1:";
 export const MAX_BACKFILL_TRIED = 400;
 const BACKFILL_RETRY_MS = 3 * DAY_MS;
 const BACKFILL_QUEUE_TTL_MS = 14 * DAY_MS;
 
 export interface StubBackfillEntry {
-  kind: "artist" | "album";
+  /** artistArt: a curated artist stored without a portrait; one Deezer read fetches it. */
+  kind: "artist" | "album" | "artistArt";
   id: string;
   queuedAt: number;
 }
@@ -496,6 +498,38 @@ export class MusicCatalog {
     };
   }
 
+  /** An artist's portrait: the seed's, else one an earlier backfill found. */
+  private artistArt(seed: ArtistSeedEntry): KindArtRef[] {
+    const own = makeArt(seed.pictureXL, seed.pictureBig);
+    if (own.length > 0) return own;
+    const found = this.cache.get<{ xl: string; big: string }>(`${ARTIST_ART_KEY}${seed.deezerId}`);
+    return found ? makeArt(found.xl, found.big) : own;
+  }
+
+  /**
+   * Queue curated artists emitted without a portrait for a bounded backfill in changes():
+   * one Deezer artist read each, remembered so later refreshes keep the art.
+   */
+  recordArtlessArtists(items: KindItem[]): void {
+    const artless = items.filter((it) => it && it.level === "artist" && (!it.art || it.art.length === 0)).map((it) => it.id);
+    if (artless.length === 0) return;
+    const nowMs = this.env.now();
+    const tried = pruneAndCapTried(this.cache.get<Record<string, number>>(BACKFILL_TRIED_KEY), nowMs);
+    const existingRaw = this.cache.get<StubBackfillEntry[]>(BACKFILL_QUEUE_KEY);
+    const queue: StubBackfillEntry[] = Array.isArray(existingRaw) ? existingRaw.filter((e) => e && typeof e.id === "string") : [];
+    const queued = new Set(queue.filter((e) => e.kind === "artistArt").map((e) => e.id));
+    let added = 0;
+    for (const id of artless) {
+      if (queued.has(id) || tried[`art:${id}`]) continue;
+      queued.add(id);
+      queue.push({ kind: "artistArt", id, queuedAt: nowMs });
+      added++;
+    }
+    if (added === 0) return;
+    const bounded = queue.length > MAX_BACKFILL_QUEUE ? queue.slice(queue.length - MAX_BACKFILL_QUEUE) : queue;
+    this.cache.set(BACKFILL_QUEUE_KEY, bounded, BACKFILL_QUEUE_TTL_MS);
+  }
+
   /**
    * Build a canonical artist KindItem.
    */
@@ -528,7 +562,7 @@ export class MusicCatalog {
       year,
       released,
       rating,
-      art: makeArt(seed.pictureXL, seed.pictureBig),
+      art: this.artistArt(seed),
       fields,
       hints: {
         deezerArtistId: seed.deezerId,
@@ -974,6 +1008,7 @@ export class MusicCatalog {
         else consecutiveMisses = 0;
         enriched.push(this.buildArtistItem(hydrated));
       }
+      this.recordArtlessArtists(enriched);
       const nextCursor = offset + rawSlice.length < seed.artists.length ? String(offset + rawSlice.length) : undefined;
       return { items: enriched, nextCursor, total: seed.artists.length };
     }
@@ -1071,7 +1106,7 @@ export class MusicCatalog {
     const tried = pruneAndCapTried(this.cache.get<Record<string, number>>(BACKFILL_TRIED_KEY), nowMs);
     const existingRaw = this.cache.get<StubBackfillEntry[]>(BACKFILL_QUEUE_KEY);
     const queue: StubBackfillEntry[] = Array.isArray(existingRaw)
-      ? existingRaw.filter((e) => e && (e.kind === "artist" || e.kind === "album") && typeof e.id === "string")
+      ? existingRaw.filter((e) => e && (e.kind === "artist" || e.kind === "album" || e.kind === "artistArt") && typeof e.id === "string")
       : [];
     const queuedIds = new Set(queue.map((e) => e.id));
 
@@ -1106,7 +1141,7 @@ export class MusicCatalog {
 
     const existingRaw = this.cache.get<StubBackfillEntry[]>(BACKFILL_QUEUE_KEY);
     const queue: StubBackfillEntry[] = Array.isArray(existingRaw)
-      ? existingRaw.filter((e) => e && (e.kind === "artist" || e.kind === "album") && typeof e.id === "string")
+      ? existingRaw.filter((e) => e && (e.kind === "artist" || e.kind === "album" || e.kind === "artistArt") && typeof e.id === "string")
       : [];
     if (queue.length === 0) return [];
 
@@ -1129,8 +1164,40 @@ export class MusicCatalog {
     let completedArtists = 0;
     let hitRateLimit = false;
 
+    // Portraits first: one cheap read each, and they are what a viewer sees first.
+    queue.sort((a, b) => Number(b.kind === "artistArt") - Number(a.kind === "artistArt"));
+    const seedArtists = queue.some((e) => e.kind === "artistArt") ? this.getCuratedSeed(false).artists : [];
     for (let i = 0; i < queue.length; i++) {
       const entry = queue[i];
+      if (entry.kind === "artistArt") {
+        if (tried[`art:${entry.id}`]) continue;
+        if (hitRateLimit || left() < 600) {
+          remaining.push(entry);
+          continue;
+        }
+        const deezerId = parseNumericId(entry.id, "ar-");
+        const seedEntry = seedArtists.find((a) => a.deezerId === deezerId);
+        tried[`art:${entry.id}`] = this.env.now();
+        if (!deezerId || !seedEntry) continue;
+        try {
+          const hydrated = this.enrichArtistSeedEntry(seedEntry);
+          const xl = cleanArtUrl(hydrated.pictureXL);
+          const big = cleanArtUrl(hydrated.pictureBig);
+          if (xl || big) {
+            this.cache.set(`${ARTIST_ART_KEY}${deezerId}`, { xl, big }, 30 * DAY_MS);
+            pushOut(this.buildArtistItem(hydrated));
+            completedArtists++;
+          }
+        } catch (err) {
+          rethrowHostFault(err);
+          if (err instanceof RateLimitError) {
+            hitRateLimit = true;
+            delete tried[`art:${entry.id}`];
+            remaining.push(entry);
+          }
+        }
+        continue;
+      }
       if (tried[entry.id]) continue;
 
       const minNeeded = entry.kind === "artist" ? 2500 : 1200;
@@ -1315,6 +1382,7 @@ export class MusicCatalog {
       }
     }
 
+    this.recordArtlessArtists(upserts);
     // Drain any queued stub artists/albums from prior search()/expand() calls within remaining budget.
     const remainingBudget = 26_000 - (this.env.now() - startMs);
     for (const bf of this.drainStubBackfill(remainingBudget)) {
