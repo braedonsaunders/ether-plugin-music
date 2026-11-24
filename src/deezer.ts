@@ -323,6 +323,18 @@ export class DeezerClient {
     return Array.isArray(res?.data) ? res!.data : [];
   }
 
+  /** Deezer's keyless artist radio: tracks by the artist and artists like them. */
+  getArtistRadio(artistId: number, limit = 40, timeoutMs = 4000): DeezerTrack[] {
+    const res = this.getJson<{ data?: DeezerTrack[] }>(
+      `/artist/${artistId}/radio?limit=${limit}`,
+      `dz:artist:${artistId}:radio:${limit}`,
+      6 * HOUR_MS,
+      timeoutMs,
+      { compact: (r) => ({ data: Array.isArray(r?.data) ? r.data.map((t) => slimTrack(t, true)) : [] }) }
+    );
+    return Array.isArray(res?.data) ? res!.data : [];
+  }
+
   getAlbum(albumId: number, timeoutMs = 4000): DeezerAlbumDetail | null {
     // MusicCatalog caches the compact CanonicalAlbum under album_v2:al-{id}; persisting raw
     // 20 KB Deezer album payloads alongside it would double-cache and exhaust the 50 MiB KV quota.

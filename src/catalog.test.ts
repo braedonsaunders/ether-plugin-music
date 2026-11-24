@@ -27,6 +27,19 @@ function makeMockCatalogHost(): {
 
   const fakeHttp = (req: HttpFetchRequest): HttpFetchResponse => {
     httpCalls.push(req.url);
+    if (req.url.includes("/artist/27/related")) {
+      return { status: 200, body: JSON.stringify({ data: [
+        { id: 1069, name: "Portishead", picture_xl: "https://cdn.test/ph-xl.jpg" },
+        { id: 4050205, name: "Justice", picture_big: "https://cdn.test/ju-big.jpg" },
+      ] }) };
+    }
+    if (req.url.includes("/artist/27/radio")) {
+      return { status: 200, body: JSON.stringify({ data: [
+        { id: 3135553, title: "One More Time", duration: 320, artist: { id: 27, name: "Daft Punk" }, album: { id: 302127, title: "Discovery" } },
+        { id: 3135554, title: "Aerodynamic", duration: 212, artist: { id: 27, name: "Daft Punk" }, album: { id: 302127, title: "Discovery" } },
+        { id: 999, title: "Gone", duration: 100, artist: { id: 5, name: "Missing" }, album: { id: 77, title: "Unavailable" } },
+      ] }) };
+    }
     if (req.url.includes("/chart/0/artists")) {
       return {
         status: 200,
@@ -1020,4 +1033,23 @@ test("0.2.5: bulky Deezer album/discography/search responses stay memory-only in
   const parentMap = JSON.parse(rawParentMap!).v as Record<string, number>;
   assert.equal(parentMap["302999"], 27, "collab album should record artist override");
   assert.equal(parentMap["302127"], undefined, "solo album owned by artist must not bloat exp:alb_parent:v1");
+});
+
+test("related: similar artists and a radio continuation that brings its albums", () => {
+  const { env } = makeMockCatalogHost();
+  const handle = createHandler(env);
+  const similar = handle({ method: "POST", path: "/ether/v1/kinds/music/related", body: { item: { id: "ar-27", level: "artist" }, purpose: "similar", limit: 10 } });
+  assert.equal(similar.status, 200);
+  const sim = similar.body as { label: string; items: KindItem[] };
+  assert.equal(sim.label, "Fans also like");
+  assert.deepEqual(sim.items.map((a) => a.id), ["ar-1069", "ar-4050205"]);
+  assert.ok(sim.items.every((a) => a.level === "artist" && a.art && a.art.length > 0));
+
+  // From a track: radio by its artist, the seed track left out, unloadable albums skipped.
+  const next = handle({ method: "POST", path: "/ether/v1/kinds/music/related", body: { item: { id: "tr-3135553", level: "track", hints: { deezerArtistId: 27 } }, purpose: "continuation", limit: 10 } });
+  assert.equal(next.status, 200);
+  const cont = next.body as { items: KindItem[]; order: string[] };
+  assert.deepEqual(cont.order, ["tr-3135554"]);
+  assert.ok(cont.items.some((i) => i.id === "al-302127" && i.level === "album"));
+  assert.ok(cont.items.some((i) => i.id === "tr-3135554" && i.playable));
 });

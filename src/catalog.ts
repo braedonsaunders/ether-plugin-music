@@ -2091,6 +2091,101 @@ export class MusicCatalog {
     return { items };
   }
 
+  /** The Deezer artist a stored item belongs to (an artist, an album or a track). */
+  private seedArtistId(item: { id?: string; level?: string; hints?: Record<string, unknown> }): number {
+    const id = String(item?.id || "");
+    if (id.startsWith("ar-")) return parseNumericId(id, "ar-");
+    const hinted = Number(item?.hints?.deezerArtistId || 0);
+    return Number.isInteger(hinted) && hinted > 0 ? hinted : 0;
+  }
+
+  /** A minimal artist item, or the curated one when the artist is curated. */
+  private artistItemFor(deezerId: number, name: string): KindItem {
+    const curated = this.getCuratedSeed(false).artists.find((a) => a.deezerId === deezerId);
+    if (curated) return this.buildArtistItem(curated);
+    const cached = this.dz.getCachedArtist(deezerId);
+    return this.buildArtistItem({
+      deezerId,
+      name: cached?.name || name,
+      pictureXL: cached?.picture_xl || "",
+      pictureBig: cached?.picture_big || cached?.picture_medium || "",
+      fans: cached?.nb_fan || 0,
+      nbAlbum: 0,
+      genres: [],
+      curation: [],
+      chartAlbumIds: [],
+      newReleaseAlbumIds: [],
+      classic: false,
+      era: "2020s",
+      chartBonus: 0,
+      latestReleaseSec: 0,
+      latestYear: 0,
+    });
+  }
+
+  /**
+   * POST /ether/v1/kinds/music/related
+   * similar: artists fans of this one also like (Deezer related artists).
+   * continuation: a radio of tracks by and like the seed's artist (Deezer artist radio),
+   * with the albums and artists they need, in radio order.
+   */
+  related(req: { item?: any; purpose?: string; limit?: number }): { label?: string; items: KindItem[]; order?: string[] } {
+    const item = req.item || {};
+    const artistId = this.seedArtistId(item);
+    if (!artistId) return { items: [] };
+    const limit = Math.max(1, Math.min(50, Number(req.limit) || 20));
+    if (req.purpose === "similar") {
+      const related = this.dz.getArtistRelated(artistId, Math.min(limit, 20));
+      const items = related
+        .filter((a) => a && a.id && a.name)
+        .map((a) => {
+          const built = this.artistItemFor(a.id, a.name);
+          if ((!built.art || built.art.length === 0) && (a.picture_xl || a.picture_big)) {
+            built.art = makeArt(a.picture_xl, a.picture_big);
+          }
+          return built;
+        });
+      return { label: "Fans also like", items };
+    }
+    if (req.purpose !== "continuation") return { items: [] };
+
+    const startMs = this.env.now();
+    const radio = this.dz.getArtistRadio(artistId, 40, 3500);
+    const seedTrack = String(item.id || "");
+    const out: KindItem[] = [];
+    const order: string[] = [];
+    const albums = new Map<number, ReturnType<MusicCatalog["loadCanonicalAlbum"]>>();
+    const artists = new Set<number>();
+    for (const tr of radio) {
+      if (order.length >= limit || this.env.now() - startMs > 6500) break;
+      const albumId = tr?.album?.id;
+      if (!tr?.id || !albumId || trackExternalId(tr.id) === seedTrack) continue;
+      if (!albums.has(albumId)) {
+        if (albums.size >= 12) continue;
+        let canonical = null;
+        try {
+          canonical = this.loadCanonicalAlbum(albumId, { allowMusicBrainz: false, timeoutMs: 1500 });
+        } catch (err) {
+          rethrowHostFault(err);
+          if (err instanceof RateLimitError) break;
+        }
+        albums.set(albumId, canonical);
+        if (canonical) {
+          if (!artists.has(canonical.deezerArtistId)) {
+            artists.add(canonical.deezerArtistId);
+            out.push(this.artistItemFor(canonical.deezerArtistId, canonical.artistName));
+          }
+          out.push(this.buildAlbumItem(canonical));
+          out.push(...this.buildTrackItems(canonical));
+        }
+      }
+      const canonical = albums.get(albumId);
+      const id = trackExternalId(tr.id);
+      if (canonical && canonical.tracks.some((t) => t.id === id)) order.push(id);
+    }
+    return { items: out, order };
+  }
+
   /**
    * GET /ether/v1/kinds/music/items/:id
    * Directly fetches any artist, album, or track item by external ID.

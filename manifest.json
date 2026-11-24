@@ -672,7 +672,11 @@
           "match": {
             "thresholdDefault": 0.72
           },
-          "lyrics": true
+          "lyrics": true,
+          "related": {
+            "similar": true,
+            "continuation": true
+          }
         }
       ],
       "frontendAdapters": [

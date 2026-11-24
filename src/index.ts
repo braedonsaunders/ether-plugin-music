@@ -218,7 +218,12 @@ export function createHandler(env?: HostEnv, subsonicHost?: () => import("./subs
         return { status: 200, body: resolver.matchCandidates(matchReq) };
       }
 
-      // 9. Synced & plain lyrics via LRCLIB (forward-compatible route)
+      // 9. Related items: similar artists and radio continuation
+      if (path === "/ether/v1/kinds/music/related") {
+        return { status: 200, body: catalog.related(body) };
+      }
+
+      // 10. Synced & plain lyrics via LRCLIB (forward-compatible route)
       if (path === "/ether/v1/kinds/music/lyrics") {
         const item = body.item || {};
         const hints = item.hints || {};
