@@ -967,7 +967,7 @@ export class SubsonicAdapter {
     let items: KindItem[] = [];
     switch (type) {
       case "random":
-        items = this.sample(this.host.browse({ level: "album", sort: "rating", desc: true, limit: MAX_BROWSE, total: "none" }).items || [], size);
+        items = this.sample(this.host.browse({ level: "album", sort: "rating", desc: true, limit: Math.min(MAX_BROWSE, Math.max(100, size * 5)), total: "none" }).items || [], size);
         break;
       case "newest":
         items = this.pagedBrowse({ level: "album", sort: "released", desc: true }, offset, size);
@@ -1135,13 +1135,14 @@ export class SubsonicAdapter {
 
   // --- search -------------------------------------------------------------------
 
-  private liveSearch(query: string): void {
+  /** Searches the live catalogue once per query (30 min); true when it added items. */
+  private liveSearch(query: string): boolean {
     const key = query.toLowerCase();
     try {
       const raw = this.env.kv.get(LIVE_SEARCH_KEY);
       const seen = raw ? (JSON.parse(raw) as Record<string, number>) : {};
       const now = this.env.now();
-      if (seen[key] && now - seen[key] < LIVE_SEARCH_TTL_MS) return;
+      if (seen[key] && now - seen[key] < LIVE_SEARCH_TTL_MS) return false;
       const found = (this.catalog.search(query, 40).items || []).filter(
         (x) => x.level === "artist" || x.level === "album" || x.level === "track"
       );
@@ -1151,9 +1152,11 @@ export class SubsonicAdapter {
         if (now - at < LIVE_SEARCH_TTL_MS && Object.keys(kept).length < 200) kept[k] = at;
       }
       this.env.kv.put(LIVE_SEARCH_KEY, JSON.stringify(kept));
+      return found.length > 0;
     } catch (err) {
       rethrowHostFault(err);
       this.env.log("warn", `subsonic live search: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
     }
   }
 
@@ -1173,10 +1176,18 @@ export class SubsonicAdapter {
       if (offset + count > MAX_BROWSE) return [];
       return (this.host.browse({ level: lv, query, limit: offset + count, total: "none" }).items || []).slice(offset, offset + count);
     };
-    if (query && artistOffset === 0 && albumOffset === 0 && songOffset === 0) this.liveSearch(query);
-    const artists = level("artist", artistOffset, artistCount);
-    const albums = level("album", albumOffset, albumCount);
-    const songs = level("track", songOffset, songCount);
+    let artists = level("artist", artistOffset, artistCount);
+    let albums = level("album", albumOffset, albumCount);
+    let songs = level("track", songOffset, songCount);
+    // Ether's library holds what has been browsed or searched before; when it
+    // has little for this query, search the live catalogue once and add it.
+    const wanted = Math.min(artistCount, 1) + Math.min(albumCount, 3) + Math.min(songCount, 5);
+    const have = Math.min(artists.length, 1) + Math.min(albums.length, 3) + Math.min(songs.length, 5);
+    if (query && artistOffset === 0 && albumOffset === 0 && songOffset === 0 && have < wanted && this.liveSearch(query)) {
+      artists = level("artist", artistOffset, artistCount);
+      albums = level("album", albumOffset, albumCount);
+      songs = level("track", songOffset, songCount);
+    }
     const states = this.states([...artists, ...albums, ...songs]);
     return {
       artist: artists.map((a) => (id3 ? artistOf(a, states.get(a.id)) : { id: a.id, name: a.title, coverArt: a.id, starred: artistOf(a, states.get(a.id)).starred })),
@@ -1392,6 +1403,14 @@ export class SubsonicAdapter {
     id = id.replace(/^(?:mf|pl)-(?=(?:ar|al|tr|co)-)/, "");
     checkId(id);
     const size = p.int("size", 0, 0, 4000);
+    if (id.startsWith("ar-")) {
+      // Many artists have no picture of their own; use their newest album's cover.
+      const [artist] = this.host.get([id]);
+      if (artist && !(artist.art || []).some((a) => a.url)) {
+        const [album] = this.host.browse({ parentId: id, level: "album", sort: "released", desc: true, limit: 1, total: "none" }).items || [];
+        if (album) id = album.id;
+      }
+    }
     return { status: 200, art: { itemRef: itemRef(id), role: size > 0 && size <= 500 ? "thumb" : "poster" } };
   }
 }
