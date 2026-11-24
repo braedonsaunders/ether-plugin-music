@@ -45,6 +45,8 @@ export interface KindItem {
   art?: KindArtRef[];
   fields?: Record<string, unknown>;
   hints?: Record<string, unknown>;
+  /** The recording this item is a copy of ("isrc:<ISRC>"), the same on every release. */
+  recording?: string;
   etag?: string;
 }
 
@@ -296,6 +298,9 @@ export interface CanonicalAlbum {
   releaseMbid?: string;
   curation: string[];
   tracks: CanonicalTrack[];
+  /** Set when this "album" is one song looked for on another release that carries it (a single,
+   * a compilation): only that song must be found, among the release's own track count. */
+  recordingTarget?: { releaseTrackCount: number };
 }
 
 export interface TrackFileMapping {

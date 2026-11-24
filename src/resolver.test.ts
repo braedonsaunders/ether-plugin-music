@@ -2258,3 +2258,61 @@ test("#781: a usenet_check that would not fit the 5 s /resolve deadline is defer
   assert.equal(calls.filter((q) => q.kind === "usenet_check").length, 1);
   assert.equal(slices, 2);
 });
+
+test("a song its album could not play is found on a single carrying the same recording (ISRC)", () => {
+  const album = sampleDiscoveryAlbum();
+  const single: SourceCandidate = {
+    title: "Daft Punk - One More Time (2000) [FLAC]",
+    indexer: "NZBgeek",
+    nzbUrl: "https://api.nzbgeek.info/api?t=get&id=omt-single",
+    size: 90_000_000,
+  };
+  const { env, calls } = makeFakeHost({
+    onResolve: (q) => {
+      if (q.kind === "indexer_search") return { candidates: /one more time/i.test(q.query || "") ? [single] : [] };
+      if (q.kind === "release_files") {
+        return { candidates: [{ ...q.candidate!, files: [
+          { index: 0, path: "01 - One More Time.flac", size: 40_000_000 },
+          { index: 1, path: "02 - One More Time (Radio Edit).flac", size: 25_000_000 },
+        ] }] };
+      }
+      if (q.kind === "usenet_check") return { candidates: [{ ...single, usenetCheck: { available: true, checked: 8, missing: 0 } }] };
+      return { candidates: [] };
+    },
+  });
+  env.http.fetch = (req) => req.url.includes("musicbrainz.org/ws/2/recording")
+    ? { status: 200, body: JSON.stringify({ recordings: [{ "artist-credit": [{ name: "Daft Punk" }], releases: [
+        { title: "Discovery", status: "Official", "track-count": 14, "release-group": { "primary-type": "Album" } },
+        { title: "One More Time", status: "Official", "track-count": 2, "release-group": { "primary-type": "Single" } },
+        { title: "Club Hits 2001", status: "Official", "track-count": 30, "release-group": { "primary-type": "Album", "secondary-types": ["Compilation"] } },
+      ] }] }) }
+    : { status: 404, body: "" };
+  const cache = new KVCache(env);
+  cache.set("album_v2:al-302127", album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+  const item = trackItemFor(album, 0);
+  item.hints = { ...(item.hints || {}), isrc: "GBDUW0000053" };
+
+  let res = resolver.resolve({ item });
+  for (let i = 0; res.pending && i < 12; i++) res = resolver.resolve({ item });
+  assert.equal(res.pending, undefined);
+  assert.equal(res.sources[0]?.release?.candidate?.nzbUrl, single.nzbUrl);
+  assert.equal(res.sources[0]?.release?.fileHint, "01 - One More Time.flac");
+  // The single was searched; the album itself and the compilation were not tried after it matched.
+  assert.ok(calls.some((q) => q.kind === "indexer_search" && /one more time/i.test(q.query || "")));
+  assert.ok(!calls.some((q) => q.kind === "indexer_search" && /club hits/i.test(q.query || "")));
+  // Any album's copy of the same recording now plays from the remembered answer at once.
+  const other = { ...item, id: "tr-999", parentId: "al-999", hints: { ...(item.hints || {}), albumId: "al-999", albumTitle: "Club Hits 2001" } };
+  cache.set(albumCacheKey("al-999"), { albumId: "al-999", resolvedAt: 0, expiresAt: Date.now() + 60_000, releases: [], negative: true }, 60_000);
+  const again = resolver.resolve({ item: other });
+  assert.equal(again.sources[0]?.release?.candidate?.nzbUrl, single.nzbUrl);
+});

@@ -154,6 +154,12 @@ export const BACKFILL_TRIED_KEY = "backfill:tried:v1";
 export const MAX_BACKFILL_QUEUE = 200;
 export const ARTIST_ART_KEY = "artist_art_v1:";
 /** Editorial playlists the library offers, and how many of each one's songs. */
+/** A track's recording identity: the same song on every release that carries it. */
+export function recordingOf(isrc?: string): string | undefined {
+  const code = (isrc || "").trim().toUpperCase().replace(/-/g, "");
+  return /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(code) ? `isrc:${code}` : undefined;
+}
+
 export const PLAYLIST_PICKS = 10;
 export const PLAYLIST_MEMBERS = 50;
 const PLAYLISTS_BUCKET_KEY = "playlists_bucket";
@@ -583,6 +589,11 @@ export class MusicCatalog {
    * Fetch and canonicalize an album (with full tracklist) from Deezer + optional MusicBrainz,
    * caching CanonicalAlbum in KV so Wave 2 (/browse tracks) and /resolve hit KV instantly.
    */
+  /** Official releases carrying a recording (MusicBrainz, by ISRC). */
+  recordingReleases(isrc: string) {
+    return this.mb.lookupRecordingReleases(isrc);
+  }
+
   loadCanonicalAlbum(
     deezerAlbumId: number,
     extra: {
@@ -868,6 +879,7 @@ export class MusicCatalog {
         playable: true,
         art,
         fields,
+        recording: recordingOf(tr.isrc),
         hints: {
           albumId: album.id,
           deezerAlbumId: album.deezerAlbumId,
@@ -886,7 +898,7 @@ export class MusicCatalog {
           isrc: tr.isrc,
           upc: album.upc,
         },
-        etag: `tr4-${tr.deezerTrackId}-${tr.disc}-${idx + 1}-${tr.durationSec}`,
+        etag: `tr5-${tr.deezerTrackId}-${tr.disc}-${idx + 1}-${tr.durationSec}`,
       };
     });
   }
@@ -2184,6 +2196,7 @@ export class MusicCatalog {
       playable: true,
       art: makeArt(tr.album?.cover_xl, tr.album?.cover_big),
       fields: { artistName: tr.artist?.name || "", albumTitle: tr.album?.title || "", duration: tr.duration, explicit: Boolean(tr.explicit_lyrics) },
+      recording: recordingOf(tr.isrc),
       hints: {
         albumId: albumExternalId(albumId), deezerAlbumId: albumId, deezerTrackId: tr.id, deezerArtistId: parentArtist,
         artistName: tr.album ? tr.artist?.name || "" : "", trackArtistName: tr.artist?.name || "", albumTitle: tr.album?.title || "",

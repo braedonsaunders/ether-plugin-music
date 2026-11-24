@@ -1109,3 +1109,11 @@ test("an artist expand never stores a placeholder name when Deezer's artist look
   assert.ok(items.length > 0);
   assert.ok(!items.some((i) => /^Artist \d+$/.test(i.title)));
 });
+
+test("tracks carry their recording identity from the ISRC", async () => {
+  const { recordingOf } = await import("./catalog.ts");
+  assert.equal(recordingOf("gbduw0000053"), "isrc:GBDUW0000053");
+  assert.equal(recordingOf("GB-DUW-00-00053"), "isrc:GBDUW0000053");
+  assert.equal(recordingOf(""), undefined);
+  assert.equal(recordingOf("not-an-isrc"), undefined);
+});

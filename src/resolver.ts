@@ -22,7 +22,8 @@ import type {
   VideoQualityPreference,
 } from "./types.ts";
 import { KVCache, HOUR_MS, rethrowHostFault } from "./kv.ts";
-import { MusicCatalog, parseNumericId, albumExternalId } from "./catalog.ts";
+import { MusicCatalog, parseNumericId, albumExternalId, recordingOf } from "./catalog.ts";
+import type { MBRecordingRelease } from "./musicbrainz.ts";
 import { getCuratedConcertById, type CuratedConcert } from "./concerts.ts";
 import {
   audioFormatOfPath,
@@ -61,6 +62,59 @@ const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
   return `alb_rel_v6:${albumId}`;
+}
+
+function recordingPlanKey(isrc: string): string {
+  return `rec_plan_v1:${isrc}`;
+}
+
+/** At most this many other releases of a song are searched for it. */
+const MAX_RECORDING_RELEASES = 4;
+
+interface RecordingPlan {
+  candidates: Array<{ title: string; artistName: string; year: number; releaseType: ReleaseType; trackCount: number }>;
+  idx: number;
+}
+
+/**
+ * The other releases worth searching for one song, best first: singles and EPs (small, fast to
+ * verify), other albums and editions, soundtracks, then compilations. The song's own album and
+ * repeats of one title are left out.
+ */
+/** A recording's verified releases, mapped onto the song asking (any album's copy of it). */
+function releasesForItem(releases: VerifiedAlbumRelease[], itemId: string): VerifiedAlbumRelease[] {
+  return releases.map((rel) => {
+    const mapping = rel.tracks[itemId] || Object.values(rel.tracks)[0];
+    return mapping ? { ...rel, tracks: { [itemId]: mapping } } : rel;
+  });
+}
+
+export function pickRecordingReleases(releases: MBRecordingRelease[], ownAlbumTitle: string): RecordingPlan["candidates"] {
+  const own = normalizeText(stripEditionSuffix(ownAlbumTitle || ""));
+  const seen = new Set<string>();
+  const rank = (r: MBRecordingRelease): number => {
+    const sec = r.secondaryTypes.map((t) => t.toLowerCase());
+    if (sec.includes("compilation")) return 4;
+    if (sec.length > 0) return 3;
+    const p = r.primaryType.toLowerCase();
+    return p === "single" ? 0 : p === "ep" ? 1 : 2;
+  };
+  const typeOf = (r: MBRecordingRelease): ReleaseType => {
+    const sec = r.secondaryTypes.map((t) => t.toLowerCase());
+    if (sec.includes("compilation")) return "compilation";
+    if (sec.includes("live")) return "live";
+    const p = r.primaryType.toLowerCase();
+    return p === "single" ? "single" : p === "ep" ? "ep" : "album";
+  };
+  const out: RecordingPlan["candidates"] = [];
+  for (const r of [...releases].sort((a, b) => rank(a) - rank(b))) {
+    const key = normalizeText(stripEditionSuffix(r.title));
+    if (!key || key === own || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ title: r.title, artistName: r.artistName, year: r.year, releaseType: typeOf(r), trackCount: r.trackCount });
+    if (out.length >= MAX_RECORDING_RELEASES) break;
+  }
+  return out;
 }
 
 function albumStageKey(albumId: string): string {
@@ -542,7 +596,9 @@ export function matchAlbumReleaseFiles(
   if (audioFiles.length < minRequiredFiles) {
     return emptyFail(`incomplete release: ${audioFiles.length} audio files < ${minRequiredFiles} tracks`);
   }
-  const maxAllowedFiles = canonicalCount + Math.min(4, Math.max(2, Math.floor(canonicalCount * 0.25)));
+  // One song on another release: the release's own size bounds the files, not the target's.
+  const sizeBasis = album.recordingTarget ? Math.max(album.recordingTarget.releaseTrackCount, canonicalCount) : canonicalCount;
+  const maxAllowedFiles = sizeBasis + Math.min(4, Math.max(2, Math.floor(sizeBasis * 0.25)));
   if (audioFiles.length > maxAllowedFiles) {
     return emptyFail(`mismatched track count: ${audioFiles.length} audio files vs ${canonicalCount} expected`);
   }
@@ -1117,7 +1173,7 @@ export class AlbumResolver {
     const cached = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (cached) {
       if (cached.negative) {
-        return { sources: [], ttlSec: this.negativeResponseTtlSec(cached) };
+        return this.resolveRecording(item, excluded, this.negativeResponseTtlSec(cached));
       }
       const sources = this.buildTrackSources(item, cached.releases, excluded);
       if (sources.length > 0) {
@@ -1128,7 +1184,8 @@ export class AlbumResolver {
         this.cache.delete(albumCacheKey(albumId));
         this.cache.delete(albumStageKey(albumId));
       } else {
-        return { sources: [], ttlSec: NEGATIVE_RESPONSE_EMPTY_TTL_SEC };
+        // The album was found but not this song on it: look for the song on its other releases.
+        return this.resolveRecording(item, excluded, NEGATIVE_RESPONSE_EMPTY_TTL_SEC);
       }
     }
 
@@ -1143,12 +1200,112 @@ export class AlbumResolver {
 
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (!fresh || fresh.releases.length === 0) {
-      return {
-        sources: [],
-        ttlSec: fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC,
-      };
+      return this.resolveRecording(item, excluded, fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC);
     }
-    return { sources: this.buildTrackSources(item, fresh.releases, excluded), ttlSec: 3600 };
+    const sources = this.buildTrackSources(item, fresh.releases, excluded);
+    if (sources.length === 0) return this.resolveRecording(item, excluded, NEGATIVE_RESPONSE_EMPTY_TTL_SEC);
+    return { sources, ttlSec: 3600 };
+  }
+
+  /**
+   * One song whose album gave no playable copy of it: find it on another release that carries
+   * the same recording (by ISRC: a single, an EP, another edition, a compilation), one release per
+   * slice through the same staged album resolver, and remember the answer per recording so every
+   * album holding that song plays it. Without an ISRC the album's answer stands.
+   */
+  private resolveRecording(item: KindItem, excluded: Set<string>, emptyTtlSec: number): KindResolveResponse {
+    const hints = (item.hints || {}) as Record<string, unknown>;
+    const recording = recordingOf(String(hints.isrc || ""));
+    if (!recording) return { sources: [], ttlSec: emptyTtlSec };
+    const isrc = recording.slice("isrc:".length);
+    const recId = `rec-${isrc}`;
+    const done = this.cache.get<CachedAlbumResolution>(albumCacheKey(recId));
+    if (done) {
+      if (done.negative) return { sources: [], ttlSec: Math.min(emptyTtlSec, this.negativeResponseTtlSec(done)) };
+      const sources = this.buildTrackSources(item, releasesForItem(done.releases, item.id), excluded);
+      if (sources.length > 0) return { sources, ttlSec: 3600 };
+      if (excluded.size === 0) return { sources: [], ttlSec: emptyTtlSec };
+      this.cache.delete(albumCacheKey(recId));
+    }
+    let plan = this.cache.get<RecordingPlan>(recordingPlanKey(isrc));
+    if (!plan) {
+      const looked = this.catalog.recordingReleases(isrc);
+      if (looked.status === "busy") return { pending: true, retryInMs: 1200, sources: [] };
+      const candidates = looked.status === "ok" ? pickRecordingReleases(looked.releases, String(hints.albumTitle || "")) : [];
+      if (candidates.length === 0) {
+        this.rememberRecordingMiss(recId);
+        return { sources: [], ttlSec: emptyTtlSec };
+      }
+      plan = { candidates, idx: 0 };
+      this.cache.set(recordingPlanKey(isrc), plan, ALBUM_CACHE_TTL_MS);
+    }
+    const cand = plan.candidates[plan.idx];
+    const synthId = `${recId}-${plan.idx}`;
+    if (!this.cache.get<CanonicalAlbum>(`album_v2:${synthId}`)) {
+      this.cache.set(`album_v2:${synthId}`, this.recordingAlbum(synthId, item, cand), ALBUM_CACHE_TTL_MS);
+    }
+    this.env.log("info", `resolve-recording: ${recording} "${item.title}" try ${plan.idx + 1}/${plan.candidates.length} "${cand.artistName} - ${cand.title}" (${cand.releaseType})`);
+    const step = this.stepResolveAlbum(synthId, item, excluded, RESOLVE_STEP_BUDGET_MS, true);
+    if (!step.done) return { pending: true, retryInMs: step.retryInMs ?? 250, sources: [] };
+    const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(synthId));
+    if (fresh && !fresh.negative && fresh.releases.length > 0) {
+      this.cache.set(albumCacheKey(recId), fresh, ALBUM_CACHE_TTL_MS);
+      this.cache.delete(recordingPlanKey(isrc));
+      const sources = this.buildTrackSources(item, releasesForItem(fresh.releases, item.id), excluded);
+      if (sources.length > 0) return { sources, ttlSec: 3600 };
+    }
+    plan.idx++;
+    if (plan.idx >= plan.candidates.length) {
+      this.cache.delete(recordingPlanKey(isrc));
+      this.rememberRecordingMiss(recId);
+      return { sources: [], ttlSec: emptyTtlSec };
+    }
+    this.cache.set(recordingPlanKey(isrc), plan, ALBUM_CACHE_TTL_MS);
+    return { pending: true, retryInMs: 250, sources: [] };
+  }
+
+  private rememberRecordingMiss(recId: string): void {
+    const now = this.env.now();
+    const record: CachedAlbumResolution = { albumId: recId, resolvedAt: now, expiresAt: now + NEGATIVE_UNMATCHED_CACHE_TTL_MS, releases: [], negative: true };
+    this.cache.set(albumCacheKey(recId), record, NEGATIVE_UNMATCHED_CACHE_TTL_MS);
+  }
+
+  /** The one-song "album" searched for on another release of its recording. */
+  private recordingAlbum(id: string, item: KindItem, cand: RecordingPlan["candidates"][number]): CanonicalAlbum {
+    const hints = (item.hints || {}) as Record<string, unknown>;
+    const artistName = cand.artistName || String(hints.trackArtistName || hints.artistName || "");
+    return {
+      id,
+      deezerAlbumId: 0,
+      artistId: `ar-${Number(hints.deezerArtistId) || 0}`,
+      deezerArtistId: Number(hints.deezerArtistId) || 0,
+      artistName,
+      title: cand.title,
+      releaseDate: "",
+      year: cand.year,
+      releaseType: cand.releaseType,
+      genres: [],
+      label: "",
+      fans: 0,
+      durationSec: Number(hints.durationSec || 0),
+      trackCount: 1,
+      discCount: 1,
+      coverXL: "",
+      coverBig: "",
+      curation: [],
+      tracks: [{
+        id: item.id,
+        deezerTrackId: Number(hints.deezerTrackId) || 0,
+        title: item.title,
+        disc: 1,
+        trackNumber: 0,
+        durationSec: Number(hints.durationSec || item.fields?.duration || 0),
+        explicit: false,
+        isrc: String(hints.isrc || "") || undefined,
+        artistName: String(hints.trackArtistName || artistName),
+      }],
+      recordingTarget: { releaseTrackCount: cand.trackCount },
+    };
   }
 
   /**

@@ -21,6 +21,16 @@ export interface CoverArtUrls {
   front500?: string;
 }
 
+/** One official release carrying a recording (MusicBrainz). */
+export interface MBRecordingRelease {
+  title: string;
+  artistName: string;
+  year: number;
+  primaryType: string;
+  secondaryTypes: string[];
+  trackCount: number;
+}
+
 export class MusicBrainzClient {
   private env: HostEnv;
   private cache: KVCache;
@@ -116,6 +126,76 @@ export class MusicBrainzClient {
     } catch (err) {
       rethrowHostFault(err);
       return null;
+    }
+  }
+
+  /**
+   * Every official release that carries a recording, by its ISRC: the album it came from,
+   * singles, EPs, deluxe editions, soundtracks and compilations. Same 1 req/s gate as above;
+   * "busy" means the slot was taken (ask again shortly). Cached 30 days (misses 7).
+   */
+  lookupRecordingReleases(isrc: string): { status: "ok"; releases: MBRecordingRelease[] } | { status: "busy" | "miss" } {
+    const code = isrc.trim().toUpperCase();
+    const cacheKey = `mb:isrc:${code}`;
+    const cached = this.cache.get<MBRecordingRelease[] | { miss: true }>(cacheKey);
+    if (cached !== null) {
+      return Array.isArray(cached) ? { status: "ok", releases: cached } : { status: "miss" };
+    }
+    if (!this.cache.tryAcquireInterval(MB_RATE_BUCKET, 1100)) {
+      return { status: "busy" };
+    }
+    try {
+      const resp = this.env.http.fetch({
+        method: "GET",
+        url: `${MB_BASE}/recording?query=${encodeURIComponent(`isrc:${code}`)}&fmt=json&limit=5`,
+        headers: { "Accept": "application/json", "User-Agent": MB_USER_AGENT },
+        timeoutMs: 3500,
+      });
+      if (resp.status === 503 || resp.status === 429) {
+        this.cache.setCooldown(MB_RATE_BUCKET, 10_000);
+        return { status: "busy" };
+      }
+      if (resp.status < 200 || resp.status >= 300 || !resp.body) {
+        return { status: "miss" };
+      }
+      const data = JSON.parse(resp.body) as {
+        recordings?: Array<{
+          "artist-credit"?: Array<{ name?: string }>;
+          releases?: Array<{
+            title?: string;
+            date?: string;
+            status?: string;
+            "track-count"?: number;
+            "artist-credit"?: Array<{ name?: string }>;
+            "release-group"?: { "primary-type"?: string; "secondary-types"?: string[] };
+          }>;
+        }>;
+      };
+      const out: MBRecordingRelease[] = [];
+      for (const rec of data.recordings || []) {
+        const recArtist = (rec["artist-credit"] || []).map((a) => a.name || "").join(" ").trim();
+        for (const rel of rec.releases || []) {
+          if (!rel.title || (rel.status && rel.status !== "Official")) continue;
+          const rg = rel["release-group"] || {};
+          out.push({
+            title: rel.title,
+            artistName: (rel["artist-credit"] || []).map((a) => a.name || "").join(" ").trim() || recArtist,
+            year: Number(String(rel.date || "").slice(0, 4)) || 0,
+            primaryType: rg["primary-type"] || "Album",
+            secondaryTypes: Array.isArray(rg["secondary-types"]) ? rg["secondary-types"] : [],
+            trackCount: Number(rel["track-count"]) || 0,
+          });
+        }
+      }
+      if (out.length === 0) {
+        this.cache.set(cacheKey, { miss: true }, 7 * DAY_MS);
+        return { status: "miss" };
+      }
+      this.cache.set(cacheKey, out.slice(0, 60), 30 * DAY_MS);
+      return { status: "ok", releases: out.slice(0, 60) };
+    } catch (err) {
+      rethrowHostFault(err);
+      return { status: "miss" };
     }
   }
 
