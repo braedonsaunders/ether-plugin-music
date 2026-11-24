@@ -671,7 +671,8 @@
           },
           "match": {
             "thresholdDefault": 0.72
-          }
+          },
+          "lyrics": true
         }
       ],
       "frontendAdapters": [
