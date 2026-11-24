@@ -631,7 +631,8 @@
                 "artist": "MusicArtist",
                 "album": "MusicAlbum",
                 "track": "Audio",
-                "concert": "Video"
+                "concert": "Video",
+                "playlist": "MusicAlbum"
               }
             }
           },
