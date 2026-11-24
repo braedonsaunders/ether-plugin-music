@@ -166,8 +166,6 @@ export function recordingOf(isrc?: string): string | undefined {
 export const PLAYLIST_PICKS = 10;
 /** At most this many tracks are read from one imported link. */
 const IMPORT_MAX_TRACKS = 500;
-/** The most tracks Spotify's public embed page lists for one playlist. */
-const SPOTIFY_EMBED_CAP = 100;
 /** One /identify call stops starting new lookups after this long (its deadline is 10 s). */
 const IDENTIFY_BUDGET_MS = 6500;
 
@@ -2292,8 +2290,7 @@ export class MusicCatalog {
 
   /**
    * POST /ether/v1/kinds/music/import
-   * A Deezer playlist or album link (keyless API, with ISRCs) or a Spotify playlist or album link
-   * (its public embed page: titles, artists and durations) as a track list. 404 for anything else.
+   * A Deezer playlist or album link (keyless API, with ISRCs) as a track list. 404 for anything else.
    */
   importLink(url: string): { status: number; body?: unknown } {
     const link = String(url || "").trim();
@@ -2302,8 +2299,6 @@ export class MusicCatalog {
       const id = Number(dz[2]);
       return dz[1].toLowerCase() === "playlist" ? this.importDeezerPlaylist(id) : this.importDeezerAlbum(id);
     }
-    const sp = link.match(/^https?:\/\/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album)\/([A-Za-z0-9]{10,40})/i);
-    if (sp) return this.importSpotify(sp[1].toLowerCase(), sp[2]);
     return { status: 404 };
   }
 
@@ -2327,41 +2322,6 @@ export class MusicCatalog {
     if (!album) return { status: 404 };
     const tracks = this.dz.getAlbumTracks(id, 200, 4000).map((t) => importTrackOf({ ...t, album: { id, title: album.title } as DeezerTrack["album"] }));
     return { status: 200, body: { name: album.title, tracks } };
-  }
-
-  private importSpotify(type: string, id: string): { status: number; body?: unknown } {
-    let html = "";
-    try {
-      const resp = this.env.http.fetch({ method: "GET", url: `https://open.spotify.com/embed/${type}/${id}`, headers: { "User-Agent": "Mozilla/5.0 (compatible; Ether)", "Accept": "text/html" }, timeoutMs: 6000 });
-      if (resp.status !== 200 || !resp.body) return { status: 404 };
-      html = resp.body;
-    } catch (err) {
-      rethrowHostFault(err);
-      return { status: 404 };
-    }
-    const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-    if (!m) return { status: 404 };
-    let data: any;
-    try {
-      data = JSON.parse(m[1]);
-    } catch {
-      return { status: 404 };
-    }
-    const entity = data?.props?.pageProps?.state?.data?.entity || {};
-    const list: any[] = Array.isArray(entity.trackList) ? entity.trackList : [];
-    const tracks: ImportTrack[] = list
-      .filter((t) => t && t.title)
-      .slice(0, IMPORT_MAX_TRACKS)
-      .map((t) => ({
-        title: String(t.title),
-        artist: String(t.subtitle || "").split(/,\s*/)[0] || "",
-        durationSec: Number(t.duration) > 0 ? Math.round(Number(t.duration) / 1000) : undefined,
-      }));
-    if (tracks.length === 0) return { status: 404 };
-    // The embed shares at most about 100 tracks and never says how many the playlist has: a list
-    // that reaches that many is reported as truncated, with the total unknown.
-    const truncated = list.length >= SPOTIFY_EMBED_CAP || undefined;
-    return { status: 200, body: { name: String(entity.name || entity.title || "Imported playlist"), tracks, truncated } };
   }
 
   /**
