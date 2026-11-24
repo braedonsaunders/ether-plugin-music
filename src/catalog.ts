@@ -1820,11 +1820,10 @@ export class MusicCatalog {
       dzArtist = this.dz.getArtist(deezerArtistId, 450);
     }
 
-    const artistName =
-      dzArtist?.name ||
-      seedEntry?.name ||
-      page.data.find((a) => a.artist?.name)?.artist?.name ||
-      `Artist ${deezerArtistId}`;
+    // Only a real name refreshes the stored artist: a placeholder would overwrite the name a
+    // playlist, search or chart already stored when Deezer's artist lookup misses its budget.
+    const knownName = dzArtist?.name || seedEntry?.name || page.data.find((a) => a.artist?.name)?.artist?.name || "";
+    const artistName = knownName || `Artist ${deezerArtistId}`;
 
     // Infer canonical genres from seed + discography genre_ids.
     const inferredGenres: string[] = [...(seedEntry?.genres || [])];
@@ -1875,7 +1874,7 @@ export class MusicCatalog {
             latestYear: latestYear || seedEntry.latestYear,
           })
         );
-      } else if (dzArtist || artistName) {
+      } else if (knownName) {
         add(
           this.buildArtistItem({
             deezerId: deezerArtistId,

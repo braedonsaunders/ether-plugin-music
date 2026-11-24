@@ -1097,3 +1097,15 @@ test("changes brings in chart playlists once per bucket, even mid-bucket after a
   const again = handle({ method: "POST", path: "/ether/v1/kinds/music/changes", body: { since: bucket } });
   assert.ok(!(again.body as { upserts: KindItem[] }).upserts.some((i) => i.level === "playlist"));
 });
+
+test("an artist expand never stores a placeholder name when Deezer's artist lookup fails", () => {
+  const { env } = makeMockCatalogHost();
+  const fetch = env.http.fetch;
+  const failing: HostEnv = { ...env, http: { ...env.http, fetch: (req) => (/\/artist\/\d+(\?|$)/.test(req.url) ? { status: 500, body: "" } : fetch(req)) } };
+  const handle = createHandler(failing);
+  const res = handle({ method: "POST", path: "/ether/v1/kinds/music/expand", body: { parentId: "ar-27", level: "artist", cursor: "" } });
+  assert.equal(res.status, 200);
+  const items = (res.body as { items: KindItem[] }).items;
+  assert.ok(items.length > 0);
+  assert.ok(!items.some((i) => /^Artist \d+$/.test(i.title)));
+});
