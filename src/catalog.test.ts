@@ -1188,3 +1188,12 @@ test("identify matches by ISRC, then by artist and title; equal releases come ba
   const at = (id: string) => body.items.findIndex((i) => i.id === id);
   assert.ok(at("ar-27") >= 0 && at("ar-27") < at("al-302127") && at("al-302127") < at("tr-3135556"));
 });
+
+test("an artist whose discography Deezer did not answer is not expanded as complete", () => {
+  const { env } = makeMockCatalogHost();
+  const fetch = env.http.fetch;
+  const failing: HostEnv = { ...env, http: { ...env.http, fetch: (req) => (/\/artist\/27\/albums/.test(req.url) ? { status: 503, body: "" } : fetch(req)) } };
+  const handle = createHandler(failing);
+  const res = handle({ method: "POST", path: "/ether/v1/kinds/music/expand", body: { parentId: "ar-27", level: "artist", cursor: "" } });
+  assert.equal(res.status, 503);
+});

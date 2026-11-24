@@ -1842,7 +1842,12 @@ export class MusicCatalog {
     const offset = Math.max(0, Number(cursor || 0) || 0);
     if (offset >= 400) return { items: [], cursor: "" };
 
-    const page = this.dz.getArtistAlbumsPage(deezerArtistId, offset, 100, offset === 0 ? 1150 : 4000);
+    const page = this.dz.getArtistAlbumsPage(deezerArtistId, offset, 100, offset === 0 ? 3500 : 4000);
+    if (page.failed) {
+      // A discography Deezer did not answer must not be stored as complete: Ether records the
+      // expansion as failed and tries again after its cooldown instead of keeping a partial list.
+      throw new Error(`artist ${deezerArtistId} discography unavailable`);
+    }
     const seed = this.cache.get<CuratedSeedPlan>("curated:seed:v2");
     const seedEntry = seed?.artists.find((a) => a.deezerId === deezerArtistId);
 

@@ -186,7 +186,15 @@ export function createHandler(env?: HostEnv, subsonicHost?: () => import("./subs
           level: body.level ? String(body.level) : undefined,
           cursor: body.cursor ? String(body.cursor) : undefined,
         };
-        return { status: 200, body: catalog.expand(expandReq) };
+        try {
+          return { status: 200, body: catalog.expand(expandReq) };
+        } catch (err) {
+          if (err instanceof Error && /discography unavailable/.test(err.message)) {
+            // Not a complete answer: Ether keeps the expansion failed and tries again later.
+            return { status: 503, body: { error: { code: "upstream_unavailable", message: err.message } } };
+          }
+          throw err;
+        }
       }
 
       // 5. Direct item lookup

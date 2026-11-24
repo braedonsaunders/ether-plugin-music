@@ -285,7 +285,7 @@ export class DeezerClient {
     index = 0,
     limit = 100,
     timeoutMs = 1150
-  ): { data: DeezerAlbumSummary[]; total: number; hasNext: boolean } {
+  ): { data: DeezerAlbumSummary[]; total: number; hasNext: boolean; failed: boolean } {
     const safeIdx = Math.max(0, Math.floor(index));
     const safeLim = Math.max(1, Math.min(100, Math.floor(limit)));
     const path = safeIdx > 0
@@ -310,7 +310,8 @@ export class DeezerClient {
     const data = Array.isArray(res?.data) ? res!.data : [];
     const total = typeof res?.total === "number" ? res.total : safeIdx + data.length;
     const hasNext = Boolean(res?.next) || (data.length >= safeLim && safeIdx + data.length < total);
-    return { data, total, hasNext };
+    // No answer at all (timeout, rate limit, upstream error) is not "no albums".
+    return { data, total, hasNext, failed: res == null };
   }
 
   getArtistTopTracks(artistId: number, limit = 10): DeezerTrack[] {
