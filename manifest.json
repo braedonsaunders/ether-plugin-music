@@ -60,6 +60,12 @@
           "type": "string",
           "title": "Concert video quality preference",
           "description": "Preferred video resolution when ranking concert film releases.",
+          "kind": "select",
+          "options": [
+            { "value": "uhd_preferred", "label": "Prefer 4K" },
+            { "value": "1080p_preferred", "label": "Prefer 1080p" },
+            { "value": "balanced", "label": "Balanced (smaller files)" }
+          ],
           "enum": [
             "uhd_preferred",
             "1080p_preferred",
@@ -77,6 +83,12 @@
           "type": "string",
           "title": "Curated discovery size",
           "description": "How many curated artists and their key albums to seed for Home, Charts and Genres. Live search always queries the full catalogue.",
+          "kind": "select",
+          "options": [
+            { "value": "compact", "label": "Compact" },
+            { "value": "standard", "label": "Standard" },
+            { "value": "large", "label": "Large" }
+          ],
           "enum": [
             "compact",
             "standard",
