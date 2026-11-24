@@ -2372,28 +2372,21 @@ export class MusicCatalog {
   /**
    * Deezer tracks matching an imported track's artist and title (duration within 3 s when known),
    * best first. One when a single release clearly fits; several when distinct releases fit equally.
+   * Deezer's fielded search misses some plain titles ("Yellow" by Coldplay), so a plain query
+   * follows when it finds nothing.
    */
   private findTrackByTitle(t: ImportTrack): DeezerTrack[] {
-    const title = stripFeaturing(String(t.title || "")).trim();
+    const title = baseTitle(stripFeaturing(String(t.title || "")).trim());
     if (!title) return [];
     const artist = String(t.artist || "").trim();
-    const q = artist ? `artist:"${artist.replace(/"/g, "")}" track:"${title.replace(/"/g, "")}"` : title;
-    const scored = this.dz.searchTracks(q, 15, 2500)
-      .map((tr) => {
-        const tSim = textSimilarity(title, stripFeaturing(tr.title_short || tr.title || ""));
-        const aSim = artist ? textSimilarity(artist, tr.artist?.name || "") : 1;
-        const durOk = !t.durationSec || !tr.duration || Math.abs(tr.duration - t.durationSec) <= 3;
-        return { tr, score: tSim * 0.6 + aSim * 0.4, ok: tSim >= 0.85 && aSim >= 0.75 && durOk };
-      })
-      .filter((x) => x.ok)
-      .sort((a, b) => b.score - a.score);
-    if (scored.length === 0) return [];
-    const best = scored[0].score;
-    const tied = scored.filter((x) => best - x.score < 0.02);
-    // The same recording on several albums: one when they share an ISRC (it is one song), else candidates.
-    const isrcs = new Set(tied.map((x) => x.tr.isrc || `id:${x.tr.id}`));
-    if (tied.length === 1 || isrcs.size === 1) return [tied[0].tr];
-    return tied.slice(0, 8).map((x) => x.tr);
+    const queries = artist
+      ? [`artist:"${artist.replace(/"/g, "")}" track:"${title.replace(/"/g, "")}"`, `${artist} ${title}`]
+      : [title];
+    for (const q of queries) {
+      const picked = pickImportTrack(t, title, artist, this.dz.searchTracks(q, 15, 2500));
+      if (picked.length) return picked;
+    }
+    return [];
   }
 
   /**
@@ -2502,4 +2495,72 @@ export class MusicCatalog {
 
     return null;
   }
+}
+
+/** A version tag naming another recording than the studio original. */
+const OTHER_TAKE = /\b(live|demo|sessions?|rough|outtakes?|remix|mix|edit|instrumental|acoustic|karaoke|commentary|rehearsal|unplugged|a ?cappella|sped up|slowed)\b/i;
+/** Album titles of compilations, which reissue songs from their original albums. */
+const COMPILATION = /\b(greatest hits|best of|the best|hits|collection|essentials?|anthology|gold|singles|definitive)\b/i;
+/** Edition suffixes on an album title: "Rumours (Super Deluxe)" is Rumours. */
+const EDITION = /\s*[([][^)\]]*(deluxe|edition|remaster|anniversary|expanded|bonus|version)[^)\]]*[)\]]\s*$/i;
+
+/** A trailing version tag on a source title: "Landslide (Live)", "Dreams - 2004 Remaster". */
+const SOURCE_VERSION = /\s*(?:[([]([^)\]]*)[)\]]|\s-\s(.*))$/;
+
+/** The song title without trailing version tags; the tags still choose the take. */
+export function baseTitle(title: string): string {
+  let out = title.trim();
+  for (let m = SOURCE_VERSION.exec(out); m; m = SOURCE_VERSION.exec(out)) {
+    const tag = m[1] ?? m[2] ?? "";
+    if (!OTHER_TAKE.test(tag) && !/remaster|version|edition|mono|stereo/i.test(tag)) break;
+    const next = out.slice(0, m.index).trim();
+    if (!next) break;
+    out = next;
+  }
+  return out;
+}
+
+function versionOf(tr: DeezerTrack): string {
+  if (tr.title_version) return tr.title_version;
+  const short = tr.title_short || "";
+  return short && tr.title.startsWith(short) ? tr.title.slice(short.length) : "";
+}
+
+/**
+ * The Deezer releases fitting an imported track, best first: one when it clearly fits, several
+ * when distinct releases fit equally. The source's album picks among versions (an exact album beats
+ * a deluxe edition of it); a live take, demo, remix or edit loses unless the source names one;
+ * compilations give way to original albums; then the release most listeners play, when it leads.
+ */
+export function pickImportTrack(t: ImportTrack, title: string, artist: string, results: DeezerTrack[]): DeezerTrack[] {
+  const album = String(t.album || "").trim();
+  const full = stripFeaturing(String(t.title || "")).trim();
+  const sourceTake = OTHER_TAKE.exec(full.slice(baseTitle(full).length))?.[1]?.toLowerCase();
+  const scored = results
+    .map((tr) => {
+      const tSim = textSimilarity(title, stripFeaturing(tr.title_short || tr.title || ""));
+      const aSim = artist ? textSimilarity(artist, tr.artist?.name || "") : 1;
+      const durOk = !t.durationSec || !tr.duration || Math.abs(tr.duration - t.durationSec) <= 3;
+      let score = tSim * 0.6 + aSim * 0.4;
+      const albumTitle = tr.album?.title || "";
+      if (album && albumTitle) {
+        if (normalizeText(album) === normalizeText(albumTitle)) score += 0.3;
+        else if (textSimilarity(album.replace(EDITION, ""), albumTitle.replace(EDITION, "")) >= 0.9) score += 0.25;
+      }
+      const take = OTHER_TAKE.exec(versionOf(tr))?.[1]?.toLowerCase();
+      if (take && take !== sourceTake) score -= 0.3;
+      if (COMPILATION.test(albumTitle) && !(album && COMPILATION.test(album))) score -= 0.05;
+      return { tr, score, ok: tSim >= 0.85 && aSim >= 0.75 && durOk };
+    })
+    .filter((x) => x.ok)
+    .sort((a, b) => b.score - a.score || (b.tr.rank || 0) - (a.tr.rank || 0));
+  if (scored.length === 0) return [];
+  const best = scored[0].score;
+  const tied = scored.filter((x) => best - x.score < 0.02);
+  // The same recording on several albums: one when they share an ISRC (it is one song).
+  const isrcs = new Set(tied.map((x) => x.tr.isrc || `id:${x.tr.id}`));
+  if (tied.length === 1 || isrcs.size === 1) return [tied[0].tr];
+  const lead = tied[0].tr.rank || 0;
+  if (lead > 0 && lead >= (tied[1].tr.rank || 0) * 1.2) return [tied[0].tr];
+  return tied.slice(0, 8).map((x) => x.tr);
 }

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import type { HostEnv, HttpFetchRequest, HttpFetchResponse, KindItem } from "./types.ts";
 import { createHandler } from "./index.ts";
 import {
+  baseTitle,
   BACKFILL_QUEUE_KEY,
   BACKFILL_TRIED_KEY,
   MAX_BACKFILL_QUEUE,
@@ -1177,6 +1178,54 @@ test("identify matches by ISRC, then by artist and title; equal releases come ba
   // Every matched track arrives with its album and artist, parents first.
   const at = (id: string) => body.items.findIndex((i) => i.id === id);
   assert.ok(at("ar-27") >= 0 && at("ar-27") < at("al-302127") && at("al-302127") < at("tr-3135556"));
+});
+
+test("identify picks the release a playlist means: its album, the studio take, the one people play", () => {
+  const fm = { id: 158, name: "Fleetwood Mac" };
+  const cp = { id: 892, name: "Coldplay" };
+  const tr = (id: number, title: string, version: string, albumId: number, albumTitle: string, rank: number, isrc: string, artist = fm) =>
+    ({ id, title: title + version, title_short: title, title_version: version, isrc, duration: 257, rank, artist, album: { id: albumId, title: albumTitle, cover_xl: "https://cdn.test/c.jpg" } });
+  const dreams = [
+    tr(1, "Dreams", " (2004 Remaster)", 11, "Rumours", 907653, "USWB10400049"),
+    tr(2, "Dreams", "", 12, "Greatest Hits", 734774, "USWB18800001"),
+    tr(3, "Dreams", " (2004 Remaster)", 13, "Rumours (Super Deluxe)", 656216, "USWB11300001"),
+    tr(4, "Dreams", " (Sessions, Roughs & Outtakes)", 13, "Rumours (Super Deluxe)", 474333, "USWB11300002"),
+    tr(5, "Dreams", " (Live at Warner Brothers Studios in Burbank, CA 5/23/97)", 14, "The Dance", 309963, "USWB19700001"),
+  ];
+  const landslide = [
+    tr(21, "Landslide", " (Live at Warner Brothers Studios in Burbank, CA 5/23/97)", 14, "The Dance", 950000, "USWB19700002"),
+    tr(22, "Landslide", "", 15, "Fleetwood Mac", 700000, "USWB17500001"),
+  ];
+  const handle = createHandler(importHost({
+    "track%3A%22Dreams%22": { data: dreams },
+    "track%3A%22Landslide%22": { data: landslide },
+    "track%3A%22Yellow%22": { data: [] },
+    "Coldplay%20Yellow": { data: [
+      tr(31, "Yellow", "", 41, "Parachutes", 971942, "GBAYE0000351", cp),
+      tr(32, "Yellow", " (Live)", 42, "Live 2012", 478612, "GBAYE1200001", cp),
+    ] },
+  }));
+  const res = handle({ method: "POST", path: "/ether/v1/kinds/music/identify", body: { tracks: [
+    { title: "Dreams", artist: "Fleetwood Mac", album: "Rumours" },
+    { title: "Dreams", artist: "Fleetwood Mac" },
+    { title: "Yellow", artist: "Coldplay", album: "Parachutes" },
+    { title: "Landslide", artist: "Fleetwood Mac" },
+    { title: "Landslide (Live)", artist: "Fleetwood Mac" },
+  ] } });
+  const m = (res.body as { matches: Array<{ index: number; id?: string; candidates?: string[] }> }).matches;
+  assert.equal(m[0].id, "tr-1", "the album the source names, not its deluxe edition");
+  assert.equal(m[1].id, "tr-1", "no album: the original album, ahead of a compilation and live takes");
+  assert.equal(m[2].id, "tr-31", "a title Deezer's fielded search misses is found by a plain search");
+  assert.equal(m[3].id, "tr-22", "the studio take, though the live one is played more");
+  assert.equal(m[4].id, "tr-21", "a source that asks for the live take gets it");
+});
+
+test("a version tag is not part of the song title", () => {
+  assert.equal(baseTitle("Landslide (Live)"), "Landslide");
+  assert.equal(baseTitle("Dreams - 2004 Remaster"), "Dreams");
+  assert.equal(baseTitle("Live Forever"), "Live Forever");
+  assert.equal(baseTitle("Song 2 (Mono Version) [Live]"), "Song 2");
+  assert.equal(baseTitle("(I Can't Get No) Satisfaction"), "(I Can't Get No) Satisfaction");
 });
 
 test("an artist whose discography Deezer did not answer is not expanded as complete", () => {

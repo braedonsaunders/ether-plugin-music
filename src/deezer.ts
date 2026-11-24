@@ -110,6 +110,8 @@ export interface DeezerTrack {
   id: number;
   title: string;
   title_short?: string;
+  /** The version tag, such as " (Live)" or " (2004 Remaster)". */
+  title_version?: string;
   duration: number;
   rank?: number;
   track_position?: number;
