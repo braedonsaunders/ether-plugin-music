@@ -1143,12 +1143,15 @@ const dzTrack = (id: number, title: string, isrc: string, albumId: number, album
 test("import reads Deezer and Spotify playlist links; other links are not ours", () => {
   const handle = createHandler(importHost({
     "/playlist/908622995/tracks": { data: [dzTrack(3135556, "One More Time", "GBDUW0000053", 302127, "Discovery")], total: 1 },
-    "/playlist/908622995": { id: 908622995, title: "Road Trip", description: "Driving", tracks: { data: [] } },
+    "/playlist/908622995": { id: 908622995, title: "Road Trip", description: "Driving", nb_tracks: 3, tracks: { data: [] } },
+    "open.spotify.com/embed/album/4m2880jivSbbyEGAKfITCa": `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify({ props: { pageProps: { state: { data: { entity: { name: "Long", trackList: Array.from({ length: 100 }, (_, i) => ({ title: `Song ${i}`, subtitle: "Someone", duration: 200000 })) } } } } } })}</script></html>`,
     "open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGoYBM5M": `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify({ props: { pageProps: { state: { data: { entity: { name: "Today's Top Hits", trackList: [{ title: "Teardrop", subtitle: "Massive Attack, Elizabeth Fraser", duration: 330000 }] } } } } } })}</script></html>`,
   }));
   const dz = handle({ method: "POST", path: "/ether/v1/kinds/music/import", body: { url: "https://www.deezer.com/en/playlist/908622995" } });
-  const dzBody = dz.body as { name: string; tracks: Array<{ title: string; isrc?: string }> };
+  const dzBody = dz.body as { name: string; tracks: Array<{ title: string; isrc?: string }>; total?: number; truncated?: boolean };
   assert.equal(dz.status, 200);
+  assert.equal(dzBody.total, 3);
+  assert.equal(dzBody.truncated, true, "fewer tracks than the playlist has is reported");
   assert.equal(dzBody.name, "Road Trip");
   assert.equal(dzBody.tracks[0].isrc, "GBDUW0000053");
   const sp = handle({ method: "POST", path: "/ether/v1/kinds/music/import", body: { url: "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M?si=x" } });
@@ -1156,6 +1159,10 @@ test("import reads Deezer and Spotify playlist links; other links are not ours",
   assert.equal(sp.status, 200);
   assert.equal(spBody.name, "Today's Top Hits");
   assert.deepEqual(spBody.tracks[0], { title: "Teardrop", artist: "Massive Attack", durationSec: 330 });
+  assert.equal((sp.body as { truncated?: boolean }).truncated, undefined);
+  const long = handle({ method: "POST", path: "/ether/v1/kinds/music/import", body: { url: "https://open.spotify.com/album/4m2880jivSbbyEGAKfITCa" } });
+  assert.equal((long.body as { truncated?: boolean; total?: number }).truncated, true, "a list at the embed's cap may be cut short");
+  assert.equal((long.body as { total?: number }).total, undefined);
   assert.equal(handle({ method: "POST", path: "/ether/v1/kinds/music/import", body: { url: "https://example.com/playlist/1" } }).status, 404);
 });
 

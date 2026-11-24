@@ -166,6 +166,8 @@ export function recordingOf(isrc?: string): string | undefined {
 export const PLAYLIST_PICKS = 10;
 /** At most this many tracks are read from one imported link. */
 const IMPORT_MAX_TRACKS = 500;
+/** The most tracks Spotify's public embed page lists for one playlist. */
+const SPOTIFY_EMBED_CAP = 100;
 /** One /identify call stops starting new lookups after this long (its deadline is 10 s). */
 const IDENTIFY_BUDGET_MS = 6500;
 
@@ -2310,7 +2312,9 @@ export class MusicCatalog {
       for (const t of page.tracks) tracks.push(importTrackOf(t));
       if (page.tracks.length < 100 || index + 100 >= page.total) break;
     }
-    return { status: 200, body: { name: pl.title, description: pl.description || undefined, tracks: tracks.slice(0, IMPORT_MAX_TRACKS) } };
+    const kept = tracks.slice(0, IMPORT_MAX_TRACKS);
+    const total = Number(pl.nb_tracks) || 0;
+    return { status: 200, body: { name: pl.title, description: pl.description || undefined, tracks: kept, total: total || undefined, truncated: total > kept.length || undefined } };
   }
 
   private importDeezerAlbum(id: number): { status: number; body?: unknown } {
@@ -2349,7 +2353,10 @@ export class MusicCatalog {
         durationSec: Number(t.duration) > 0 ? Math.round(Number(t.duration) / 1000) : undefined,
       }));
     if (tracks.length === 0) return { status: 404 };
-    return { status: 200, body: { name: String(entity.name || entity.title || "Imported playlist"), tracks } };
+    // The embed shares at most about 100 tracks and never says how many the playlist has: a list
+    // that reaches that many is reported as truncated, with the total unknown.
+    const truncated = list.length >= SPOTIFY_EMBED_CAP || undefined;
+    return { status: 200, body: { name: String(entity.name || entity.title || "Imported playlist"), tracks, truncated } };
   }
 
   /**
