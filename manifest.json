@@ -39,16 +39,28 @@
     "settings": {
       "type": "object",
       "properties": {
-        "qualityPreference": {
-          "type": "string",
-          "title": "Audio quality preference",
-          "description": "Preferred format when ranking album releases.",
-          "enum": [
-            "flac_preferred",
-            "lossless_only",
-            "high_bitrate"
+        "sourceOrder": {
+          "kind": "orderedList",
+          "title": "Where to look first",
+          "description": "Ether tries the first source and falls back down the list when it has no copy.",
+          "options": [
+            { "value": "debrid", "label": "Debrid", "description": "Cached torrents on your Debrid service" },
+            { "value": "usenet", "label": "Usenet", "description": "Your Usenet indexers and providers" }
           ],
-          "default": "flac_preferred"
+          "default": ["debrid", "usenet"]
+        },
+        "qualityLadder": {
+          "kind": "orderedList",
+          "title": "Audio quality, best first",
+          "description": "Albums play in the best quality on this list; take a quality off to never use it.",
+          "options": [
+            { "value": "flac24", "label": "Hi-Res FLAC", "description": "24-bit lossless" },
+            { "value": "flac", "label": "FLAC", "description": "CD-quality lossless" },
+            { "value": "lossless", "label": "Other lossless", "description": "ALAC, WAV and similar" },
+            { "value": "lossy_high", "label": "High-bitrate lossy", "description": "MP3 at 320 kbps or AAC at 256 kbps" },
+            { "value": "lossy", "label": "Other lossy", "description": "MP3 or AAC at lower bitrates" }
+          ],
+          "default": ["flac24", "flac", "lossless", "lossy_high", "lossy"]
         },
         "newznabCategories": {
           "type": "string",
