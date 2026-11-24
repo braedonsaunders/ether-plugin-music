@@ -1,7 +1,7 @@
 {
   "id": "ether.music",
   "name": "Music",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Curated music discovery, live catalogue search across artists, albums, tracks and video concerts, playback through your Ether indexers and debrid sources, and a Subsonic / OpenSubsonic server for Symfonium, Feishin, Amperfy, Substreamer and other Subsonic apps.",
   "ether": {
     "protocol": 1,
@@ -705,6 +705,7 @@
           "protocolHint": "subsonic",
           "pathPrefix": "/subsonic",
           "auth": "query_credentials",
+          "icon": "assets/subsonic.svg",
           "libraries": [
             "music"
           ],

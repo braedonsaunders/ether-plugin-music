@@ -1,0 +1,16 @@
+Music (ether.music)
+Copyright (c) Braedon Saunders. Licensed under the terms in LICENSE.
+
+This package includes third-party material:
+
+assets/subsonic.svg
+  The OpenSubsonic logo, from the OpenSubsonic project website
+  (https://github.com/opensubsonic/opensubsonic.github.io,
+  assets/icons/logo.svg, commit 210552e41fdc3b057ef4a1c5ab61a01e6d8fc5f2).
+  Licensed under the Apache License, Version 2.0
+  (https://www.apache.org/licenses/LICENSE-2.0).
+  Modified: the path was redrawn in white with its transforms applied,
+  centred on a rounded blue tile.
+  It is used only to identify the Subsonic/OpenSubsonic protocol this
+  plugin serves; it does not imply endorsement by the OpenSubsonic
+  project.
