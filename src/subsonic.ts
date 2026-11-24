@@ -534,9 +534,44 @@ export class SubsonicAdapter {
     };
     this.viewer = h("x-ether-viewer");
     this.viewerName = h("x-ether-viewer-name");
+    this.timed();
   }
 
   handle(method: string, subPath: string, query: Record<string, string | string[]> | undefined): EtherResponse {
+    const started = this.env.now();
+    const res = this.handleInner(method, subPath, query);
+    const took = this.env.now() - started;
+    if (took > 1500) {
+      const calls = this.timings
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6)
+        .map(([n, ms]) => `${n}=${ms}ms`)
+        .join(" ");
+      this.env.log("info", `subsonic slow ${methodOf(subPath)} ${took}ms host: ${calls}`);
+    }
+    return res;
+  }
+
+  private timings: Array<[string, number]> = [];
+
+  private timed(): void {
+    const host = this.host as unknown as Record<string, (...a: unknown[]) => unknown>;
+    const wrapped: Record<string, (...a: unknown[]) => unknown> = {};
+    for (const name of Object.keys(host)) {
+      const fn = host[name];
+      wrapped[name] = (...args: unknown[]) => {
+        const t0 = this.env.now();
+        try {
+          return fn(...args);
+        } finally {
+          this.timings.push([name, this.env.now() - t0]);
+        }
+      };
+    }
+    this.host = wrapped as unknown as SubsonicHost;
+  }
+
+  private handleInner(method: string, subPath: string, query: Record<string, string | string[]> | undefined): EtherResponse {
     const p = new Params(query);
     const out = outputOf(p);
     if (subPath.startsWith(UNAUTHENTICATED + "/") || subPath === UNAUTHENTICATED) {
@@ -746,7 +781,11 @@ export class SubsonicAdapter {
       if (!page.nextCursor || !(page.items || []).length) break;
       cursor = page.nextCursor;
     }
-    const states = this.states(artists);
+    // Starred flags come from the viewer's liked artists (one bounded call),
+    // not a per-artist state lookup over the whole index.
+    const liked = new Set(this.host.favorites("artist", 1000).map((f) => f.id));
+    const states = new Map<string, ItemState>();
+    for (const a of artists) if (liked.has(a.id)) states.set(a.id, { id: a.id, playCount: 0, favorite: true });
     const groups = new Map<string, Record<string, unknown>[]>();
     const sorted = artists.slice().sort((a, b) => sortKey(a.title).localeCompare(sortKey(b.title)));
     for (const a of sorted) {
