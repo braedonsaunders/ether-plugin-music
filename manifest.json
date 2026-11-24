@@ -33,8 +33,7 @@
         "coverartarchive.org",
         "*.archive.org",
         "lrclib.net",
-        "v3.sg.media-imdb.com",
-        "open.spotify.com"
+        "v3.sg.media-imdb.com"
       ]
     },
     "settings": {
@@ -694,7 +693,7 @@
             "continuation": true
           },
           "import": {
-            "links": ["deezer", "spotify"],
+            "links": ["deezer"],
             "identify": true
           }
         }
