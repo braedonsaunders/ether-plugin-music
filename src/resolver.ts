@@ -27,10 +27,13 @@ import type { MBRecordingRelease } from "./musicbrainz.ts";
 import { getCuratedConcertById, type CuratedConcert } from "./concerts.ts";
 import {
   audioFormatOfPath,
+  coreReleaseTitle,
+  indexerQueryText,
   isArchivePath,
   isConcertExtraOrSamplePath,
   isRejectedConcertVideoRelease,
   isRejectedReleaseForRequest,
+  joinedArtistSpelling,
   normalizeText,
   parseTrackFilename,
   stripEditionSuffix,
@@ -56,12 +59,12 @@ const RESOLVE_STEP_BUDGET_MS = 1400;
  */
 const USENET_CHECK_START_CUTOFF_MS = 1800;
 const MAX_CACHED_RELEASES = 3;
-const MAX_FILE_LIST_PROBES = 8;
-const MAX_USENET_PROBES = 5;
+const MAX_FILE_LIST_PROBES = 12;
+const MAX_USENET_PROBES = 10;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v6:${albumId}`;
+  return `alb_rel_v7:${albumId}`;
 }
 
 function recordingPlanKey(isrc: string): string {
@@ -361,6 +364,87 @@ export function classifyReleaseQuality(
 /**
  * Score how well an indexer candidate title matches the canonical album BEFORE fetching file lists.
  */
+/** Words in a release name that describe the release, not its title. */
+const RELEASE_DESCRIPTION_WORDS = new Set(
+  (
+    "flac mp3 wav alac aac ogg opus ape wma dsd sacd mqa web cd cds cdm cdr vinyl lp rip remaster remastered " +
+    "deluxe edition expanded anniversary special limited reissue lossless album self titled the and " +
+    "retail proper repack real read nfo scene digital stereo mono hdtracks qobuz tidal bit khz kbps " +
+    "vbr cbr disc discs box set bonus tracks track japan japanese usa germany europe import version"
+  ).split(" ")
+);
+
+/**
+ * A self-titled album ("Metallica" by Metallica) matches every release of the artist by name
+ * alone. Tells apart the ones that name another title: the album's name appears once only, and
+ * the rest of the release name carries title words (or one such word without the album's year).
+ */
+export function isOtherTitleForSelfTitledAlbum(
+  relTitle: string,
+  _normRel: string,
+  normArtist: string,
+  normAlbum: string,
+  albumYear: number
+): boolean {
+  if (!normAlbum || normAlbum !== normArtist) return false;
+  // A post named after a file ('[2/6] "Folder/Artist - Title.flac"') repeats the artist in its
+  // path: judge the first part of the path that names the artist.
+  const segments = relTitle
+    .trim()
+    .replace(/^\[\d+\/\d+\]\s*/, "")
+    .replace(/^["']/, "")
+    .split("/");
+  const folder = segments.find((seg) => normalizeText(seg).includes(normArtist)) ?? relTitle;
+  // A scene name ends in "-GROUP": the group is not a title word.
+  const named = /^[^\s]+-[^\s]+-[^\s]+$/.test(folder) ? folder.replace(/-[A-Za-z0-9]{2,14}$/, "") : folder;
+  const own = new Set(normArtist.split(/\s+/));
+  const isTitleWord = (w: string) => /^[a-z]{3,}$/.test(w) && !own.has(w) && !RELEASE_DESCRIPTION_WORDS.has(w);
+  const norm = normalizeText(named);
+  const parts = norm.split(normAlbum);
+  if (parts.length - 1 >= 2) {
+    // "Artist - Artist" and "Artist - 1991 - Artist" name the album; "Artist - Mandatory Artist" does not.
+    const between = parts[1].split(/\s+/).filter(Boolean);
+    if (!between.some(isTitleWord)) return false;
+  }
+  const extra = norm.split(/\s+/).filter(isTitleWord);
+  if (extra.length >= 2) return true;
+  const years = Array.from(named.matchAll(/\b(19\d{2}|20\d{2})\b/g)).map((m) => Number(m[1]));
+  const yearNamed = albumYear > 0 && years.includes(albumYear);
+  // One other word beside the album's year is a label or a pressing, unless the release is a single.
+  if (extra.length === 1) return !yearNamed || /\b(?:cds|cdm|cd\s*single|single|maxi)\b/i.test(named);
+  // No other title word: still another release when it is dated to another year and is not a remaster.
+  return years.length > 0 && albumYear > 0 && !yearNamed && !/remaster|reissue|anniversary/i.test(named);
+}
+
+/**
+ * Whether the audio members listed inside a release's archives show it is not this album, so a
+ * track picked from it by name would be the wrong file or ambiguous: a title the album has once
+ * is there more than once (a single packed as WAV and MP3), or most members name no album track.
+ */
+export function archiveMembersContradictAlbum(
+  album: { tracks: Array<{ title: string }> },
+  members: Array<{ path: string }>
+): boolean {
+  if (members.length === 0) return false;
+  const want = new Map<string, number>();
+  for (const tr of album.tracks) {
+    const k = normalizeText(coreReleaseTitle(tr.title));
+    if (k) want.set(k, (want.get(k) || 0) + 1);
+  }
+  const have = new Map<string, number>();
+  let named = 0;
+  for (const m of members) {
+    const k = normalizeText(coreReleaseTitle(parseTrackFilename(m.path).titleGuess));
+    if (!k || !want.has(k)) continue;
+    named++;
+    have.set(k, (have.get(k) || 0) + 1);
+  }
+  for (const [k, n] of have) {
+    if (n > (want.get(k) || 0)) return true;
+  }
+  return members.length >= 3 && named * 2 < members.length;
+}
+
 export function preScoreAlbumCandidate(
   candidate: SourceCandidate,
   album: {
@@ -388,10 +472,14 @@ export function preScoreAlbumCandidate(
 
   const normRel = normalizeText(relTitle);
   const normArtist = normalizeText(album.artistName);
-  const cleanAlbum = stripEditionSuffix(album.title);
+  const cleanAlbum = coreReleaseTitle(album.title);
   const normAlbum = normalizeText(cleanAlbum);
 
   const reasons: string[] = [];
+
+  if (isOtherTitleForSelfTitledAlbum(relTitle, normRel, normArtist, normAlbum, album.year)) {
+    return { accepted: false, score: 0.2, reasons: ["self-titled album: release names another title"] };
+  }
 
   // Artist match check (all significant artist tokens or strong similarity)
   const artistTokens = normArtist.split(/\s+/).filter((t) => t.length >= 2 && t !== "the");
@@ -1726,12 +1814,19 @@ export class AlbumResolver {
     deferredInFlight: boolean;
     incomplete?: boolean;
   } {
-    const cleanArtist = album.artistName.trim();
-    const cleanAlbum = stripEditionSuffix(album.title).trim();
+    // Indexers match words: punctuation and accents in a name ("AC/DC", "Beyoncé") and tags a
+    // release name never carries ("(feat. ...)", "[From ...]") make a query match little or nothing.
+    const cleanArtist = indexerQueryText(album.artistName) || album.artistName.trim();
+    const cleanAlbum = indexerQueryText(coreReleaseTitle(album.title)) || stripEditionSuffix(album.title).trim();
     // Primary query without year captures both "(2001)" and undated album packs in ONE search;
-    // only fall back sequentially to the year-scoped variant when the primary returned noisy
+    // only fall back sequentially to the other variants when the primary returned noisy
     // non-matching results and no well-matched release has been found yet.
     const queries: string[] = [`${cleanArtist} ${cleanAlbum}`];
+    // "ACDC" beside "AC DC": some indexers only match the spelling a release name uses.
+    const joinedArtist = joinedArtistSpelling(album.artistName);
+    if (joinedArtist) {
+      queries.push(`${joinedArtist} ${cleanAlbum}`);
+    }
     if (album.year > 0) {
       queries.push(`${cleanArtist} ${cleanAlbum} ${album.year}`);
     }
@@ -2119,10 +2214,20 @@ export class AlbumResolver {
 
     // Archive-packed Usenet fallback when NZB lists .rar/.zip/.7z volumes without a complete
     // expanded audio listing (e.g. uninspected archive or partial multi-volume RAR peek).
+    // A partial listing can still show the release is something else (a single packed twice,
+    // another album): a track picked from it by name would be wrong or ambiguous.
+    const expandedContradictsAlbum = archiveMembersContradictAlbum(album, expandedAudioFiles);
+    if (expandedContradictsAlbum && isUsenet && archiveFiles.length > 0 && !expandedCompleteListing) {
+      this.env.log(
+        "debug",
+        `resolve-album: reject ${album.id} [usenet] "${(cand.title || "").slice(0, 60)}" files=${files.length} reason=archive members are not this album`
+      );
+    }
     if (
       verified.length === 0 &&
       !expandedCompleteListing &&
       !expandedQualityRejected &&
+      !expandedContradictsAlbum &&
       isUsenet &&
       archiveFiles.length > 0 &&
       preScore >= 60

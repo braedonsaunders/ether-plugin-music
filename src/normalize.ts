@@ -550,3 +550,58 @@ export function validExternalId(id: string): string {
     .slice(0, 120);
   return cleaned || "m-unknown";
 }
+
+/**
+ * Text an indexer's full-text search can match: Latin accents folded, punctuation turned into
+ * spaces ("AC/DC" -> "AC DC", "Beyoncé" -> "Beyonce"). Letters of other scripts are kept.
+ */
+export function indexerQueryText(input: string): string {
+  return String(input || "")
+    .replace(/[Ææ]/g, "ae")
+    .replace(/[Œœ]/g, "oe")
+    .replace(/[Øø]/g, "o")
+    .replace(/[ß]/g, "ss")
+    .replace(/[Łł]/g, "l")
+    .replace(/[À-ɏ]/g, (ch) => ch.normalize("NFD").replace(/[̀-ͯ]/g, ""))
+    .replace(/(?<=\p{L})\$(?=\p{L})/gu, "S")
+    .replace(/(?<=\p{L})!(?=\p{L})/gu, "i")
+    .replace(/['’`´]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+/**
+ * The spelling release names use when an artist's name is split by punctuation and written as
+ * one word ("AC/DC" -> "ACDC", "R.E.M." -> "REM", "blink-182" -> "blink182"). Empty when the
+ * name has no such word.
+ */
+export function joinedArtistSpelling(artist: string): string {
+  const words = String(artist || "").trim().split(/\s+/).filter(Boolean);
+  let changed = false;
+  const out = words.map((w) => {
+    if (!/[\p{L}\p{N}][\/.\-][\p{L}\p{N}]/u.test(w)) return w;
+    changed = true;
+    return w.replace(/[\/.\-]/g, "");
+  });
+  if (!changed) return "";
+  const joined = indexerQueryText(out.join(" "));
+  return joined && joined !== indexerQueryText(artist) ? joined : "";
+}
+
+/**
+ * An album or single title without "(feat. ...)", "[From ...]" and edition tags: what release
+ * names carry, used for searching and for comparing titles.
+ */
+export function coreReleaseTitle(title: string): string {
+  const original = String(title || "").trim();
+  let out = original;
+  let prev = "";
+  while (out !== prev) {
+    prev = out;
+    out = stripFeaturing(out)
+      .replace(/\s*[\(\[]\s*(?:from|music\s+from|original|soundtrack|ost)\b[^\)\]]*[\)\]]\s*$/i, "")
+      .trim();
+    out = stripEditionSuffix(out);
+  }
+  return out || original;
+}
