@@ -64,7 +64,7 @@ const MAX_USENET_PROBES = 10;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v7:${albumId}`;
+  return `alb_rel_v8:${albumId}`;
 }
 
 function recordingPlanKey(isrc: string): string {
@@ -294,8 +294,11 @@ export function classifyReleaseQuality(
   const hasLosslessFile = audioExts.some((a) => a.lossless);
   const firstFile = audioExts[0];
 
-  const is24Bit = /\b(?:24\s*-?\s*bit|24bit|24[-_/ ]?(?:44|48|88|96|176|192)|hi-?res)\b/i.test(t);
-  const isFlacTitle = /\bflac\b/i.test(t);
+  const is24Bit = /\b(?:24\s*-?\s*bit|24bit|24[-_/ ]?(?:44|48|88|96|176|192)|(?:44|48|88|96|176|192)[-_/ ]24|hi-?res)\b/i.test(t);
+  // A 24-bit tag with no lossy format beside it ("96-24", "24-96") is a lossless rip whose name
+  // leaves the format out; the files decide once they are listed.
+  const isLossyTitle = /\b(?:mp3|aac|m4a|ogg|opus|wma|320|256|192\s*k(?:bps)?|v0|v2)\b/i.test(t);
+  const isFlacTitle = /\bflac\b/i.test(t) || (is24Bit && !isLossyTitle);
   const isVinyl = /\b(?:vinyl|lp\s*rip|pbthal)\b/i.test(t);
   const isWebOrCd = /\b(?:web|cd|qobuz|tidal|bandcamp|cdrip|eac)\b/i.test(t);
 

@@ -2614,3 +2614,23 @@ test("ranking a long result list stops when the slice is out of time instead of 
   assert.match(ranked, /unscored=\d+/, `the names not reached are counted: ${ranked}`);
   assert.match(ranked, /usenet=[1-9]/, "the names scored in time are still used");
 });
+
+test("a 24-bit tag without a format word is read as lossless, in either order", () => {
+  const q = (title: string) => classifyReleaseQuality(title, undefined, "flac_preferred");
+  for (const title of [
+    "Metallica - 1991 - Metallica (The Black Album) (2001) 96-24",
+    "Artist - Album (1977) 24-96 vinyl",
+    "Artist - Album [24-192]",
+  ]) {
+    assert.equal(q(title).lossless, true, title);
+    assert.equal(q(title).tier, "flac24", title);
+  }
+  assert.equal(q("Artist - Album (1977) MP3 320").lossless, false);
+  assert.equal(q("Artist - Album 24-96 MP3").lossless, false, "a lossy format beside the tag wins");
+  // The files decide once they are listed.
+  assert.equal(q("Artist - Album 96-24").lossless, true);
+  assert.equal(
+    classifyReleaseQuality("Artist - Album 96-24", [{ index: 0, path: "01 - Song.mp3", size: 9_000_000 }], "flac_preferred").lossless,
+    false
+  );
+});
