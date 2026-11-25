@@ -159,7 +159,13 @@ const INCOMPLETE_MEMO_TTL_MS = 30 * 1000;
 export function searchIncomplete(res: { pending?: unknown[]; indexers?: Array<{ status?: string }> } | null | undefined): boolean {
   if (!res) return true;
   if (Array.isArray(res.pending) && res.pending.length > 0) return true;
-  return (res.indexers || []).some((s) => s.status === "pending" || s.status === "timed_out" || s.status === "error");
+  const statuses = res.indexers || [];
+  if (statuses.some((s) => s.status === "pending" || s.status === "timed_out")) return true;
+  // An indexer that answers every music search with an error (one with no audio category, a
+  // source that only knows films) would otherwise keep each search open for good: when the
+  // others have answered, the search is as complete as it will get.
+  const answered = statuses.some((s) => s.status === "answered");
+  return !answered && statuses.some((s) => s.status === "error");
 }
 
 function compactCandidateForMemo(c: SourceCandidate): SourceCandidate {
@@ -1548,7 +1554,16 @@ export class AlbumResolver {
       const list = Array.isArray(res?.candidates) ? res.candidates : [];
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
       const incomplete = searchIncomplete(res);
-      this.env.log("debug", `indexer_search ${entityId} "${query}" returned=${list.length} in ${elapsedMs}ms (timeout ${timeoutMs}ms)`);
+      const statusCounts: Record<string, number> = {};
+      for (const st of ((res as { indexers?: Array<{ status?: string }> } | null)?.indexers || [])) {
+        const k = st.status || "unknown";
+        statusCounts[k] = (statusCounts[k] || 0) + 1;
+      }
+      const statusText = Object.keys(statusCounts).map((k) => `${k}:${statusCounts[k]}`).join(",") || "none";
+      this.env.log(
+        "debug",
+        `indexer_search ${entityId} "${query}" returned=${list.length} in ${elapsedMs}ms (timeout ${timeoutMs}ms) indexers=${statusText}`
+      );
       if (incomplete && list.length === 0) {
         // Indexers still running (or cut off) and nothing yet: not an answer. Keep it marked in
         // flight so concurrent tracks wait, and search again after the wait window.

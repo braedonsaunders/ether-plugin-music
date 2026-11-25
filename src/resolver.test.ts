@@ -33,6 +33,7 @@ import {
   matchConcertReleaseFiles,
   preScoreAlbumCandidate,
   preScoreConcertCandidate,
+  searchIncomplete,
   searchMemoKey,
 } from "./resolver.ts";
 import { buildConcertItem, getCuratedConcertById } from "./concerts.ts";
@@ -2633,4 +2634,15 @@ test("a 24-bit tag without a format word is read as lossless, in either order", 
     classifyReleaseQuality("Artist - Album 96-24", [{ index: 0, path: "01 - Song.mp3", size: 9_000_000 }], "flac_preferred").lossless,
     false
   );
+});
+
+test("an indexer that only errors does not keep a search open once the others have answered", () => {
+  const st = (...statuses: string[]) => ({ candidates: [], indexers: statuses.map((status) => ({ status })) });
+  assert.equal(searchIncomplete(st("answered", "answered", "error")), false);
+  assert.equal(searchIncomplete(st("answered", "skipped")), false);
+  assert.equal(searchIncomplete(st("answered", "pending")), true, "an indexer still searching keeps it open");
+  assert.equal(searchIncomplete(st("answered", "timed_out")), true);
+  assert.equal(searchIncomplete(st("error", "error")), true, "nobody answered: no verdict");
+  assert.equal(searchIncomplete({ candidates: [], pending: [{ id: "x" }] }), true);
+  assert.equal(searchIncomplete(null), true);
 });
