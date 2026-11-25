@@ -2178,10 +2178,12 @@ export class AlbumResolver {
     const archiveFallbacks = stage.archiveFallbacks;
     const debridFallbacks = stage.debridFallbacks || (stage.debridFallbacks = []);
 
+    const listAt = this.env.now();
     const listed = this.listReleaseFiles(stage, cand);
     if (!listed) return false;
     const files = listed.files;
     const isCached = listed.cached;
+    const listedMs = this.env.now() - listAt;
 
     const isUsenet = isUsenetCandidate(cand);
     if (!isUsenet && !isCached) return false;
@@ -2217,7 +2219,12 @@ export class AlbumResolver {
       return false;
     }
 
+    const matchAt = this.env.now();
     const match = matchAlbumReleaseFiles(album, cand.title || "", files, this.settings.qualityPreference);
+    this.env.log(
+      "debug",
+      `resolve-album: probe ${album.id} "${(cand.title || "").slice(0, 60)}" files=${files.length} listed in ${listedMs}ms matched in ${this.env.now() - matchAt}ms at=${this.env.now() - startMs}ms`
+    );
     const archiveFiles = files.filter((f) => isArchivePath(f.path));
     const expandedAudioFiles = files.flatMap((f) =>
       Array.isArray(f.members)
