@@ -389,12 +389,14 @@ export function isOtherTitleForSelfTitledAlbum(
   if (!normAlbum || normAlbum !== normArtist) return false;
   // A post named after a file ('[2/6] "Folder/Artist - Title.flac"') repeats the artist in its
   // path: judge the first part of the path that names the artist.
-  const segments = relTitle
-    .trim()
-    .replace(/^\[\d+\/\d+\]\s*/, "")
-    .replace(/^["']/, "")
-    .split("/");
-  const folder = segments.find((seg) => normalizeText(seg).includes(normArtist)) ?? relTitle;
+  let folder = relTitle.trim();
+  if (folder.includes("/")) {
+    const segments = folder
+      .replace(/^\[\d+\/\d+\]\s*/, "")
+      .replace(/^["']/, "")
+      .split("/");
+    folder = segments.find((seg) => normalizeText(seg).includes(normArtist)) ?? folder;
+  }
   // A scene name ends in "-GROUP": the group is not a title word.
   const named = /^[^\s]+-[^\s]+-[^\s]+$/.test(folder) ? folder.replace(/-[A-Za-z0-9]{2,14}$/, "") : folder;
   const own = new Set(normArtist.split(/\s+/));
@@ -1514,14 +1516,17 @@ export class AlbumResolver {
       const list = Array.isArray(res?.candidates) ? res.candidates : [];
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
       const incomplete = searchIncomplete(res);
+      this.env.log("debug", `indexer_search ${entityId} "${query}" returned=${list.length} in ${elapsedMs}ms (timeout ${timeoutMs}ms)`);
       if (incomplete && list.length === 0) {
         // Indexers still running (or cut off) and nothing yet: not an answer. Keep it marked in
         // flight so concurrent tracks wait, and search again after the wait window.
         this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
         return { candidates: [], rawCount: 0, fromCache: false, errored: false, deferredInFlight: false, elapsedMs, incomplete: true };
       }
+      const rankAt = this.env.now();
       const ordered = prioritize ? prioritize(list) : list;
       const compacted = ordered.slice(0, SEARCH_MEMO_MAX_CANDIDATES).map(compactCandidateForMemo);
+      this.env.log("debug", `indexer_search ${entityId} ranked ${list.length} in ${this.env.now() - rankAt}ms`);
       this.cache.set<SearchQueryMemo>(
         memoKey,
         { status: "done", at: this.env.now(), rawCount: list.length, candidates: compacted, incomplete: incomplete || undefined },
@@ -1842,10 +1847,26 @@ export class AlbumResolver {
     // A candidate is scored once per search, however often ranking asks: scoring a hundred
     // release names inside a sort is most of the 5 s a /resolve call is given.
     const scored = new Map<string, { accepted: boolean; score: number; reasons: string[] }>();
+    // Scoring stops when the slice has used its time: a /resolve call cut off at 5 s keeps
+    // nothing, so the names not reached are left out of this search rather than losing them all.
+    const SCORING_DEADLINE_MS = 2600;
+    let scoringStopped = false;
+    let unscored = 0;
     const scoreOf = (cand: SourceCandidate, allowUnconfirmedTorrent: boolean) => {
-      const key = `${allowUnconfirmedTorrent ? 1 : 0}${cand.cached ? 1 : 0}${isUsenetCandidate(cand) ? 1 : 0}${cand.infoHash || cand.magnet ? 1 : 0}:${cand.seeders ?? ""}:${cand.title || ""}`;
+      const usenet = isUsenetCandidate(cand);
+      // The torrent option changes nothing for a Usenet release: one entry serves both askers.
+      const key = usenet
+        ? `u:${cand.title || ""}`
+        : `${allowUnconfirmedTorrent ? 1 : 0}${cand.cached ? 1 : 0}${cand.infoHash || cand.magnet ? 1 : 0}:${cand.seeders ?? ""}:${cand.title || ""}`;
       let pre = scored.get(key);
       if (!pre) {
+        if (!scoringStopped && scored.size % 8 === 0 && this.env.now() - startMs >= SCORING_DEADLINE_MS) {
+          scoringStopped = true;
+        }
+        if (scoringStopped) {
+          unscored++;
+          return { accepted: false, score: 0, reasons: ["not scored: out of time"] };
+        }
         pre = preScoreAlbumCandidate(
           cand,
           album,
@@ -1865,12 +1886,13 @@ export class AlbumResolver {
 
     const prioritizeForMemo = (cands: SourceCandidate[]): SourceCandidate[] => {
       if (cands.length <= SEARCH_MEMO_MAX_CANDIDATES) return cands;
-      return [...cands].sort((a, b) => {
-        const pa = scoreOf(a, true);
-        const pb = scoreOf(b, true);
-        if (pa.accepted !== pb.accepted) return pa.accepted ? -1 : 1;
-        return pb.score - pa.score;
-      });
+      return cands
+        .map((cand) => ({ cand, pre: scoreOf(cand, true) }))
+        .sort((a, b) => {
+          if (a.pre.accepted !== b.pre.accepted) return a.pre.accepted ? -1 : 1;
+          return b.pre.score - a.pre.score;
+        })
+        .map((x) => x.cand);
     };
 
     // Always run query variants strictly sequentially; stop at the first query that yields
@@ -1882,10 +1904,12 @@ export class AlbumResolver {
       }
       const elapsed = this.env.now() - startMs;
       if (qi > 0 && interactive) {
-        if (elapsed >= 1400) break;
+        // A /resolve call is killed at 5 s and nothing it found is kept: a second search starts
+        // only while there is clearly room for it and for ranking what it returns.
+        if (elapsed >= 900) break;
       }
       const timeoutMs = interactive
-        ? (qi === 0 ? 2500 : Math.max(800, Math.min(1800, 3200 - elapsed)))
+        ? (qi === 0 ? 2500 : Math.max(800, Math.min(1500, 2400 - elapsed)))
         : 5000;
       const res = this.runMemoizedIndexerSearch(
         album.id,
@@ -1902,6 +1926,10 @@ export class AlbumResolver {
         break;
       }
       totalRawFromIndexer += res.rawCount;
+      this.env.log(
+        "debug",
+        `resolve-album: query ${album.id} "${q}" results=${res.rawCount} cached=${res.fromCache} incomplete=${res.incomplete} took=${res.elapsedMs}ms at=${this.env.now() - startMs}ms`
+      );
       if (res.incomplete) incomplete = true;
       if (res.rawCount === 0) {
         emptyQueries.push(q);
@@ -2013,7 +2041,7 @@ export class AlbumResolver {
     ];
     this.env.log(
       "info",
-      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
+      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
     );
     return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
   }

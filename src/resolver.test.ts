@@ -2570,3 +2570,37 @@ test("archive members that are not the album stop the archive fallback", () => {
   assert.equal(res.sources.length, 0, "the single must not be offered for the album");
   assert.equal(checks, 0, "no Usenet check is spent on it");
 });
+
+test("ranking a long result list stops when the slice is out of time instead of being cut off", () => {
+  const album = sampleDiscoveryAlbum();
+  const many: SourceCandidate[] = Array.from({ length: 300 }, (_, i) => ({
+    title: `Daft Punk - Discovery (2001) [FLAC] repost ${i}`,
+    nzbUrl: `https://althub.test/api?t=get&id=${i}`,
+    indexer: "altHUB",
+    size: 130_000_000,
+  }));
+  const { env } = makeFakeHost({
+    onResolve: (q) => (q.kind === "indexer_search" ? { candidates: many } : { candidates: [] }),
+  });
+  // A slow engine: every look at the clock is 120 ms later.
+  let now = 1_760_000_000_000;
+  env.now = () => (now += 120);
+  const logs: string[] = [];
+  env.log = (_level, line) => { logs.push(line); };
+  const cache = new KVCache(env);
+  cache.set(`album_v2:${album.id}`, album, 600_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  const ranked = logs.find((l) => /raw=300/.test(l)) || "";
+  assert.match(ranked, /unscored=\d+/, `the names not reached are counted: ${ranked}`);
+  assert.match(ranked, /usenet=[1-9]/, "the names scored in time are still used");
+});
