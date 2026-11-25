@@ -27,15 +27,20 @@ import type { MBRecordingRelease } from "./musicbrainz.ts";
 import { getCuratedConcertById, type CuratedConcert } from "./concerts.ts";
 import {
   audioFormatOfPath,
+  coreReleaseTitle,
+  indexerQueryText,
   isArchivePath,
   isConcertExtraOrSamplePath,
   isRejectedConcertVideoRelease,
   isRejectedReleaseForRequest,
+  joinedArtistSpelling,
   normalizeText,
   parseTrackFilename,
+  similarityOfNormalized,
   stripEditionSuffix,
   stripFeaturing,
   textSimilarity,
+  tokenSetOfNormalized,
   videoFormatOfPath,
 } from "./normalize.ts";
 
@@ -56,12 +61,12 @@ const RESOLVE_STEP_BUDGET_MS = 1400;
  */
 const USENET_CHECK_START_CUTOFF_MS = 1800;
 const MAX_CACHED_RELEASES = 3;
-const MAX_FILE_LIST_PROBES = 8;
-const MAX_USENET_PROBES = 5;
+const MAX_FILE_LIST_PROBES = 12;
+const MAX_USENET_PROBES = 10;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v6:${albumId}`;
+  return `alb_rel_v8:${albumId}`;
 }
 
 function recordingPlanKey(isrc: string): string {
@@ -154,7 +159,13 @@ const INCOMPLETE_MEMO_TTL_MS = 30 * 1000;
 export function searchIncomplete(res: { pending?: unknown[]; indexers?: Array<{ status?: string }> } | null | undefined): boolean {
   if (!res) return true;
   if (Array.isArray(res.pending) && res.pending.length > 0) return true;
-  return (res.indexers || []).some((s) => s.status === "pending" || s.status === "timed_out" || s.status === "error");
+  const statuses = res.indexers || [];
+  if (statuses.some((s) => s.status === "pending" || s.status === "timed_out")) return true;
+  // An indexer that answers every music search with an error (one with no audio category, a
+  // source that only knows films) would otherwise keep each search open for good: when the
+  // others have answered, the search is as complete as it will get.
+  const answered = statuses.some((s) => s.status === "answered");
+  return !answered && statuses.some((s) => s.status === "error");
 }
 
 function compactCandidateForMemo(c: SourceCandidate): SourceCandidate {
@@ -291,8 +302,11 @@ export function classifyReleaseQuality(
   const hasLosslessFile = audioExts.some((a) => a.lossless);
   const firstFile = audioExts[0];
 
-  const is24Bit = /\b(?:24\s*-?\s*bit|24bit|24[-_/ ]?(?:44|48|88|96|176|192)|hi-?res)\b/i.test(t);
-  const isFlacTitle = /\bflac\b/i.test(t);
+  const is24Bit = /\b(?:24\s*-?\s*bit|24bit|24[-_/ ]?(?:44|48|88|96|176|192)|(?:44|48|88|96|176|192)[-_/ ]24|hi-?res)\b/i.test(t);
+  // A 24-bit tag with no lossy format beside it ("96-24", "24-96") is a lossless rip whose name
+  // leaves the format out; the files decide once they are listed.
+  const isLossyTitle = /\b(?:mp3|aac|m4a|ogg|opus|wma|320|256|192\s*k(?:bps)?|v0|v2)\b/i.test(t);
+  const isFlacTitle = /\bflac\b/i.test(t) || (is24Bit && !isLossyTitle);
   const isVinyl = /\b(?:vinyl|lp\s*rip|pbthal)\b/i.test(t);
   const isWebOrCd = /\b(?:web|cd|qobuz|tidal|bandcamp|cdrip|eac)\b/i.test(t);
 
@@ -361,6 +375,98 @@ export function classifyReleaseQuality(
 /**
  * Score how well an indexer candidate title matches the canonical album BEFORE fetching file lists.
  */
+/** Words in a release name that describe the release, not its title. */
+const RELEASE_DESCRIPTION_WORDS = new Set(
+  (
+    "flac mp3 wav alac aac ogg opus ape wma dsd sacd mqa web cd cds cdm cdr vinyl lp rip remaster remastered " +
+    "deluxe edition expanded anniversary special limited reissue lossless album self titled the and " +
+    "retail proper repack real read nfo scene digital stereo mono hdtracks qobuz tidal bit khz kbps " +
+    "vbr cbr disc discs box set bonus tracks track japan japanese usa germany europe import version"
+  ).split(" ")
+);
+
+/**
+ * A self-titled album ("Metallica" by Metallica) matches every release of the artist by name
+ * alone. Tells apart the ones that name another title: the album's name appears once only, and
+ * the rest of the release name carries title words (or one such word without the album's year).
+ */
+export function isOtherTitleForSelfTitledAlbum(
+  relTitle: string,
+  _normRel: string,
+  normArtist: string,
+  normAlbum: string,
+  albumYear: number
+): boolean {
+  if (!normAlbum || normAlbum !== normArtist) return false;
+  // A post named after a file ('[2/6] "Folder/Artist - Title.flac"') repeats the artist in its
+  // path: judge the first part of the path that names the artist.
+  let folder = relTitle.trim();
+  if (folder.includes("/")) {
+    const segments = folder
+      .replace(/^\[\d+\/\d+\]\s*/, "")
+      .replace(/^["']/, "")
+      .split("/");
+    folder = segments.find((seg) => normalizeText(seg).includes(normArtist)) ?? folder;
+  }
+  // A scene name ends in "-GROUP": the group is not a title word.
+  const named = /^[^\s]+-[^\s]+-[^\s]+$/.test(folder) ? folder.replace(/-[A-Za-z0-9]{2,14}$/, "") : folder;
+  const own = new Set(normArtist.split(/\s+/));
+  const isTitleWord = (w: string) => /^[a-z]{3,}$/.test(w) && !own.has(w) && !RELEASE_DESCRIPTION_WORDS.has(w);
+  const norm = normalizeText(named);
+  const parts = norm.split(normAlbum);
+  if (parts.length - 1 >= 2) {
+    // "Artist - Artist" and "Artist - 1991 - Artist" name the album; "Artist - Mandatory Artist" does not.
+    const between = parts[1].split(/\s+/).filter(Boolean);
+    if (!between.some(isTitleWord)) return false;
+  }
+  const extra = norm.split(/\s+/).filter(isTitleWord);
+  if (extra.length >= 2) return true;
+  const years = Array.from(named.matchAll(/\b(19\d{2}|20\d{2})\b/g)).map((m) => Number(m[1]));
+  const yearNamed = albumYear > 0 && years.includes(albumYear);
+  // One other word beside the album's year is a label or a pressing, unless the release is a single.
+  if (extra.length === 1) return !yearNamed || /\b(?:cds|cdm|cd\s*single|single|maxi)\b/i.test(named);
+  // No other title word: still another release when it is dated to another year and is not a remaster.
+  return years.length > 0 && albumYear > 0 && !yearNamed && !/remaster|reissue|anniversary/i.test(named);
+}
+
+/**
+ * Whether the audio members listed inside a release's archives show it is not this album, so a
+ * track picked from it by name would be the wrong file or ambiguous: a title the album has once
+ * is there more than once (a single packed as WAV and MP3), or most members name no album track.
+ */
+export function archiveMembersContradictAlbum(
+  album: { tracks: Array<{ title: string }> },
+  members: Array<{ path: string }>
+): boolean {
+  if (members.length === 0) return false;
+  const titles = new Map<string, number>();
+  for (const tr of album.tracks) {
+    const k = normalizeText(coreReleaseTitle(tr.title));
+    if (k) titles.set(k, (titles.get(k) || 0) + 1);
+  }
+  // A member names a track when its file name carries the track's title, whatever else is in
+  // it ("01-artist-track_title", "Artist - Track Title (Live)").
+  const copies = new Map<string, number>();
+  let named = 0;
+  for (const m of members) {
+    const base = (m.path.replace(/\\/g, "/").split("/").pop() || m.path).replace(/\.[^.]+$/, "");
+    const name = ` ${normalizeText(base)} `;
+    let title = "";
+    for (const k of titles.keys()) {
+      if (k.length > title.length && name.includes(` ${k} `)) title = k;
+    }
+    if (!title) continue;
+    named++;
+    // The same file name in two formats or folders is the same recording twice.
+    const key = `${title}|${name}`;
+    copies.set(key, (copies.get(key) || 0) + 1);
+  }
+  for (const [key, n] of copies) {
+    if (n > (titles.get(key.split("|")[0]) || 0)) return true;
+  }
+  return members.length >= 3 && named * 2 < members.length;
+}
+
 export function preScoreAlbumCandidate(
   candidate: SourceCandidate,
   album: {
@@ -388,10 +494,14 @@ export function preScoreAlbumCandidate(
 
   const normRel = normalizeText(relTitle);
   const normArtist = normalizeText(album.artistName);
-  const cleanAlbum = stripEditionSuffix(album.title);
+  const cleanAlbum = coreReleaseTitle(album.title);
   const normAlbum = normalizeText(cleanAlbum);
 
   const reasons: string[] = [];
+
+  if (isOtherTitleForSelfTitledAlbum(relTitle, normRel, normArtist, normAlbum, album.year)) {
+    return { accepted: false, score: 0.2, reasons: ["self-titled album: release names another title"] };
+  }
 
   // Artist match check (all significant artist tokens or strong similarity)
   const artistTokens = normArtist.split(/\s+/).filter((t) => t.length >= 2 && t !== "the");
@@ -637,24 +747,34 @@ export function matchAlbumReleaseFiles(
     }
     const cleanGuess = stripFeaturing(stripEditionSuffix(parsed.titleGuess));
     const cleanBase = stripFeaturing(parsed.baseName);
+    const guessNorm = normalizeText(parsed.titleGuess);
+    const cleanGuessNorm = normalizeText(cleanGuess);
+    const cleanBaseNorm = normalizeText(cleanBase);
     return {
       ...af,
       parsed,
-      guessNorm: normalizeText(parsed.titleGuess),
+      guessNorm,
+      guessWords: tokenSetOfNormalized(guessNorm),
       cleanGuess,
-      cleanGuessNorm: normalizeText(cleanGuess),
+      cleanGuessNorm,
+      cleanGuessWords: tokenSetOfNormalized(cleanGuessNorm),
       cleanBase,
-      cleanBaseNorm: normalizeText(cleanBase),
+      cleanBaseNorm,
+      cleanBaseWords: tokenSetOfNormalized(cleanBaseNorm),
     };
   });
 
   const preparedTracks = album.tracks.map((tr) => {
     const cleanTitle = stripFeaturing(stripEditionSuffix(tr.title));
+    const titleNorm = normalizeText(tr.title);
+    const cleanTitleNorm = normalizeText(cleanTitle);
     return {
       tr,
-      titleNorm: normalizeText(tr.title),
+      titleNorm,
+      titleWords: tokenSetOfNormalized(titleNorm),
       cleanTitle,
-      cleanTitleNorm: normalizeText(cleanTitle),
+      cleanTitleNorm,
+      cleanTitleWords: tokenSetOfNormalized(cleanTitleNorm),
     };
   });
 
@@ -663,7 +783,7 @@ export function matchAlbumReleaseFiles(
   const pairs: Pair[] = [];
 
   for (let ti = 0; ti < preparedTracks.length; ti++) {
-    const { tr, titleNorm, cleanTitle, cleanTitleNorm } = preparedTracks[ti];
+    const { tr, titleNorm, titleWords, cleanTitleNorm, cleanTitleWords } = preparedTracks[ti];
 
     for (let fi = 0; fi < parsedFiles.length; fi++) {
       const pf = parsedFiles[fi];
@@ -677,9 +797,14 @@ export function matchAlbumReleaseFiles(
       ) {
         titleSim = 1.0;
       } else {
-        const simDirect = textSimilarity(tr.title, pf.parsed.titleGuess);
-        const simClean = textSimilarity(cleanTitle, pf.cleanGuess);
-        const simBase = pf.cleanBaseNorm === pf.cleanGuessNorm ? simClean : textSimilarity(cleanTitle, pf.cleanBase);
+        // Same result as textSimilarity on the raw strings, without normalizing them again per pair:
+        // a 100-track box set against its 100 files is 10,000 pairs.
+        const simDirect = similarityOfNormalized(titleNorm, titleWords, pf.guessNorm, pf.guessWords);
+        const simClean = similarityOfNormalized(cleanTitleNorm, cleanTitleWords, pf.cleanGuessNorm, pf.cleanGuessWords);
+        const simBase =
+          pf.cleanBaseNorm === pf.cleanGuessNorm
+            ? simClean
+            : similarityOfNormalized(cleanTitleNorm, cleanTitleWords, pf.cleanBaseNorm, pf.cleanBaseWords);
         titleSim = Math.max(simDirect, simClean, simBase * 0.9);
       }
       score += titleSim * 0.55;
@@ -716,7 +841,8 @@ export function matchAlbumReleaseFiles(
         score += 0.05;
       }
 
-      pairs.push({ trackIdx: ti, fileIdx: fi, score });
+      // A pair below the assignment floor is never used: leaving it out keeps the sort short.
+      if (score >= 0.42) pairs.push({ trackIdx: ti, fileIdx: fi, score });
     }
   }
 
@@ -1263,8 +1389,10 @@ export class AlbumResolver {
     const synthId = `${recId}-${plan.idx}`;
     if (!this.cache.get<CanonicalAlbum>(`album_v2:${synthId}`)) {
       this.cache.set(`album_v2:${synthId}`, this.recordingAlbum(synthId, item, cand), ALBUM_CACHE_TTL_MS);
+      // Said once per release tried, not on every poll: Ether keeps a plugin's last 200 lines,
+      // and a waiting app polls several times a second.
+      this.env.log("info", `resolve-recording: ${recording} "${item.title}" try ${plan.idx + 1}/${plan.candidates.length} "${cand.artistName} - ${cand.title}" (${cand.releaseType})`);
     }
-    this.env.log("info", `resolve-recording: ${recording} "${item.title}" try ${plan.idx + 1}/${plan.candidates.length} "${cand.artistName} - ${cand.title}" (${cand.releaseType})`);
     const step = this.stepResolveAlbum(synthId, item, excluded, RESOLVE_STEP_BUDGET_MS, true);
     if (!step.done) return { pending: true, retryInMs: step.retryInMs ?? 250, sources: [] };
     if (step.inconclusive) return { sources: [], ttlSec: 30 };
@@ -1426,14 +1554,26 @@ export class AlbumResolver {
       const list = Array.isArray(res?.candidates) ? res.candidates : [];
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
       const incomplete = searchIncomplete(res);
+      const statusCounts: Record<string, number> = {};
+      for (const st of ((res as { indexers?: Array<{ status?: string }> } | null)?.indexers || [])) {
+        const k = st.status || "unknown";
+        statusCounts[k] = (statusCounts[k] || 0) + 1;
+      }
+      const statusText = Object.keys(statusCounts).map((k) => `${k}:${statusCounts[k]}`).join(",") || "none";
+      this.env.log(
+        "debug",
+        `indexer_search ${entityId} "${query}" returned=${list.length} in ${elapsedMs}ms (timeout ${timeoutMs}ms) indexers=${statusText}`
+      );
       if (incomplete && list.length === 0) {
         // Indexers still running (or cut off) and nothing yet: not an answer. Keep it marked in
         // flight so concurrent tracks wait, and search again after the wait window.
         this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
         return { candidates: [], rawCount: 0, fromCache: false, errored: false, deferredInFlight: false, elapsedMs, incomplete: true };
       }
+      const rankAt = this.env.now();
       const ordered = prioritize ? prioritize(list) : list;
       const compacted = ordered.slice(0, SEARCH_MEMO_MAX_CANDIDATES).map(compactCandidateForMemo);
+      this.env.log("debug", `indexer_search ${entityId} ranked ${list.length} in ${this.env.now() - rankAt}ms`);
       this.cache.set<SearchQueryMemo>(
         memoKey,
         { status: "done", at: this.env.now(), rawCount: list.length, candidates: compacted, incomplete: incomplete || undefined },
@@ -1504,16 +1644,17 @@ export class AlbumResolver {
         return { done: true, verifiedCount: 0 };
       }
 
-      this.env.log(
-        "info",
-        `resolve-album: search ${album.id} "${album.artistName} - ${album.title}" (${album.year}, ${album.tracks.length} tracks)`
-      );
       const searched = this.searchAndRankCandidates(album, excluded, startMs, budgetMs);
       if (searched.deferredInFlight) {
         // Another worker is currently running the same album search; yield briefly without
         // firing a duplicate parallel search or caching a premature negative result.
         return { done: false, verifiedCount: 0, retryInMs: 350 };
       }
+      // Logged for a search that ran, not for each poll that waited on one.
+      this.env.log(
+        "info",
+        `resolve-album: search ${album.id} "${album.artistName} - ${album.title}" (${album.year}, ${album.tracks.length} tracks)`
+      );
       if (searched.incomplete && searched.ordered.length === 0) {
         return this.inconclusive(albumId);
       }
@@ -1726,12 +1867,19 @@ export class AlbumResolver {
     deferredInFlight: boolean;
     incomplete?: boolean;
   } {
-    const cleanArtist = album.artistName.trim();
-    const cleanAlbum = stripEditionSuffix(album.title).trim();
+    // Indexers match words: punctuation and accents in a name ("AC/DC", "Beyoncé") and tags a
+    // release name never carries ("(feat. ...)", "[From ...]") make a query match little or nothing.
+    const cleanArtist = indexerQueryText(album.artistName) || album.artistName.trim();
+    const cleanAlbum = indexerQueryText(coreReleaseTitle(album.title)) || stripEditionSuffix(album.title).trim();
     // Primary query without year captures both "(2001)" and undated album packs in ONE search;
-    // only fall back sequentially to the year-scoped variant when the primary returned noisy
+    // only fall back sequentially to the other variants when the primary returned noisy
     // non-matching results and no well-matched release has been found yet.
     const queries: string[] = [`${cleanArtist} ${cleanAlbum}`];
+    // "ACDC" beside "AC DC": some indexers only match the spelling a release name uses.
+    const joinedArtist = joinedArtistSpelling(album.artistName);
+    if (joinedArtist) {
+      queries.push(`${joinedArtist} ${cleanAlbum}`);
+    }
     if (album.year > 0) {
       queries.push(`${cleanArtist} ${cleanAlbum} ${album.year}`);
     }
@@ -1744,22 +1892,55 @@ export class AlbumResolver {
     let totalRawFromIndexer = 0;
     let incomplete = false;
 
+    // A candidate is scored once per search, however often ranking asks: scoring a hundred
+    // release names inside a sort is most of the 5 s a /resolve call is given.
+    const scored = new Map<string, { accepted: boolean; score: number; reasons: string[] }>();
+    // Scoring stops when the slice has used its time: a /resolve call cut off at 5 s keeps
+    // nothing, so the names not reached are left out of this search rather than losing them all.
+    const SCORING_DEADLINE_MS = 2600;
+    let scoringStopped = false;
+    let unscored = 0;
+    const scoreOf = (cand: SourceCandidate, allowUnconfirmedTorrent: boolean) => {
+      const usenet = isUsenetCandidate(cand);
+      // The torrent option changes nothing for a Usenet release: one entry serves both askers.
+      const key = usenet
+        ? `u:${cand.title || ""}`
+        : `${allowUnconfirmedTorrent ? 1 : 0}${cand.cached ? 1 : 0}${cand.infoHash || cand.magnet ? 1 : 0}:${cand.seeders ?? ""}:${cand.title || ""}`;
+      let pre = scored.get(key);
+      if (!pre) {
+        if (!scoringStopped && scored.size % 8 === 0 && this.env.now() - startMs >= SCORING_DEADLINE_MS) {
+          scoringStopped = true;
+        }
+        if (scoringStopped) {
+          unscored++;
+          return { accepted: false, score: 0, reasons: ["not scored: out of time"] };
+        }
+        pre = preScoreAlbumCandidate(
+          cand,
+          album,
+          this.settings.qualityPreference,
+          allowUnconfirmedTorrent ? { allowUnconfirmedTorrent: true } : undefined
+        );
+        scored.set(key, pre);
+      }
+      return pre;
+    };
+
     const isWellMatched = (cand: SourceCandidate): boolean => {
       if (!isUsenetCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
-      const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference, {
-        allowUnconfirmedTorrent: true,
-      });
+      const pre = scoreOf(cand, true);
       return pre.accepted && pre.score >= 55;
     };
 
     const prioritizeForMemo = (cands: SourceCandidate[]): SourceCandidate[] => {
       if (cands.length <= SEARCH_MEMO_MAX_CANDIDATES) return cands;
-      return [...cands].sort((a, b) => {
-        const pa = preScoreAlbumCandidate(a, album, this.settings.qualityPreference, { allowUnconfirmedTorrent: true });
-        const pb = preScoreAlbumCandidate(b, album, this.settings.qualityPreference, { allowUnconfirmedTorrent: true });
-        if (pa.accepted !== pb.accepted) return pa.accepted ? -1 : 1;
-        return pb.score - pa.score;
-      });
+      return cands
+        .map((cand) => ({ cand, pre: scoreOf(cand, true) }))
+        .sort((a, b) => {
+          if (a.pre.accepted !== b.pre.accepted) return a.pre.accepted ? -1 : 1;
+          return b.pre.score - a.pre.score;
+        })
+        .map((x) => x.cand);
     };
 
     // Always run query variants strictly sequentially; stop at the first query that yields
@@ -1771,10 +1952,12 @@ export class AlbumResolver {
       }
       const elapsed = this.env.now() - startMs;
       if (qi > 0 && interactive) {
-        if (elapsed >= 1400) break;
+        // A /resolve call is killed at 5 s and nothing it found is kept: a second search starts
+        // only while there is clearly room for it and for ranking what it returns.
+        if (elapsed >= 900) break;
       }
       const timeoutMs = interactive
-        ? (qi === 0 ? 2500 : Math.max(800, Math.min(1800, 3200 - elapsed)))
+        ? (qi === 0 ? 2500 : Math.max(800, Math.min(1500, 2400 - elapsed)))
         : 5000;
       const res = this.runMemoizedIndexerSearch(
         album.id,
@@ -1791,6 +1974,10 @@ export class AlbumResolver {
         break;
       }
       totalRawFromIndexer += res.rawCount;
+      this.env.log(
+        "debug",
+        `resolve-album: query ${album.id} "${q}" results=${res.rawCount} cached=${res.fromCache} incomplete=${res.incomplete} took=${res.elapsedMs}ms at=${this.env.now() - startMs}ms`
+      );
       if (res.incomplete) incomplete = true;
       if (res.rawCount === 0) {
         emptyQueries.push(q);
@@ -1856,7 +2043,7 @@ export class AlbumResolver {
       const isUsenet = isUsenetCandidate(cand);
       if (!isUsenet && !cand.cached) continue;
 
-      const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference);
+      const pre = scoreOf(cand, false);
       if (!pre.accepted) continue;
       preRanked.push({ cand, score: pre.score });
     }
@@ -1885,9 +2072,7 @@ export class AlbumResolver {
       for (const cand of rawCandidates) {
         if (isUsenetCandidate(cand) || cand.cached) continue;
         if (!cand.infoHash && !cand.magnet) continue;
-        const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference, {
-          allowUnconfirmedTorrent: true,
-        });
+        const pre = scoreOf(cand, true);
         if (!pre.accepted || pre.score < 45) continue;
         unconfirmedDebrid.push({ cand, score: pre.score });
       }
@@ -1904,7 +2089,7 @@ export class AlbumResolver {
     ];
     this.env.log(
       "info",
-      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}`
+      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
     );
     return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
   }
@@ -2011,10 +2196,12 @@ export class AlbumResolver {
     const archiveFallbacks = stage.archiveFallbacks;
     const debridFallbacks = stage.debridFallbacks || (stage.debridFallbacks = []);
 
+    const listAt = this.env.now();
     const listed = this.listReleaseFiles(stage, cand);
     if (!listed) return false;
     const files = listed.files;
     const isCached = listed.cached;
+    const listedMs = this.env.now() - listAt;
 
     const isUsenet = isUsenetCandidate(cand);
     if (!isUsenet && !isCached) return false;
@@ -2050,7 +2237,12 @@ export class AlbumResolver {
       return false;
     }
 
+    const matchAt = this.env.now();
     const match = matchAlbumReleaseFiles(album, cand.title || "", files, this.settings.qualityPreference);
+    this.env.log(
+      "debug",
+      `resolve-album: probe ${album.id} "${(cand.title || "").slice(0, 60)}" files=${files.length} listed in ${listedMs}ms matched in ${this.env.now() - matchAt}ms at=${this.env.now() - startMs}ms`
+    );
     const archiveFiles = files.filter((f) => isArchivePath(f.path));
     const expandedAudioFiles = files.flatMap((f) =>
       Array.isArray(f.members)
@@ -2119,10 +2311,20 @@ export class AlbumResolver {
 
     // Archive-packed Usenet fallback when NZB lists .rar/.zip/.7z volumes without a complete
     // expanded audio listing (e.g. uninspected archive or partial multi-volume RAR peek).
+    // A partial listing can still show the release is something else (a single packed twice,
+    // another album): a track picked from it by name would be wrong or ambiguous.
+    const expandedContradictsAlbum = archiveMembersContradictAlbum(album, expandedAudioFiles);
+    if (expandedContradictsAlbum && isUsenet && archiveFiles.length > 0 && !expandedCompleteListing) {
+      this.env.log(
+        "debug",
+        `resolve-album: reject ${album.id} [usenet] "${(cand.title || "").slice(0, 60)}" files=${files.length} reason=archive members are not this album`
+      );
+    }
     if (
       verified.length === 0 &&
       !expandedCompleteListing &&
       !expandedQualityRejected &&
+      !expandedContradictsAlbum &&
       isUsenet &&
       archiveFiles.length > 0 &&
       preScore >= 60

@@ -12,10 +12,17 @@ import { KVCache, isHostFaultOrAbort } from "./kv.ts";
 import { DeezerClient } from "./deezer.ts";
 import { MusicBrainzClient } from "./musicbrainz.ts";
 import { MusicCatalog } from "./catalog.ts";
-import { stripEditionSuffix, normalizeText } from "./normalize.ts";
+import {
+  stripEditionSuffix,
+  normalizeText,
+  indexerQueryText,
+  joinedArtistSpelling,
+  coreReleaseTitle,
+} from "./normalize.ts";
 import {
   AlbumResolver,
   albumCacheKey,
+  archiveMembersContradictAlbum,
   buildArchiveTrackHint,
   classifyReleaseQuality,
   classifyVideoQuality,
@@ -26,6 +33,7 @@ import {
   matchConcertReleaseFiles,
   preScoreAlbumCandidate,
   preScoreConcertCandidate,
+  searchIncomplete,
   searchMemoKey,
 } from "./resolver.ts";
 import { buildConcertItem, getCuratedConcertById } from "./concerts.ts";
@@ -2371,4 +2379,270 @@ test("a song its album could not play is found on a single carrying the same rec
   cache.set(albumCacheKey("al-999"), { albumId: "al-999", resolvedAt: 0, expiresAt: Date.now() + 60_000, releases: [], negative: true }, 60_000);
   const again = resolver.resolve({ item: other });
   assert.equal(again.sources[0]?.release?.candidate?.nzbUrl, single.nzbUrl);
+});
+
+function resolverFor(album: CanonicalAlbum, onResolve: (q: SourceQuery) => { candidates: SourceCandidate[] }) {
+  const { env } = makeFakeHost({ onResolve });
+  const cache = new KVCache(env);
+  cache.set(`album_v2:${album.id}`, album, 60_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  return new AlbumResolver(env, cache, catalog, settings);
+}
+
+test("search text: punctuation and accents in names, and tags a release name never carries", () => {
+  assert.equal(indexerQueryText("AC/DC"), "AC DC");
+  assert.equal(indexerQueryText("Beyoncé"), "Beyonce");
+  assert.equal(indexerQueryText("Guns N' Roses"), "Guns N Roses");
+  assert.equal(indexerQueryText("Simon & Garfunkel"), "Simon Garfunkel");
+  assert.equal(indexerQueryText("A$AP Rocky"), "ASAP Rocky");
+  assert.equal(indexerQueryText("Кино"), "Кино", "letters of other scripts are kept");
+  assert.equal(indexerQueryText("Кайно"), "Кайно", "only Latin accents are folded");
+
+  assert.equal(joinedArtistSpelling("AC/DC"), "ACDC");
+  assert.equal(joinedArtistSpelling("R.E.M."), "REM");
+  assert.equal(joinedArtistSpelling("blink-182"), "blink182");
+  assert.equal(joinedArtistSpelling("Daft Punk"), "");
+
+  assert.equal(
+    coreReleaseTitle("Flower In A Hurricane (feat. Tame Impala, SZA, King Gizzard & the Lizard Wizard) [From GTAVI: Original Score]"),
+    "Flower In A Hurricane"
+  );
+  assert.equal(coreReleaseTitle("Interstellar (Original Motion Picture Soundtrack)"), "Interstellar");
+  assert.equal(coreReleaseTitle("Metallica (Remastered 2021)"), "Metallica");
+  assert.equal(coreReleaseTitle("Discovery"), "Discovery");
+});
+
+test("an artist name with punctuation is searched as words, then as one word", () => {
+  const album: CanonicalAlbum = { ...sampleDiscoveryAlbum(), id: "al-9410086", artistName: "AC/DC", title: "Highway to Hell", year: 1979 };
+  const queries: string[] = [];
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") queries.push(q.query || "");
+    return { candidates: [] };
+  });
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(queries[0], "AC DC Highway to Hell");
+  assert.ok(queries.includes("ACDC Highway to Hell"), `joined spelling is searched too: ${queries.join(" | ")}`);
+});
+
+test("a single is searched and matched by its title alone", () => {
+  const album: CanonicalAlbum = {
+    ...sampleDiscoveryAlbum(),
+    id: "al-1119445672",
+    artistName: "Justice",
+    title: "Flower In A Hurricane (feat. Tame Impala, SZA, King Gizzard & the Lizard Wizard) [From GTAVI: Original Score]",
+    year: 2026,
+  };
+  const queries: string[] = [];
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") queries.push(q.query || "");
+    return { candidates: [] };
+  });
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(queries[0], "Justice Flower In A Hurricane");
+
+  const pre = preScoreAlbumCandidate(
+    { title: "Justice-Flower_In_A_Hurricane-SINGLE-WEB-FLAC-2026-GRP", nzbUrl: "https://x.test/1", indexer: "x" },
+    { artistName: album.artistName, title: album.title, year: 2026, releaseType: "single", durationSec: 200 },
+    "flac_preferred"
+  );
+  assert.equal(pre.accepted, true, pre.reasons.join(", "));
+});
+
+test("a self-titled album does not match the artist's other releases", () => {
+  const album = { artistName: "Metallica", title: "Metallica (Remastered 2021)", year: 1991, releaseType: "album" as const, durationSec: 3750 };
+  const score = (title: string) =>
+    preScoreAlbumCandidate({ title, nzbUrl: "https://x.test/1", indexer: "x" }, album, "flac_preferred");
+
+  for (const other of [
+    "Metallica - Nothing Else Matters CDM (Wav + Mp3)",
+    "Metallica-ReLoad-REMASTERED-24BIT-WEB-FLAC-2026-ENTiTLED",
+    "Metallica - Reload (1997) [FLAC 24bit-96kHz]-NICFEIN",
+    "Metallica - Master of Puppets (1986) [FLAC]",
+    "Metallica.-.S&M.(1999).[FLAC].88",
+    "Metallica - (1991) The Unforgiven (CDS)",
+    '[2/6] "6711_Disc 2/Disc 2/Metallica - Mandatory Metallica (US Promo CD, Disc 2).flac"',
+    '[2/10] "Metallica - One 1989 UK Vertigo METCD5/Metallica - One (Vertigo METCD5).flac"',
+  ]) {
+    const pre = score(other);
+    assert.equal(pre.accepted, false, `${other} is another title`);
+    assert.match(pre.reasons.join(" "), /self-titled/);
+  }
+  for (const same of [
+    "Metallica-Metallica-REMASTERED-24BIT-WEB-FLAC-2021-ENTiTLED",
+    "Metallica - Metallica (1991) [FLAC]",
+    "Metallica (1991) [FLAC]",
+    "Metallica 1991 Vertigo FLAC",
+    "Metallica - The Black Album (1991) FLAC",
+    "Metallica.-.Metallica.[1991].[MP3.320].88 [54d0d6b31]",
+    "Metallica - 1991 - Metallica (The Black Album) (2001) 96-24 - Metallica - 1991 - Metallica",
+  ]) {
+    assert.equal(score(same).accepted, true, `${same} is the album`);
+  }
+  // An album that is not self-titled is unaffected.
+  assert.equal(
+    preScoreAlbumCandidate(
+      { title: "Metallica - Reload (1997) [FLAC]", nzbUrl: "https://x.test/1", indexer: "x" },
+      { ...album, title: "Reload", year: 1997 },
+      "flac_preferred"
+    ).accepted,
+    true
+  );
+});
+
+test("archive members that are not the album stop the archive fallback", () => {
+  const album = sampleDiscoveryAlbum();
+  const t = album.tracks.map((x) => x.title);
+  // A single packed as WAV and MP3: one album title, twice.
+  assert.equal(
+    archiveMembersContradictAlbum(album, [
+      { path: `wav/01 - ${t[0]}.wav` },
+      { path: `mp3/01 - ${t[0]}.mp3` },
+    ]),
+    true
+  );
+  // Another release: most members name no track of the album.
+  assert.equal(
+    archiveMembersContradictAlbum(album, [
+      { path: "01 - Some Other Song.flac" },
+      { path: "02 - And Another.flac" },
+      { path: `03 - ${t[0]}.flac` },
+    ]),
+    true
+  );
+  // The first volume of the right album: its first tracks, once each.
+  assert.equal(
+    archiveMembersContradictAlbum(album, [
+      { path: `01 - ${t[0]}.flac` },
+      { path: `02 - ${t[1]}.flac` },
+      { path: `03 - ${t[2]}.flac` },
+    ]),
+    false
+  );
+  assert.equal(archiveMembersContradictAlbum(album, []), false, "nothing listed says nothing");
+  // Scene file names carry the artist and underscores: they still name the album's tracks.
+  assert.equal(
+    archiveMembersContradictAlbum(album, [
+      { path: "01-daft_punk-one_more_time.flac" },
+      { path: "02-daft_punk-aerodynamic.flac" },
+      { path: "03-daft_punk-digital_love.flac" },
+      { path: "00-daft_punk-discovery-cd-flac-2001.nfo.flac" },
+    ]),
+    false
+  );
+
+  // End to end: a multi-volume release whose listed members are a single in two formats is not
+  // offered as the album, whatever its Usenet health.
+  const single: SourceCandidate = {
+    title: "Daft Punk - Discovery CDM (Wav + Mp3)",
+    nzbUrl: "https://althub.test/api?t=get&id=9",
+    indexer: "altHUB",
+    size: 90_000_000,
+  };
+  let checks = 0;
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [single] };
+    if (q.kind === "release_files") {
+      return {
+        candidates: [
+          {
+            ...q.candidate!,
+            files: [
+              {
+                index: 0,
+                path: "dp-cdm.part01.rar",
+                size: 50_000_000,
+                members: [
+                  { index: 0, path: `wav/01 - ${t[0]}.wav`, size: 40_000_000 },
+                  { index: 1, path: `mp3/01 - ${t[0]}.mp3`, size: 8_000_000 },
+                ],
+              },
+              { index: 1, path: "dp-cdm.part02.rar", size: 40_000_000 },
+            ],
+          },
+        ],
+      };
+    }
+    if (q.kind === "usenet_check") {
+      checks++;
+      return { candidates: [{ nzbUrl: q.nzbUrl, usenetCheck: { available: true, checked: 4, missing: 0 } }] };
+    }
+    return { candidates: [] };
+  });
+  let res = resolver.resolve({ item: trackItemFor(album, 0) });
+  for (let i = 0; i < 6 && res.pending; i++) res = resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.equal(res.sources.length, 0, "the single must not be offered for the album");
+  assert.equal(checks, 0, "no Usenet check is spent on it");
+});
+
+test("ranking a long result list stops when the slice is out of time instead of being cut off", () => {
+  const album = sampleDiscoveryAlbum();
+  const many: SourceCandidate[] = Array.from({ length: 300 }, (_, i) => ({
+    title: `Daft Punk - Discovery (2001) [FLAC] repost ${i}`,
+    nzbUrl: `https://althub.test/api?t=get&id=${i}`,
+    indexer: "altHUB",
+    size: 130_000_000,
+  }));
+  const { env } = makeFakeHost({
+    onResolve: (q) => (q.kind === "indexer_search" ? { candidates: many } : { candidates: [] }),
+  });
+  // A slow engine: every look at the clock is 120 ms later.
+  let now = 1_760_000_000_000;
+  env.now = () => (now += 120);
+  const logs: string[] = [];
+  env.log = (_level, line) => { logs.push(line); };
+  const cache = new KVCache(env);
+  cache.set(`album_v2:${album.id}`, album, 600_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  const ranked = logs.find((l) => /raw=300/.test(l)) || "";
+  assert.match(ranked, /unscored=\d+/, `the names not reached are counted: ${ranked}`);
+  assert.match(ranked, /usenet=[1-9]/, "the names scored in time are still used");
+});
+
+test("a 24-bit tag without a format word is read as lossless, in either order", () => {
+  const q = (title: string) => classifyReleaseQuality(title, undefined, "flac_preferred");
+  for (const title of [
+    "Metallica - 1991 - Metallica (The Black Album) (2001) 96-24",
+    "Artist - Album (1977) 24-96 vinyl",
+    "Artist - Album [24-192]",
+  ]) {
+    assert.equal(q(title).lossless, true, title);
+    assert.equal(q(title).tier, "flac24", title);
+  }
+  assert.equal(q("Artist - Album (1977) MP3 320").lossless, false);
+  assert.equal(q("Artist - Album 24-96 MP3").lossless, false, "a lossy format beside the tag wins");
+  // The files decide once they are listed.
+  assert.equal(q("Artist - Album 96-24").lossless, true);
+  assert.equal(
+    classifyReleaseQuality("Artist - Album 96-24", [{ index: 0, path: "01 - Song.mp3", size: 9_000_000 }], "flac_preferred").lossless,
+    false
+  );
+});
+
+test("an indexer that only errors does not keep a search open once the others have answered", () => {
+  const st = (...statuses: string[]) => ({ candidates: [], indexers: statuses.map((status) => ({ status })) });
+  assert.equal(searchIncomplete(st("answered", "answered", "error")), false);
+  assert.equal(searchIncomplete(st("answered", "skipped")), false);
+  assert.equal(searchIncomplete(st("answered", "pending")), true, "an indexer still searching keeps it open");
+  assert.equal(searchIncomplete(st("answered", "timed_out")), true);
+  assert.equal(searchIncomplete(st("error", "error")), true, "nobody answered: no verdict");
+  assert.equal(searchIncomplete({ candidates: [], pending: [{ id: "x" }] }), true);
+  assert.equal(searchIncomplete(null), true);
 });

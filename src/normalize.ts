@@ -79,15 +79,23 @@ export function tokensOf(input: string): string[] {
 export function textSimilarity(a: string, b: string): number {
   const na = normalizeText(a);
   const nb = normalizeText(b);
+  return similarityOfNormalized(na, tokenSetOfNormalized(na), nb, tokenSetOfNormalized(nb));
+}
+
+/** The words of a text that normalizeText has already been through. */
+export function tokenSetOfNormalized(norm: string): Set<string> {
+  return new Set(norm.split(" ").filter((t) => t.length > 0));
+}
+
+/**
+ * textSimilarity for texts already normalized and split: comparing every track with every file
+ * of a release would otherwise normalize the same strings thousands of times.
+ */
+export function similarityOfNormalized(na: string, setA: Set<string>, nb: string, setB: Set<string>): number {
   if (!na || !nb) return 0;
   if (na === nb) return 1;
+  if (setA.size === 0 || setB.size === 0) return 0;
 
-  const ta = tokensOf(na);
-  const tb = tokensOf(nb);
-  if (ta.length === 0 || tb.length === 0) return 0;
-
-  const setA = new Set(ta);
-  const setB = new Set(tb);
   let inter = 0;
   for (const t of setA) {
     if (setB.has(t)) inter++;
@@ -549,4 +557,59 @@ export function validExternalId(id: string): string {
     .replace(/^[^A-Za-z0-9]+/, "m")
     .slice(0, 120);
   return cleaned || "m-unknown";
+}
+
+/**
+ * Text an indexer's full-text search can match: Latin accents folded, punctuation turned into
+ * spaces ("AC/DC" -> "AC DC", "Beyoncé" -> "Beyonce"). Letters of other scripts are kept.
+ */
+export function indexerQueryText(input: string): string {
+  return String(input || "")
+    .replace(/[Ææ]/g, "ae")
+    .replace(/[Œœ]/g, "oe")
+    .replace(/[Øø]/g, "o")
+    .replace(/[ß]/g, "ss")
+    .replace(/[Łł]/g, "l")
+    .replace(/[À-ɏ]/g, (ch) => ch.normalize("NFD").replace(/[̀-ͯ]/g, ""))
+    .replace(/(?<=\p{L})\$(?=\p{L})/gu, "S")
+    .replace(/(?<=\p{L})!(?=\p{L})/gu, "i")
+    .replace(/['’`´]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+/**
+ * The spelling release names use when an artist's name is split by punctuation and written as
+ * one word ("AC/DC" -> "ACDC", "R.E.M." -> "REM", "blink-182" -> "blink182"). Empty when the
+ * name has no such word.
+ */
+export function joinedArtistSpelling(artist: string): string {
+  const words = String(artist || "").trim().split(/\s+/).filter(Boolean);
+  let changed = false;
+  const out = words.map((w) => {
+    if (!/[\p{L}\p{N}][\/.\-][\p{L}\p{N}]/u.test(w)) return w;
+    changed = true;
+    return w.replace(/[\/.\-]/g, "");
+  });
+  if (!changed) return "";
+  const joined = indexerQueryText(out.join(" "));
+  return joined && joined !== indexerQueryText(artist) ? joined : "";
+}
+
+/**
+ * An album or single title without "(feat. ...)", "[From ...]" and edition tags: what release
+ * names carry, used for searching and for comparing titles.
+ */
+export function coreReleaseTitle(title: string): string {
+  const original = String(title || "").trim();
+  let out = original;
+  let prev = "";
+  while (out !== prev) {
+    prev = out;
+    out = stripFeaturing(out)
+      .replace(/\s*[\(\[]\s*(?:from|music\s+from|original|soundtrack|ost)\b[^\)\]]*[\)\]]\s*$/i, "")
+      .trim();
+    out = stripEditionSuffix(out);
+  }
+  return out || original;
 }
