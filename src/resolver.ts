@@ -1383,8 +1383,10 @@ export class AlbumResolver {
     const synthId = `${recId}-${plan.idx}`;
     if (!this.cache.get<CanonicalAlbum>(`album_v2:${synthId}`)) {
       this.cache.set(`album_v2:${synthId}`, this.recordingAlbum(synthId, item, cand), ALBUM_CACHE_TTL_MS);
+      // Said once per release tried, not on every poll: Ether keeps a plugin's last 200 lines,
+      // and a waiting app polls several times a second.
+      this.env.log("info", `resolve-recording: ${recording} "${item.title}" try ${plan.idx + 1}/${plan.candidates.length} "${cand.artistName} - ${cand.title}" (${cand.releaseType})`);
     }
-    this.env.log("info", `resolve-recording: ${recording} "${item.title}" try ${plan.idx + 1}/${plan.candidates.length} "${cand.artistName} - ${cand.title}" (${cand.releaseType})`);
     const step = this.stepResolveAlbum(synthId, item, excluded, RESOLVE_STEP_BUDGET_MS, true);
     if (!step.done) return { pending: true, retryInMs: step.retryInMs ?? 250, sources: [] };
     if (step.inconclusive) return { sources: [], ttlSec: 30 };
@@ -1627,16 +1629,17 @@ export class AlbumResolver {
         return { done: true, verifiedCount: 0 };
       }
 
-      this.env.log(
-        "info",
-        `resolve-album: search ${album.id} "${album.artistName} - ${album.title}" (${album.year}, ${album.tracks.length} tracks)`
-      );
       const searched = this.searchAndRankCandidates(album, excluded, startMs, budgetMs);
       if (searched.deferredInFlight) {
         // Another worker is currently running the same album search; yield briefly without
         // firing a duplicate parallel search or caching a premature negative result.
         return { done: false, verifiedCount: 0, retryInMs: 350 };
       }
+      // Logged for a search that ran, not for each poll that waited on one.
+      this.env.log(
+        "info",
+        `resolve-album: search ${album.id} "${album.artistName} - ${album.title}" (${album.year}, ${album.tracks.length} tracks)`
+      );
       if (searched.incomplete && searched.ordered.length === 0) {
         return this.inconclusive(albumId);
       }
