@@ -2646,3 +2646,53 @@ test("an indexer that only errors does not keep a search open once the others ha
   assert.equal(searchIncomplete({ candidates: [], pending: [{ id: "x" }] }), true);
   assert.equal(searchIncomplete(null), true);
 });
+
+test("a release answered by a source plugin plays when nothing else has the album, and only then", () => {
+  const album = sampleDiscoveryAlbum();
+  const fromPlugin: SourceCandidate = {
+    title: "Daft Punk - Discovery (2001) [FLAC]",
+    indexer: "SlskSource",
+    size: 130_000_000,
+    pluginRelease: { plugin: "community.slsksource", id: "abc123" },
+  };
+  const files = album.tracks.map((t, i) => ({ index: i, path: `${String(i + 1).padStart(2, "0")} - ${t.title}.flac`, size: 30_000_000 }));
+
+  // 1. The plugin's release is the only candidate: it is listed through Ether and offered.
+  const listed: SourceCandidate[] = [];
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [fromPlugin] };
+    if (q.kind === "release_files") {
+      listed.push(q.candidate!);
+      return { candidates: [{ ...q.candidate!, files }] };
+    }
+    return { candidates: [] };
+  });
+  let res = resolver.resolve({ item: trackItemFor(album, 1) });
+  for (let i = 0; i < 6 && res.pending; i++) res = resolver.resolve({ item: trackItemFor(album, 1) });
+  assert.equal(res.sources.length, 1, "the plugin's release is offered");
+  const src = res.sources[0];
+  assert.equal(src.pattern, "release");
+  assert.deepEqual(src.release?.candidate?.pluginRelease, { plugin: "community.slsksource", id: "abc123" }, "Ether opens it through the plugin");
+  assert.equal(src.release?.fileIndex, 1, "by the file's place in the plugin's listing");
+  assert.match(src.label || "", /SlskSource/);
+  assert.equal(listed[0]?.pluginRelease?.id, "abc123", "release_files is asked with the plugin release");
+
+  // 2. With a Usenet release that verifies, the plugin's release is never asked for its files.
+  const usenet: SourceCandidate = { title: "Daft Punk - Discovery (2001) [FLAC]", nzbUrl: "https://althub.test/api?t=get&id=1", indexer: "altHUB", size: 130_000_000 };
+  const asked: string[] = [];
+  const both = resolverFor({ ...album, id: "al-302128" }, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [fromPlugin, usenet] };
+    if (q.kind === "release_files") {
+      asked.push(q.candidate?.pluginRelease ? "plugin" : "usenet");
+      return { candidates: [{ ...q.candidate!, files }] };
+    }
+    if (q.kind === "usenet_check") return { candidates: [{ nzbUrl: q.nzbUrl, usenetCheck: { available: true, checked: 4, missing: 0 } }] };
+    return { candidates: [] };
+  });
+  const item = { ...trackItemFor(album, 0), parentId: "al-302128" };
+  let r2 = both.resolve({ item });
+  for (let i = 0; i < 6 && r2.pending; i++) r2 = both.resolve({ item });
+  assert.equal(r2.sources.length, 1);
+  assert.ok(r2.sources[0].release?.candidate?.nzbUrl, "the Usenet release is the one offered");
+  assert.deepEqual(asked, ["usenet"], "the last resort is not touched");
+});

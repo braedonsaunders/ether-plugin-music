@@ -132,6 +132,8 @@ export interface SourceCandidate {
   codec?: string;
   files?: ReleaseFile[];
   usenetCheck?: UsenetCheckResult;
+  /** A release a source plugin answered a category search with: no hash, magnet or NZB. */
+  pluginRelease?: { plugin: string; id: string };
 }
 
 export interface SourceQuery {
@@ -322,7 +324,7 @@ export interface TrackFileMapping {
 
 export interface VerifiedAlbumRelease {
   releaseId: string;
-  sourceKind: "usenet" | "debrid";
+  sourceKind: "usenet" | "debrid" | "plugin";
   qualityTier: "flac24" | "flac" | "lossless" | "lossy_high" | "lossy";
   codec: string;
   mime: string;
@@ -350,7 +352,7 @@ export interface CachedAlbumResolution {
 
 export interface VerifiedConcertRelease {
   releaseId: string;
-  sourceKind: "usenet" | "debrid";
+  sourceKind: "usenet" | "debrid" | "plugin";
   qualityTier: "uhd" | "1080p" | "720p" | "sd";
   codec: string;
   mime: string;

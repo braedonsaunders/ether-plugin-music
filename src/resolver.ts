@@ -61,8 +61,10 @@ const RESOLVE_STEP_BUDGET_MS = 1400;
  */
 const USENET_CHECK_START_CUTOFF_MS = 1800;
 const MAX_CACHED_RELEASES = 3;
-const MAX_FILE_LIST_PROBES = 12;
 const MAX_USENET_PROBES = 10;
+const MAX_PLUGIN_PROBES = 4;
+// Room for every kind the shortlist can hold: 6 Debrid, the Usenet ones, 4 unconfirmed, the plugin ones.
+const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
@@ -183,6 +185,7 @@ function compactCandidateForMemo(c: SourceCandidate): SourceCandidate {
   if (typeof c.resolution === "number") out.resolution = c.resolution;
   if (c.source) out.source = c.source;
   if (c.codec) out.codec = c.codec;
+  if (c.pluginRelease) out.pluginRelease = { plugin: c.pluginRelease.plugin, id: c.pluginRelease.id };
   return out;
 }
 
@@ -249,7 +252,13 @@ interface ResolveStage {
   searchIncomplete?: boolean;
 }
 
+/** A release a source plugin answered the search with: Ether lists and opens it through that plugin. */
+export function isPluginCandidate(c: SourceCandidate): boolean {
+  return Boolean(c.pluginRelease?.plugin && c.pluginRelease?.id) && !c.infoHash && !c.magnet && !c.nzbUrl;
+}
+
 export function candidateRefOf(c: SourceCandidate): string {
+  if (isPluginCandidate(c)) return `plg:${c.pluginRelease!.plugin}:${c.pluginRelease!.id}`;
   if (c.infoHash) return `ih:${c.infoHash.toLowerCase()}`;
   if (c.nzbUrl) return `nzb:${c.nzbUrl}`;
   if (c.magnet) return `mag:${c.magnet.slice(0, 80)}`;
@@ -553,7 +562,11 @@ export function preScoreAlbumCandidate(
   // Strongly prefer cached Debrid releases because release_files returns exact inner audio paths
   // in ~150ms (unlike RAR-packed Usenet posts whose inner members cannot be inspected before download).
   const isUsenet = isUsenetCandidate(candidate);
-  if (candidate.cached && !isUsenet) {
+  if (isPluginCandidate(candidate)) {
+    // A source plugin's release lists its real files and opens on demand.
+    score += 4;
+    reasons.push("Source plugin");
+  } else if (candidate.cached && !isUsenet) {
     score += 22;
     reasons.push("Debrid cached");
   } else if (isUsenet) {
@@ -1905,6 +1918,8 @@ export class AlbumResolver {
       // The torrent option changes nothing for a Usenet release: one entry serves both askers.
       const key = usenet
         ? `u:${cand.title || ""}`
+        : isPluginCandidate(cand)
+        ? `p:${cand.title || ""}`
         : `${allowUnconfirmedTorrent ? 1 : 0}${cand.cached ? 1 : 0}${cand.infoHash || cand.magnet ? 1 : 0}:${cand.seeders ?? ""}:${cand.title || ""}`;
       let pre = scored.get(key);
       if (!pre) {
@@ -1927,7 +1942,7 @@ export class AlbumResolver {
     };
 
     const isWellMatched = (cand: SourceCandidate): boolean => {
-      if (!isUsenetCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
+      if (!isUsenetCandidate(cand) && !isPluginCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
       const pre = scoreOf(cand, true);
       return pre.accepted && pre.score >= 55;
     };
@@ -2041,7 +2056,7 @@ export class AlbumResolver {
     const preRanked: Array<{ cand: SourceCandidate; score: number }> = [];
     for (const cand of rawCandidates) {
       const isUsenet = isUsenetCandidate(cand);
-      if (!isUsenet && !cand.cached) continue;
+      if (!isUsenet && !cand.cached && !isPluginCandidate(cand)) continue;
 
       const pre = scoreOf(cand, false);
       if (!pre.accepted) continue;
@@ -2052,7 +2067,10 @@ export class AlbumResolver {
     // Guarantee cached Debrid candidates are probed first (up to 6) before Usenet NZB fetches,
     // and deduplicate Usenet candidates by normalized release title so 4 identical scene RAR reposts
     // never burn all probe slots ahead of unpacked P2P releases.
-    const debridRanked = preRanked.filter((x) => !isUsenetCandidate(x.cand));
+    const debridRanked = preRanked.filter((x) => !isUsenetCandidate(x.cand) && !isPluginCandidate(x.cand));
+    // Source-plugin releases (a peer-to-peer network behind a plugin) are the last resort:
+    // they are asked only after everything Usenet and Debrid offered.
+    const pluginRanked = preRanked.filter((x) => isPluginCandidate(x.cand));
     const usenetAll = preRanked.filter((x) => isUsenetCandidate(x.cand));
     const usenetDedup: Array<{ cand: SourceCandidate; score: number }> = [];
     const seenUsenetTitle = new Set<string>();
@@ -2086,10 +2104,11 @@ export class AlbumResolver {
       ...debridRanked.slice(0, 6),
       ...usenetDedup.slice(0, MAX_USENET_PROBES),
       ...unconfirmedDebrid.slice(0, 4),
+      ...pluginRanked.slice(0, MAX_PLUGIN_PROBES),
     ];
     this.env.log(
       "info",
-      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
+      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)} plugin=${pluginRanked.length}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
     );
     return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
   }
@@ -2272,18 +2291,19 @@ export class AlbumResolver {
           healthBonus = 8;
         }
       }
-      const srcTag = isUsenet ? (match.isArchive ? "Usenet Archive" : "Usenet") : "Debrid";
+      const isPlugin = isPluginCandidate(cand);
+      const srcTag = isUsenet ? (match.isArchive ? "Usenet Archive" : "Usenet") : isPlugin ? (cand.indexer || "Source plugin") : "Debrid";
       const coverageBonus = match.partial ? 0 : 35;
       const archivePenalty = match.isArchive ? -3 : 0;
       verified.push({
         releaseId: candidateRefOf(cand),
-        sourceKind: isUsenet ? "usenet" : "debrid",
+        sourceKind: isUsenet ? "usenet" : isPlugin ? "plugin" : "debrid",
         qualityTier: match.quality.tier,
         codec: match.quality.codec,
         mime: match.quality.mime,
         label: `${match.quality.label} · ${srcTag}`,
         score: Math.round((preScore + coverageBonus + healthBonus + archivePenalty + match.averageConfidence * 40 + match.quality.points * 0.5) * 10) / 10,
-        candidate: isUsenet ? cand : { ...cand, cached: true },
+        candidate: isUsenet || isPlugin ? cand : { ...cand, cached: true },
         tracks: match.tracks,
       });
       return false;
