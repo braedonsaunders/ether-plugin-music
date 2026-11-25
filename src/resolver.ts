@@ -36,9 +36,11 @@ import {
   joinedArtistSpelling,
   normalizeText,
   parseTrackFilename,
+  similarityOfNormalized,
   stripEditionSuffix,
   stripFeaturing,
   textSimilarity,
+  tokenSetOfNormalized,
   videoFormatOfPath,
 } from "./normalize.ts";
 
@@ -739,24 +741,34 @@ export function matchAlbumReleaseFiles(
     }
     const cleanGuess = stripFeaturing(stripEditionSuffix(parsed.titleGuess));
     const cleanBase = stripFeaturing(parsed.baseName);
+    const guessNorm = normalizeText(parsed.titleGuess);
+    const cleanGuessNorm = normalizeText(cleanGuess);
+    const cleanBaseNorm = normalizeText(cleanBase);
     return {
       ...af,
       parsed,
-      guessNorm: normalizeText(parsed.titleGuess),
+      guessNorm,
+      guessWords: tokenSetOfNormalized(guessNorm),
       cleanGuess,
-      cleanGuessNorm: normalizeText(cleanGuess),
+      cleanGuessNorm,
+      cleanGuessWords: tokenSetOfNormalized(cleanGuessNorm),
       cleanBase,
-      cleanBaseNorm: normalizeText(cleanBase),
+      cleanBaseNorm,
+      cleanBaseWords: tokenSetOfNormalized(cleanBaseNorm),
     };
   });
 
   const preparedTracks = album.tracks.map((tr) => {
     const cleanTitle = stripFeaturing(stripEditionSuffix(tr.title));
+    const titleNorm = normalizeText(tr.title);
+    const cleanTitleNorm = normalizeText(cleanTitle);
     return {
       tr,
-      titleNorm: normalizeText(tr.title),
+      titleNorm,
+      titleWords: tokenSetOfNormalized(titleNorm),
       cleanTitle,
-      cleanTitleNorm: normalizeText(cleanTitle),
+      cleanTitleNorm,
+      cleanTitleWords: tokenSetOfNormalized(cleanTitleNorm),
     };
   });
 
@@ -765,7 +777,7 @@ export function matchAlbumReleaseFiles(
   const pairs: Pair[] = [];
 
   for (let ti = 0; ti < preparedTracks.length; ti++) {
-    const { tr, titleNorm, cleanTitle, cleanTitleNorm } = preparedTracks[ti];
+    const { tr, titleNorm, titleWords, cleanTitleNorm, cleanTitleWords } = preparedTracks[ti];
 
     for (let fi = 0; fi < parsedFiles.length; fi++) {
       const pf = parsedFiles[fi];
@@ -779,9 +791,14 @@ export function matchAlbumReleaseFiles(
       ) {
         titleSim = 1.0;
       } else {
-        const simDirect = textSimilarity(tr.title, pf.parsed.titleGuess);
-        const simClean = textSimilarity(cleanTitle, pf.cleanGuess);
-        const simBase = pf.cleanBaseNorm === pf.cleanGuessNorm ? simClean : textSimilarity(cleanTitle, pf.cleanBase);
+        // Same result as textSimilarity on the raw strings, without normalizing them again per pair:
+        // a 100-track box set against its 100 files is 10,000 pairs.
+        const simDirect = similarityOfNormalized(titleNorm, titleWords, pf.guessNorm, pf.guessWords);
+        const simClean = similarityOfNormalized(cleanTitleNorm, cleanTitleWords, pf.cleanGuessNorm, pf.cleanGuessWords);
+        const simBase =
+          pf.cleanBaseNorm === pf.cleanGuessNorm
+            ? simClean
+            : similarityOfNormalized(cleanTitleNorm, cleanTitleWords, pf.cleanBaseNorm, pf.cleanBaseWords);
         titleSim = Math.max(simDirect, simClean, simBase * 0.9);
       }
       score += titleSim * 0.55;
@@ -818,7 +835,8 @@ export function matchAlbumReleaseFiles(
         score += 0.05;
       }
 
-      pairs.push({ trackIdx: ti, fileIdx: fi, score });
+      // A pair below the assignment floor is never used: leaving it out keeps the sort short.
+      if (score >= 0.42) pairs.push({ trackIdx: ti, fileIdx: fi, score });
     }
   }
 

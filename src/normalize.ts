@@ -79,15 +79,23 @@ export function tokensOf(input: string): string[] {
 export function textSimilarity(a: string, b: string): number {
   const na = normalizeText(a);
   const nb = normalizeText(b);
+  return similarityOfNormalized(na, tokenSetOfNormalized(na), nb, tokenSetOfNormalized(nb));
+}
+
+/** The words of a text that normalizeText has already been through. */
+export function tokenSetOfNormalized(norm: string): Set<string> {
+  return new Set(norm.split(" ").filter((t) => t.length > 0));
+}
+
+/**
+ * textSimilarity for texts already normalized and split: comparing every track with every file
+ * of a release would otherwise normalize the same strings thousands of times.
+ */
+export function similarityOfNormalized(na: string, setA: Set<string>, nb: string, setB: Set<string>): number {
   if (!na || !nb) return 0;
   if (na === nb) return 1;
+  if (setA.size === 0 || setB.size === 0) return 0;
 
-  const ta = tokensOf(na);
-  const tb = tokensOf(nb);
-  if (ta.length === 0 || tb.length === 0) return 0;
-
-  const setA = new Set(ta);
-  const setB = new Set(tb);
   let inter = 0;
   for (const t of setA) {
     if (setB.has(t)) inter++;
