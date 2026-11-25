@@ -1839,19 +1839,35 @@ export class AlbumResolver {
     let totalRawFromIndexer = 0;
     let incomplete = false;
 
+    // A candidate is scored once per search, however often ranking asks: scoring a hundred
+    // release names inside a sort is most of the 5 s a /resolve call is given.
+    const scored = new Map<string, { accepted: boolean; score: number; reasons: string[] }>();
+    const scoreOf = (cand: SourceCandidate, allowUnconfirmedTorrent: boolean) => {
+      const key = `${allowUnconfirmedTorrent ? 1 : 0}${cand.cached ? 1 : 0}${isUsenetCandidate(cand) ? 1 : 0}${cand.infoHash || cand.magnet ? 1 : 0}:${cand.seeders ?? ""}:${cand.title || ""}`;
+      let pre = scored.get(key);
+      if (!pre) {
+        pre = preScoreAlbumCandidate(
+          cand,
+          album,
+          this.settings.qualityPreference,
+          allowUnconfirmedTorrent ? { allowUnconfirmedTorrent: true } : undefined
+        );
+        scored.set(key, pre);
+      }
+      return pre;
+    };
+
     const isWellMatched = (cand: SourceCandidate): boolean => {
       if (!isUsenetCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
-      const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference, {
-        allowUnconfirmedTorrent: true,
-      });
+      const pre = scoreOf(cand, true);
       return pre.accepted && pre.score >= 55;
     };
 
     const prioritizeForMemo = (cands: SourceCandidate[]): SourceCandidate[] => {
       if (cands.length <= SEARCH_MEMO_MAX_CANDIDATES) return cands;
       return [...cands].sort((a, b) => {
-        const pa = preScoreAlbumCandidate(a, album, this.settings.qualityPreference, { allowUnconfirmedTorrent: true });
-        const pb = preScoreAlbumCandidate(b, album, this.settings.qualityPreference, { allowUnconfirmedTorrent: true });
+        const pa = scoreOf(a, true);
+        const pb = scoreOf(b, true);
         if (pa.accepted !== pb.accepted) return pa.accepted ? -1 : 1;
         return pb.score - pa.score;
       });
@@ -1951,7 +1967,7 @@ export class AlbumResolver {
       const isUsenet = isUsenetCandidate(cand);
       if (!isUsenet && !cand.cached) continue;
 
-      const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference);
+      const pre = scoreOf(cand, false);
       if (!pre.accepted) continue;
       preRanked.push({ cand, score: pre.score });
     }
@@ -1980,9 +1996,7 @@ export class AlbumResolver {
       for (const cand of rawCandidates) {
         if (isUsenetCandidate(cand) || cand.cached) continue;
         if (!cand.infoHash && !cand.magnet) continue;
-        const pre = preScoreAlbumCandidate(cand, album, this.settings.qualityPreference, {
-          allowUnconfirmedTorrent: true,
-        });
+        const pre = scoreOf(cand, true);
         if (!pre.accepted || pre.score < 45) continue;
         unconfirmedDebrid.push({ cand, score: pre.score });
       }
