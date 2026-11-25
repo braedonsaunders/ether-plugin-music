@@ -68,7 +68,7 @@ const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v9:${albumId}`;
+  return `alb_rel_v10:${albumId}`;
 }
 
 function recordingPlanKey(isrc: string): string {
