@@ -68,7 +68,7 @@ const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v10:${albumId}`;
+  return `alb_rel_v11:${albumId}`;
 }
 
 function recordingPlanKey(isrc: string): string {
@@ -813,6 +813,10 @@ export function matchAlbumReleaseFiles(
         (cleanTitleNorm && (cleanTitleNorm === pf.cleanGuessNorm || cleanTitleNorm === pf.guessNorm))
       ) {
         titleSim = 1.0;
+      } else if (opts?.allowPartial) {
+        // A partial folder is taken on trust for the tracks it names, so a near miss is not
+        // enough: "Song (Holiday Ver.)" is not "Song (JUNGWON Ver.)", whatever their numbers say.
+        continue;
       } else {
         // Same result as textSimilarity on the raw strings, without normalizing them again per pair:
         // a 100-track box set against its 100 files is 10,000 pairs.

@@ -2734,3 +2734,30 @@ test("a source plugin's folder with only some of the album serves the tracks it 
   const other = [0, 1, 2].map((i) => ({ index: i, path: `0${i + 1} - Some Other Song ${i}.flac`, size: 30_000_000 }));
   assert.equal(matchAlbumReleaseFiles(album, "Daft Punk - Discovery (2001) [FLAC]", other, "flac_preferred", { allowPartial: true }).matched, false);
 });
+
+test("a partial folder serves only the tracks it names exactly", () => {
+  const titles = ["I Want You", "I Want You (JUNGWON Ver.)", "I Want You (JAY Ver.)", "I Want You (JAKE Ver.)"];
+  const album: CanonicalAlbum = {
+    ...sampleDiscoveryAlbum(),
+    id: "al-1148845481",
+    artistName: "ENHYPEN",
+    title: "I Want You (ENHYPEN Remix)",
+    year: 2026,
+    trackCount: titles.length,
+    tracks: titles.map((title, i) => ({ id: `tr-${i + 1}`, deezerTrackId: i + 1, title, disc: 1, trackNumber: i + 1, durationSec: 197, explicit: false, artistName: "ENHYPEN" })),
+  };
+  const file = (name: string, i: number) => ({ index: i, path: name, size: 44_000_000 });
+  // The folder of the remix release: every version but the plain song.
+  const own = ["01-02. I Want You (JUNGWON Ver.).flac", "01-03. I Want You (JAY Ver.).flac", "01-04. I Want You (JAKE Ver.).flac"].map(file);
+  const m = matchAlbumReleaseFiles(album, "(2026) I Want You (ENHYPEN Remix) [FLAC]", own, "flac_preferred", { allowPartial: true });
+  assert.equal(m.matched, true);
+  assert.deepEqual(Object.keys(m.tracks).sort(), ["tr-2", "tr-3", "tr-4"], "the plain song is not in it");
+  assert.equal(m.tracks["tr-2"].file, "01-02. I Want You (JUNGWON Ver.).flac");
+  // Another remix set with the same numbering is other recordings.
+  const others = ["01-02. I Want You (Holiday Ver.).flac", "01-03. I Want You (Sped Up Ver.).flac", "01-04. I Want You (Slowed Ver.).flac"].map(file);
+  assert.equal(matchAlbumReleaseFiles(album, "ENHYPEN - (2026) I Want You (Remix) [FLAC]", others, "flac_preferred", { allowPartial: true }).matched, false);
+  // The single holds the plain song and only that.
+  const single = matchAlbumReleaseFiles(album, "ENHYPEN - I Want You [FLAC]", [file("01 - I Want You.flac", 0)], "flac_preferred", { allowPartial: true });
+  assert.equal(single.matched, true);
+  assert.deepEqual(Object.keys(single.tracks), ["tr-1"]);
+});
