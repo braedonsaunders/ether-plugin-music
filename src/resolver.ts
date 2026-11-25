@@ -428,21 +428,30 @@ export function archiveMembersContradictAlbum(
   members: Array<{ path: string }>
 ): boolean {
   if (members.length === 0) return false;
-  const want = new Map<string, number>();
+  const titles = new Map<string, number>();
   for (const tr of album.tracks) {
     const k = normalizeText(coreReleaseTitle(tr.title));
-    if (k) want.set(k, (want.get(k) || 0) + 1);
+    if (k) titles.set(k, (titles.get(k) || 0) + 1);
   }
-  const have = new Map<string, number>();
+  // A member names a track when its file name carries the track's title, whatever else is in
+  // it ("01-artist-track_title", "Artist - Track Title (Live)").
+  const copies = new Map<string, number>();
   let named = 0;
   for (const m of members) {
-    const k = normalizeText(coreReleaseTitle(parseTrackFilename(m.path).titleGuess));
-    if (!k || !want.has(k)) continue;
+    const base = (m.path.replace(/\\/g, "/").split("/").pop() || m.path).replace(/\.[^.]+$/, "");
+    const name = ` ${normalizeText(base)} `;
+    let title = "";
+    for (const k of titles.keys()) {
+      if (k.length > title.length && name.includes(` ${k} `)) title = k;
+    }
+    if (!title) continue;
     named++;
-    have.set(k, (have.get(k) || 0) + 1);
+    // The same file name in two formats or folders is the same recording twice.
+    const key = `${title}|${name}`;
+    copies.set(key, (copies.get(key) || 0) + 1);
   }
-  for (const [k, n] of have) {
-    if (n > (want.get(k) || 0)) return true;
+  for (const [key, n] of copies) {
+    if (n > (titles.get(key.split("|")[0]) || 0)) return true;
   }
   return members.length >= 3 && named * 2 < members.length;
 }

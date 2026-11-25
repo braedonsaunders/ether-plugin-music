@@ -2526,6 +2526,16 @@ test("archive members that are not the album stop the archive fallback", () => {
     false
   );
   assert.equal(archiveMembersContradictAlbum(album, []), false, "nothing listed says nothing");
+  // Scene file names carry the artist and underscores: they still name the album's tracks.
+  assert.equal(
+    archiveMembersContradictAlbum(album, [
+      { path: "01-daft_punk-one_more_time.flac" },
+      { path: "02-daft_punk-aerodynamic.flac" },
+      { path: "03-daft_punk-digital_love.flac" },
+      { path: "00-daft_punk-discovery-cd-flac-2001.nfo.flac" },
+    ]),
+    false
+  );
 
   // End to end: a multi-volume release whose listed members are a single in two formats is not
   // offered as the album, whatever its Usenet health.
