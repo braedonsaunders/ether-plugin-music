@@ -2696,3 +2696,41 @@ test("a release answered by a source plugin plays when nothing else has the albu
   assert.ok(r2.sources[0].release?.candidate?.nzbUrl, "the Usenet release is the one offered");
   assert.deepEqual(asked, ["usenet"], "the last resort is not touched");
 });
+
+test("a source plugin's folder with only some of the album serves the tracks it has", () => {
+  const album = sampleDiscoveryAlbum();
+  const folder = (id: string, idxs: number[]): { cand: SourceCandidate; files: Array<{ index: number; path: string; size: number }> } => ({
+    cand: { title: "Daft Punk - Discovery (2001) [FLAC]", indexer: "SlskSource", size: 60_000_000, pluginRelease: { plugin: "community.slsksource", id } },
+    files: idxs.map((ti, i) => ({ index: i, path: `${String(ti + 1).padStart(2, "0")} - ${album.tracks[ti].title}.flac`, size: 30_000_000 })),
+  });
+  const a = folder("first", [0, 1, 2]);
+  const b = folder("second", [3]);
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [a.cand, b.cand] };
+    if (q.kind === "release_files") {
+      const f = q.candidate?.pluginRelease?.id === "first" ? a.files : b.files;
+      return { candidates: [{ ...q.candidate!, files: f }] };
+    }
+    return { candidates: [] };
+  });
+  const play = (ti: number) => {
+    let r = resolver.resolve({ item: trackItemFor(album, ti) });
+    for (let i = 0; i < 8 && r.pending; i++) r = resolver.resolve({ item: trackItemFor(album, ti) });
+    return r;
+  };
+  const second = play(1);
+  assert.equal(second.sources.length, 1, "a track the first folder has");
+  assert.equal(second.sources[0].release?.candidate?.pluginRelease?.id, "first");
+  assert.equal(second.sources[0].release?.fileIndex, 1);
+  const fourth = play(3);
+  assert.equal(fourth.sources[0]?.release?.candidate?.pluginRelease?.id, "second", "a track only the other folder has");
+  assert.equal(fourth.sources[0]?.release?.fileIndex, 0);
+
+  // A Usenet release still has to be the whole album.
+  const part = matchAlbumReleaseFiles(album, "Daft Punk - Discovery (2001) [FLAC]", a.files, "flac_preferred");
+  assert.equal(part.matched, false);
+  assert.equal(matchAlbumReleaseFiles(album, "Daft Punk - Discovery (2001) [FLAC]", a.files, "flac_preferred", { allowPartial: true }).matched, true);
+  // A folder of other songs is not this album, however partial it may be.
+  const other = [0, 1, 2].map((i) => ({ index: i, path: `0${i + 1} - Some Other Song ${i}.flac`, size: 30_000_000 }));
+  assert.equal(matchAlbumReleaseFiles(album, "Daft Punk - Discovery (2001) [FLAC]", other, "flac_preferred", { allowPartial: true }).matched, false);
+});

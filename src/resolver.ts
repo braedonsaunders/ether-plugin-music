@@ -68,7 +68,7 @@ const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v8:${albumId}`;
+  return `alb_rel_v9:${albumId}`;
 }
 
 function recordingPlanKey(isrc: string): string {
@@ -688,7 +688,11 @@ export function matchAlbumReleaseFiles(
   album: CanonicalAlbum,
   releaseTitle: string,
   files: ReleaseFile[],
-  pref: QualityPreference
+  pref: QualityPreference,
+  // allowPartial: a folder that holds only some of the album's tracks still serves those tracks,
+  // provided its own files are the album's. For a last-resort source, where what one person
+  // shares is all there is.
+  opts?: { allowPartial?: boolean }
 ): AlbumFileMatchResult {
   const expanded = expandReleaseFiles(files);
   const emptyFail = (reason: string): AlbumFileMatchResult => ({
@@ -734,7 +738,7 @@ export function matchAlbumReleaseFiles(
   const isExpandedCanonical =
     stripEditionSuffix(album.title).toLowerCase() !== album.title.trim().toLowerCase() ||
     /\b(?:deluxe|anniversary|expanded|complete|special|super|bonus|encore|remaster|legacy|ultimate|edition)\b/i.test(album.title);
-  const minRequiredFiles = isExpandedCanonical ? Math.min(canonicalCount, 5) : canonicalCount;
+  const minRequiredFiles = opts?.allowPartial ? 1 : isExpandedCanonical ? Math.min(canonicalCount, 5) : canonicalCount;
   if (audioFiles.length < minRequiredFiles) {
     return emptyFail(`incomplete release: ${audioFiles.length} audio files < ${minRequiredFiles} tracks`);
   }
@@ -902,7 +906,7 @@ export function matchAlbumReleaseFiles(
 
   const fullCoverage = usedTracks.size >= canonicalCount;
   const partialEditionAllowed =
-    isExpandedCanonical &&
+    (isExpandedCanonical || Boolean(opts?.allowPartial)) &&
     usedTracks.size >= minRequiredFiles &&
     usedTracks.size >= Math.ceil(audioFiles.length * 0.8);
 
@@ -2257,7 +2261,9 @@ export class AlbumResolver {
     }
 
     const matchAt = this.env.now();
-    const match = matchAlbumReleaseFiles(album, cand.title || "", files, this.settings.qualityPreference);
+    const match = matchAlbumReleaseFiles(album, cand.title || "", files, this.settings.qualityPreference, {
+      allowPartial: isPluginCandidate(cand),
+    });
     this.env.log(
       "debug",
       `resolve-album: probe ${album.id} "${(cand.title || "").slice(0, 60)}" files=${files.length} listed in ${listedMs}ms matched in ${this.env.now() - matchAt}ms at=${this.env.now() - startMs}ms`
@@ -2325,7 +2331,7 @@ export class AlbumResolver {
     if (!isUsenet || archiveFiles.length === 0 || expandedCompleteListing) {
       this.env.log(
         "debug",
-        `resolve-album: reject ${album.id} [${isUsenet ? "usenet" : "debrid"}] "${(cand.title || "").slice(0, 60)}" files=${files.length} reason=${match.reason || "unmatched"}`
+        `resolve-album: reject ${album.id} [${isUsenet ? "usenet" : isPluginCandidate(cand) ? "plugin" : "debrid"}] "${(cand.title || "").slice(0, 60)}" files=${files.length} reason=${match.reason || "unmatched"}`
       );
     }
 
