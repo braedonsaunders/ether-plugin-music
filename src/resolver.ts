@@ -408,6 +408,10 @@ interface SearchQueryMemo {
 const SOURCE_HEALTH_KEY = "src_health_v1";
 const SOURCE_HEALTH_WINDOW_MS = 6 * HOUR_MS;
 const SOURCE_HEALTH_REFRESH_MS = 5 * 60 * 1000;
+/** Set while a source that normally answers reports errors; a miss found meanwhile lives this long. */
+const SOURCE_DOWN_KEY = "src_down_v1";
+const SOURCE_DOWN_MEMO_MS = 3 * 60 * 1000;
+const MISS_TTL_WHILE_DOWN_MS = 2 * 60 * 1000;
 /** How many times one album's or concert's inconclusive search is tried again in a few minutes. */
 const MAX_INCONCLUSIVE_SEARCHES = 8;
 const INCONCLUSIVE_WINDOW_MS = 3 * 60 * 1000;
@@ -2233,7 +2237,8 @@ export class AlbumResolver {
    * SOURCE_HEALTH_WINDOW_MS. Sources that answer are remembered as healthy as a side effect.
    */
   private sourcesDown(statuses: Array<{ indexerId?: string; status?: string }>): string[] {
-    const seen = this.cache.get<Record<string, number>>(SOURCE_HEALTH_KEY) || {};
+    const stored = this.cache.get<Record<string, number>>(SOURCE_HEALTH_KEY);
+    const seen: Record<string, number> = typeof stored === "object" && stored !== null && !Array.isArray(stored) ? stored : {};
     const now = this.env.now();
     let changed = false;
     const down: string[] = [];
@@ -2253,7 +2258,16 @@ export class AlbumResolver {
       for (const id of Object.keys(seen)) if (now - seen[id] > SOURCE_HEALTH_WINDOW_MS) delete seen[id];
       this.cache.set(SOURCE_HEALTH_KEY, seen, SOURCE_HEALTH_WINDOW_MS);
     }
+    if (down.length > 0) this.cache.set(SOURCE_DOWN_KEY, now, SOURCE_DOWN_MEMO_MS);
     return down;
+  }
+
+  /**
+   * How long a miss is remembered: as asked, unless a source that normally answers was down in
+   * the last minutes; then briefly, because the miss may be the outage's and not the world's.
+   */
+  private missTtlMs(ttlMs: number): number {
+    return this.cache.get<number>(SOURCE_DOWN_KEY) ? Math.min(ttlMs, MISS_TTL_WHILE_DOWN_MS) : ttlMs;
   }
 
   /**
@@ -2506,8 +2520,9 @@ export class AlbumResolver {
 
   private rememberRecordingMiss(recId: string): void {
     const now = this.env.now();
-    const record: CachedAlbumResolution = { albumId: recId, resolvedAt: now, expiresAt: now + NEGATIVE_UNMATCHED_CACHE_TTL_MS, releases: [], negative: true };
-    this.cache.set(albumCacheKey(recId), record, NEGATIVE_UNMATCHED_CACHE_TTL_MS);
+    const ttlMs = this.missTtlMs(NEGATIVE_UNMATCHED_CACHE_TTL_MS);
+    const record: CachedAlbumResolution = { albumId: recId, resolvedAt: now, expiresAt: now + ttlMs, releases: [], negative: true };
+    this.cache.set(albumCacheKey(recId), record, ttlMs);
   }
 
   /** The one-song "album" searched for on another release of its recording. */
@@ -2663,10 +2678,10 @@ export class AlbumResolver {
       const list = Array.isArray(res?.candidates) ? res.candidates : [];
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
       // A source that answered within the last hours and now reports an error is down, not
-      // empty (Soulseek offline, an indexer paused): what this search says is no verdict, so it
-      // counts as unfinished and no miss is remembered from it.
+      // empty (Soulseek offline, an indexer paused). The search goes on as usual with what the
+      // others answered; only a miss found meanwhile is remembered briefly (see missTtlMs).
       const degraded = this.sourcesDown((res as { indexers?: Array<{ indexerId?: string; status?: string }> } | null)?.indexers || []);
-      const incomplete = searchIncomplete(res) || degraded.length > 0;
+      const incomplete = searchIncomplete(res);
       if (degraded.length > 0) this.env.log("debug", `indexer_search ${entityId} sources down that normally answer: ${degraded.join(", ").slice(0, 120)}`);
       const statusCounts: Record<string, number> = {};
       for (const st of ((res as { indexers?: Array<{ status?: string }> } | null)?.indexers || [])) {
@@ -3001,10 +3016,11 @@ export class AlbumResolver {
     }
 
     const now = this.env.now();
-    const negTtlMs =
+    const negTtlMs = this.missTtlMs(
       (stage.rawCandidateCount || 0) > 0
         ? NEGATIVE_UNMATCHED_CACHE_TTL_MS
-        : NEGATIVE_EMPTY_CACHE_TTL_MS;
+        : NEGATIVE_EMPTY_CACHE_TTL_MS
+    );
     const ttlMs = finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : negTtlMs;
     // Which candidates were listed, and whether that was all of the shortlist: a later play of
     // a track none of the releases serves goes on from here instead of starting over.
@@ -4405,10 +4421,11 @@ export class AlbumResolver {
     }
 
     const now = this.env.now();
-    const negTtlMs =
+    const negTtlMs = this.missTtlMs(
       (stage.rawCandidateCount || 0) > 0
         ? NEGATIVE_UNMATCHED_CACHE_TTL_MS
-        : NEGATIVE_EMPTY_CACHE_TTL_MS;
+        : NEGATIVE_EMPTY_CACHE_TTL_MS
+    );
     const ttlMs = finalReleases.length > 0 ? ALBUM_CACHE_TTL_MS : negTtlMs;
     const record: CachedConcertResolution = {
       concertId,
