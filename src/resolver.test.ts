@@ -4676,3 +4676,29 @@ test("build 19 / 3: candidates the call had no time to score are carried to the 
   assert.ok(!h.logs.some((l) => /dropped .*not scored: out of time/.test(l)), "never dropped for want of time");
   assert.equal(preScoreAlbumCandidate({ title: "Band, The - The Last Waltz, Disc 2 [FLAC]", nzbUrl: "https://nzb.test/d2", size: 300_000_000 }, { artistName: "The Band", title: "The Last Waltz", year: 2002, releaseType: "album", durationSec: 1200 }, "flac_preferred").accepted, true);
 });
+
+test("build 19 / 4: in a requested box set, the folder of the sub-album the track is known to sit on is listed first; the song query is sent on a repeat that has a source", () => {
+  const titles = ["Risque", "Good Times", "Take It Off", "Telling Lies", "My Forbidden Lover", "Dance Dance Dance"];
+  const album = albumOf("al-9580", "Chic", "The Studio Album Collection 1977-1992", 2014, titles, {}, 160);
+  const item = trackItemFor(album, 3);
+  const mk = (n: string): SourceCandidate => ({ title: n, indexer: "SlskSource", size: 400_000_000, pluginRelease: { plugin: "community.slsksource", id: n } });
+  const cands = [mk("Chic - Studio Album Collection - CD02 [FLAC]"), mk("Chic - Studio Album Collection - CD03 [FLAC]"), mk("Chic - Studio Album Collection - Take It Off [FLAC]")];
+  const listed: string[] = [];
+  const sent: string[] = [];
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") { sent.push(q.query || ""); return { candidates: cands }; }
+    if (q.kind === "release_files") { listed.push(q.candidate!.pluginRelease!.id); return { candidates: [{ ...q.candidate!, files: filesOf(["01 - Nothing Here.flac"], 30_000_000) }] }; }
+    return { candidates: [] };
+  });
+  const rel = verifiedFor(album, "box", { trackIdx: 3, partial: true, file: "Box/1981 - Take It Off/5-05 - Telling Lies.flac" });
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: false, resumes: 0, probedRefs: [], releases: [rel] }, 3_600_000);
+  assert.equal(h.play(item).sources.length, 1);
+  advance(h, 10_000);
+  const r = h.play(item);
+  assert.equal(r.sources.length, 1, "the known source answers throughout");
+  assertAllChecked(r.sources);
+  assert.match(listed[0], /Take It Off/, listed.join(" | "));
+  // The search is used up: the song's query runs on later repeats, with the source still answering.
+  for (let i = 0; i < 4; i++) { advance(h, 10_000); assert.equal(h.play(item).sources.length, 1); }
+  assert.ok(sent.some((q) => /^Chic Telling Lies$/.test(q)), sent.join(" | "));
+});

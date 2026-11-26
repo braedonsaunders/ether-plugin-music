@@ -2218,6 +2218,22 @@ export class AlbumResolver {
     this.cache.set(key, state, TRACK_QUERY_TTL_MS);
   }
 
+  /** Folder words and disc of the wanted track's file in a release already verified (box sets), when known. */
+  private placeHintOf(item: KindItem, rec: CachedAlbumResolution | null): { folderWords: string[]; disc: number } | undefined {
+    if (!rec || rec.negative) return undefined;
+    for (const r of rec.releases) {
+      const path = r.tracks[item.id]?.file || r.tracks[item.id]?.fileHint;
+      if (!path) continue;
+      const parts = path.replace(/\\/g, "/").split("/");
+      if (parts.length < 2) continue;
+      const folder = parts[parts.length - 2].replace(/^\s*(?:19|20)\d\d\s*[-.]?\s*/, "");
+      const words = normalizeTitleKey(folder).split(" ").filter((w) => w.length >= 2 && !/^(?:cd|disc|disk)\d*$/.test(w) && !/^\d+$/.test(w));
+      const disc = parseTrackFilename(path).disc ?? 0;
+      if (words.length >= 2 || disc > 0) return { folderWords: words, disc };
+    }
+    return undefined;
+  }
+
   /**
    * A repeat with nothing new and the album's search used up: the song's queries run (one per call,
    * see missOnAlbum) and what they list joins the album's record; the sources known before are in
@@ -2709,7 +2725,7 @@ export class AlbumResolver {
       const prior = excluded.size === 0 || trackQuery ? priorRec : null;
       const earlier = prior && !prior.negative && prior.releases.length > 0 ? prior : null;
       const skipRefs = (trackQuery ? priorRec?.probedRefs : earlier?.probedRefs) || [];
-      const searched = this.searchAndRankCandidates(album, excluded, startMs, budgetMs, new Set(skipRefs), item.id, trackQuery);
+      const searched = this.searchAndRankCandidates(album, excluded, startMs, budgetMs, new Set(skipRefs), item.id, trackQuery, this.placeHintOf(item, priorRec));
       if (searched.deferredInFlight) {
         // Another worker is currently running the same album search; yield briefly without
         // firing a duplicate parallel search or caching a premature negative result.
@@ -3004,7 +3020,9 @@ export class AlbumResolver {
     skipRefs: Set<string> = new Set(),
     wantedId?: string,
     /** The song query phase: only this query is sent, and names are judged leniently. */
-    trackQuery?: string
+    trackQuery?: string,
+    /** Where an already verified release holds the wanted track: its folder and disc point to the right part of a box set. */
+    placeHint?: { folderWords: string[]; disc: number }
   ): {
     ordered: Array<{ cand: SourceCandidate; score: number; volume?: boolean }>;
     rawCount: number;
@@ -3313,6 +3331,15 @@ export class AlbumResolver {
       droppedAtNames.push({ name: m.cand.title || "", indexer: m.cand.indexer, reason: "name does not tie it to the song (beyond the few listed)" });
     }
 
+    if (placeHint) {
+      // A requested box set: the folder of the sub-album (or the disc) the track is known to sit on is probed first.
+      const discRe = placeHint.disc > 0 ? new RegExp(`(?:^|[^a-z0-9])(?:cd|disc|disk|d)\\s*0?${placeHint.disc}(?![0-9])`, "i") : null;
+      for (const r of preRanked) {
+        const key = ` ${normalizeTitleKey(r.cand.title || "")} `;
+        const folderHit = placeHint.folderWords.length >= 2 && placeHint.folderWords.every((w) => key.includes(` ${w} `));
+        if (folderHit || (discRe && discRe.test(r.cand.title || ""))) r.score += 40;
+      }
+    }
     preRanked.sort((a, b) => b.score - a.score);
     // Guarantee cached Debrid candidates are probed first (up to 6) before Usenet NZB fetches,
     // and deduplicate Usenet candidates by normalized release title so 4 identical scene RAR reposts
