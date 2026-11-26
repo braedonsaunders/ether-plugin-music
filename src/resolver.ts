@@ -106,7 +106,7 @@ export function formatDroppedAtNameRanking(
 }
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v11:${albumId}`;
+  return `alb_rel_v12:${albumId}`;
 }
 
 function recordingPlanKey(isrc: string): string {
