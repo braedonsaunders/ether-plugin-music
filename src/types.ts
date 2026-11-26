@@ -364,6 +364,8 @@ export interface CachedAlbumResolution {
   probedRefs?: string[];
   /** How often the search went on for a track the cached releases did not serve. */
   resumes?: number;
+  /** The last search behind this record had indexers still running, timed out or failed: it is not a verdict. */
+  searchIncomplete?: boolean;
 }
 
 export interface VerifiedConcertRelease {

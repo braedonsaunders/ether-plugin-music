@@ -53,6 +53,8 @@ const ALBUM_CACHE_TTL_MS = 24 * HOUR_MS;
 const NEGATIVE_EMPTY_CACHE_TTL_MS = 30 * 60 * 1000;
 const NEGATIVE_UNMATCHED_CACHE_TTL_MS = 60 * 60 * 1000;
 const NEGATIVE_RESPONSE_EMPTY_TTL_SEC = 600;
+/** How long an empty answer stands when the search behind it was not finished: the host asks again soon. */
+const INCOMPLETE_EMPTY_TTL_SEC = 30;
 const NEGATIVE_RESPONSE_UNMATCHED_TTL_SEC = 900;
 const STAGE_CACHE_TTL_MS = 2 * 60 * 1000;
 const SEARCH_DEDUP_WINDOW_MS = 5 * 60 * 1000;
@@ -123,7 +125,7 @@ export function formatDroppedAtNameRanking(
 }
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v13:${albumId}`;
+  return `alb_rel_v14:${albumId}`;
 }
 
 /**
@@ -1765,7 +1767,13 @@ export class AlbumResolver {
         // shortlist was not finished: the search goes on from where it stopped (below).
       } else {
         // The album was found but not this song on it: look for the song on its other releases.
-        return this.resolveRecording(item, excluded, NEGATIVE_RESPONSE_EMPTY_TTL_SEC);
+        // A search that never finished is no verdict: a short answer, and nothing remembered.
+        return this.resolveRecording(
+          item,
+          excluded,
+          cached.searchIncomplete ? INCOMPLETE_EMPTY_TTL_SEC : NEGATIVE_RESPONSE_EMPTY_TTL_SEC,
+          Boolean(cached.searchIncomplete)
+        );
       }
     }
 
@@ -1777,14 +1785,29 @@ export class AlbumResolver {
         sources: [],
       };
     }
-    if (step.inconclusive) return { sources: [], ttlSec: 30 };
+    if (step.inconclusive) {
+      // The search stayed unfinished through its tries. Releases found earlier hold other tracks
+      // but not this one: only now is the song looked for on its other releases, briefly and
+      // without remembering a miss.
+      if (excluded.size === 0 && cached && !cached.negative && cached.releases.length > 0) {
+        return this.resolveRecording(item, excluded, INCOMPLETE_EMPTY_TTL_SEC, true);
+      }
+      return { sources: [], ttlSec: INCOMPLETE_EMPTY_TTL_SEC };
+    }
 
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (!fresh || fresh.releases.length === 0) {
       return this.resolveRecording(item, excluded, fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC);
     }
     const sources = this.buildTrackSources(item, fresh.releases, excluded);
-    if (sources.length === 0) return this.resolveRecording(item, excluded, NEGATIVE_RESPONSE_EMPTY_TTL_SEC);
+    if (sources.length === 0) {
+      return this.resolveRecording(
+        item,
+        excluded,
+        fresh.searchIncomplete ? INCOMPLETE_EMPTY_TTL_SEC : NEGATIVE_RESPONSE_EMPTY_TTL_SEC,
+        Boolean(fresh.searchIncomplete)
+      );
+    }
     return { sources, ttlSec: 3600 };
   }
 
@@ -1792,9 +1815,10 @@ export class AlbumResolver {
    * One song whose album gave no playable copy of it: find it on another release that carries
    * the same recording (by ISRC: a single, an EP, another edition, a compilation), one release per
    * slice through the same staged album resolver, and remember the answer per recording so every
-   * album holding that song plays it. Without an ISRC the album's answer stands.
+   * album holding that song plays it. Without an ISRC the album's answer stands. `noMemory`: the
+   * album's own search was not finished, so no "nothing for this recording" is written.
    */
-  private resolveRecording(item: KindItem, excluded: Set<string>, emptyTtlSec: number): KindResolveResponse {
+  private resolveRecording(item: KindItem, excluded: Set<string>, emptyTtlSec: number, noMemory = false): KindResolveResponse {
     const hints = (item.hints || {}) as Record<string, unknown>;
     const recording = recordingOf(String(hints.isrc || ""));
     if (!recording) return { sources: [], ttlSec: emptyTtlSec };
@@ -1817,7 +1841,7 @@ export class AlbumResolver {
       if (looked.status === "failed") return { sources: [], ttlSec: 30 };
       const candidates = looked.status === "ok" ? pickRecordingReleases(looked.releases, String(hints.albumTitle || "")) : [];
       if (candidates.length === 0) {
-        this.rememberRecordingMiss(recId);
+        if (!noMemory) this.rememberRecordingMiss(recId);
         return { sources: [], ttlSec: emptyTtlSec };
       }
       plan = { candidates, idx: 0 };
@@ -1844,7 +1868,7 @@ export class AlbumResolver {
     plan.idx++;
     if (plan.idx >= plan.candidates.length) {
       this.cache.delete(recordingPlanKey(isrc));
-      this.rememberRecordingMiss(recId);
+      if (!noMemory) this.rememberRecordingMiss(recId);
       return { sources: [], ttlSec: emptyTtlSec };
     }
     this.cache.set(recordingPlanKey(isrc), plan, ALBUM_CACHE_TTL_MS);
@@ -2146,7 +2170,9 @@ export class AlbumResolver {
         "info",
         `resolve-album: search ${album.id} "${album.artistName} - ${album.title}" (${album.year}, ${album.tracks.length} tracks)`
       );
-      if (searched.incomplete && searched.ordered.length === 0 && !earlier) {
+      // Nothing to go on with from an unfinished search: no verdict, with or without releases
+      // found earlier (those hold other tracks; whether more exist is not known yet).
+      if (searched.incomplete && searched.ordered.length === 0) {
         return this.inconclusive(albumId);
       }
       stage = {
@@ -2252,8 +2278,10 @@ export class AlbumResolver {
   private inconclusive(entityId: string): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
     const key = `search_retry:${entityId}`;
     const tries = (this.cache.get<number>(key) || 0) + 1;
-    this.cache.set(key, tries, INCONCLUSIVE_WINDOW_MS);
+    // Only counted tries keep the window open: a host asking every 30 s must not keep the
+    // budget spent for good, the search runs afresh once the window has passed.
     if (tries <= MAX_INCONCLUSIVE_SEARCHES) {
+      this.cache.set(key, tries, INCONCLUSIVE_WINDOW_MS);
       return { done: false, verifiedCount: 0, retryInMs: INCONCLUSIVE_RETRY_MS };
     }
     this.env.log("info", `resolve: ${entityId} search still inconclusive after ${MAX_INCONCLUSIVE_SEARCHES} tries; not caching a negative`);
@@ -2294,7 +2322,8 @@ export class AlbumResolver {
     // a track none of the releases serves goes on from here instead of starting over.
     const listedRefs = stage.preRanked.slice(0, stage.nextIdx).map((x) => candidateRefOf(x.cand));
     const probedRefs = [...(stage.skipRefs || []), ...listedRefs].slice(-80);
-    const exhausted = stage.nextIdx >= stage.preRanked.length || (stage.resumes || 0) >= MAX_ALBUM_RESUMES;
+    // An unfinished search says nothing about what else exists: never "exhausted".
+    const exhausted = !stage.searchIncomplete && (stage.nextIdx >= stage.preRanked.length || (stage.resumes || 0) >= MAX_ALBUM_RESUMES);
     const record: CachedAlbumResolution = {
       albumId,
       resolvedAt: now,
@@ -2304,6 +2333,7 @@ export class AlbumResolver {
       exhausted,
       probedRefs,
       resumes: stage.resumes || 0,
+      searchIncomplete: stage.searchIncomplete || undefined,
     };
     this.cache.set(albumCacheKey(albumId), record, ttlMs);
     this.cache.delete(albumStageKey(albumId));

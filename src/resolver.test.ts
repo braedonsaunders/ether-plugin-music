@@ -3573,3 +3573,97 @@ test("defect 7: a MusicBrainz failure is not remembered as 'no such recording'",
     assert.equal(res.sources[0]?.release?.candidate?.nzbUrl, single.nzbUrl);
   }
 });
+
+function resumeHarness(opts: { searchAnswer: (n: number) => { candidates: SourceCandidate[]; pending?: unknown[] } }) {
+  const titles = ["Song 1", "Song 2", "Song 3", "Song 4", "Song 5", "Bonus Song"];
+  const album: CanonicalAlbum = {
+    ...sampleDiscoveryAlbum(),
+    id: "al-777", deezerAlbumId: 777, artistName: "Test Band", title: "Test Album", year: 2001, trackCount: titles.length,
+    tracks: titles.map((t, i) => ({ id: `tr-77${i}`, deezerTrackId: 7700 + i, title: t, disc: 1, trackNumber: i + 1, durationSec: 240, explicit: false, artistName: "Test Band" })),
+  };
+  const cand = (i: number): SourceCandidate => ({ title: `Test Band - Test Album (2001) FLAC r${i}`, indexer: "NZBgeek", nzbUrl: `https://nzb.test/r${i}`, size: 150_000_000 });
+  let clock = 1_760_000_000_000;
+  let searches = 0;
+  const { env, kvMap, calls } = makeFakeHost({
+    onResolve: (q) => {
+      clock += 300;
+      if (q.kind === "indexer_search") return opts.searchAnswer(++searches);
+      if (q.kind === "release_files") {
+        return { candidates: [{ ...q.candidate!, files: titles.slice(0, 5).map((t, i) => ({ index: i, path: `${String(i + 1).padStart(2, "0")} ${t}.flac`, size: 30_000_000 })) }] };
+      }
+      if (q.kind === "usenet_check") return { candidates: [{ ...q.candidate!, usenetCheck: { available: true, checked: 8, missing: 0 } }] };
+      return { candidates: [] };
+    },
+  });
+  env.now = () => clock;
+  const cache = new KVCache(env);
+  cache.set(`album_v2:${album.id}`, album, 24 * 3_600_000);
+  const settings = review3Settings();
+  const resolver = new AlbumResolver(env, cache, new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings), settings);
+  const poll = (idx: number, max = 30) => {
+    let res = resolver.resolve({ item: trackItemFor(album, idx) });
+    for (let i = 0; res.pending && i < max; i++) {
+      clock += 400;
+      res = resolver.resolve({ item: trackItemFor(album, idx) });
+    }
+    return res;
+  };
+  return { album, cand, cache, resolver, poll, advance: (ms: number) => { clock += ms; }, kvMap, calls, searches: () => searches };
+}
+
+test("defect 5: a resumed search that was incomplete never records the album as exhausted or a long-lived miss", () => {
+  const pendingNote = [{ indexerId: "slow", indexer: "Slow" }];
+  let complete = false;
+  const c1: SourceCandidate = { title: "Test Band - Test Album (2001) FLAC r1", indexer: "NZBgeek", nzbUrl: "https://nzb.test/r1", size: 150_000_000 };
+  const c2: SourceCandidate = { ...c1, title: "Test Band - Test Album (2001) FLAC r2", nzbUrl: "https://nzb.test/r2" };
+  let n = 0;
+  // Search 1: both candidates, one indexer still running. Later searches: only the second.
+  const h2 = resumeHarness({
+    searchAnswer: () => {
+      n++;
+      return n === 1 ? { candidates: [c1, c2], pending: pendingNote } : (complete ? { candidates: [c2] } : { candidates: [c2], pending: pendingNote });
+    },
+  });
+  const first = h2.poll(0);
+  assert.equal(first.sources.length, 1, "the partial release plays track 1");
+  // The bonus track: no cached release serves it, the second search is incomplete too.
+  h2.advance(10_000);
+  const bonus = h2.poll(5);
+  assert.equal(bonus.sources.length, 0);
+  assert.ok((bonus.ttlSec ?? 0) <= 60, `short ttl while the search was incomplete, got ${bonus.ttlSec}`);
+  const rec = h2.cache.get<{ exhausted?: boolean; negative?: boolean }>(albumCacheKey("al-777"));
+  assert.ok(rec, "the releases found so far stay cached");
+  assert.notEqual(rec!.exhausted, true, "not exhausted after an incomplete search");
+  assert.notEqual(rec!.negative, true);
+  // The next play searches again; the indexer has finished now: only then is the album exhausted.
+  complete = true;
+  h2.advance(60_000);
+  const again = h2.poll(5);
+  assert.equal(again.sources.length, 0);
+  const rec2 = h2.cache.get<{ exhausted?: boolean }>(albumCacheKey("al-777"));
+  assert.equal(rec2?.exhausted, true, "a complete search with nothing more does exhaust it");
+});
+
+test("defect 5: an incomplete resumed search with nothing to list answers pending, then briefly empty; nothing remembered", () => {
+  const pendingNote = [{ indexerId: "slow", indexer: "Slow" }];
+  const c1 = (() => ({ title: "Test Band - Test Album (2001) FLAC r1", indexer: "NZBgeek", nzbUrl: "https://nzb.test/r1", size: 150_000_000 }))();
+  let n = 0;
+  const h = resumeHarness({
+    searchAnswer: () => (++n === 1 ? { candidates: [c1], pending: pendingNote } : { candidates: [], pending: pendingNote }),
+  });
+  assert.equal(h.poll(0).sources.length, 1);
+  h.advance(10_000);
+  let res = h.resolver.resolve({ item: trackItemFor(h.album, 5) });
+  assert.equal(res.pending, true, "an unfinished search is asked again, not answered");
+  let pendings = 1;
+  for (; res.pending && pendings < 30; pendings++) {
+    h.advance(1_500);
+    res = h.resolver.resolve({ item: trackItemFor(h.album, 5) });
+  }
+  assert.ok(pendings <= 10, `bounded by the inconclusive budget, took ${pendings}`);
+  assert.equal(res.sources.length, 0);
+  assert.ok((res.ttlSec ?? 0) > 0 && (res.ttlSec ?? 0) <= 60, `short ttl, got ${res.ttlSec}`);
+  const rec = h.cache.get<{ exhausted?: boolean; negative?: boolean }>(albumCacheKey("al-777"));
+  assert.notEqual(rec?.exhausted, true);
+  assert.notEqual(rec?.negative, true);
+});
