@@ -2761,3 +2761,70 @@ test("a partial folder serves only the tracks it names exactly", () => {
   assert.equal(single.matched, true);
   assert.deepEqual(Object.keys(single.tracks), ["tr-1"]);
 });
+
+function clockedResolverFor(album: CanonicalAlbum, onResolve: (q: SourceQuery) => { candidates: SourceCandidate[]; indexers?: Array<{ status: string }> }) {
+  const { env } = makeFakeHost({ onResolve });
+  let now = 1_760_000_000_000;
+  env.now = () => now;
+  const cache = new KVCache(env);
+  cache.set(`album_v2:${album.id}`, album, 600_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  return { resolver: new AlbumResolver(env, cache, catalog, settings), advance: (ms: number) => { now += ms; } };
+}
+
+test("an incomplete search is asked again so a late source is picked up", () => {
+  const album = sampleDiscoveryAlbum();
+  const title = "Daft Punk - Discovery (2001) [FLAC]";
+  const usenet: SourceCandidate = { title, nzbUrl: "https://althub.test/api?t=get&id=1", indexer: "altHUB", size: 300_000_000 };
+  const slsk: SourceCandidate = { title, indexer: "SlskSource", size: 300_000_000, pluginRelease: { plugin: "community.slsksource", id: "x" } };
+  const goodFiles = album.tracks.map((t, i) => ({ index: i, path: `${String(i + 1).padStart(2, "0")} - ${t.title}.flac`, size: 30_000_000 }));
+  const badFiles = [{ index: 0, path: "01 - Unrelated Song.flac", size: 30_000_000 }];
+  let searches = 0;
+  const { resolver, advance } = clockedResolverFor(album, (q) => {
+    if (q.kind === "indexer_search") {
+      searches++;
+      if (searches === 1) return { candidates: [usenet], indexers: [{ status: "answered" }, { status: "pending" }] };
+      return { candidates: [usenet, slsk], indexers: [{ status: "answered" }, { status: "answered" }] };
+    }
+    if (q.kind === "release_files") {
+      const files = q.candidate?.pluginRelease?.id === "x" ? goodFiles : badFiles;
+      return { candidates: [{ ...q.candidate!, files }] };
+    }
+    return { candidates: [] };
+  });
+  let res = resolver.resolve({ item: trackItemFor(album, 0) });
+  for (let i = 0; i < 8 && res.sources.length === 0; i++) {
+    advance(1500);
+    res = resolver.resolve({ item: trackItemFor(album, 0) });
+  }
+  assert.equal(res.sources[0]?.release?.candidate?.pluginRelease?.id, "x");
+  assert.ok(searches >= 2 && searches <= 4, `searches=${searches}`);
+});
+
+test("a complete search answer is not searched again within 5 minutes", () => {
+  const album = sampleDiscoveryAlbum();
+  let searches = 0;
+  const { resolver, advance } = clockedResolverFor(album, (q) => {
+    if (q.kind === "indexer_search") {
+      searches++;
+      return { candidates: [], indexers: [{ status: "answered" }, { status: "answered" }] };
+    }
+    return { candidates: [] };
+  });
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  const afterFirst = searches;
+  assert.ok(afterFirst >= 1);
+  for (let i = 0; i < 12; i++) {
+    advance(20_000);
+    resolver.resolve({ item: trackItemFor(album, 0) });
+  }
+  assert.equal(searches, afterFirst, "a complete answer is reused for 5 minutes");
+});

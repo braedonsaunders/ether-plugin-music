@@ -154,8 +154,16 @@ interface SearchQueryMemo {
 /** How many times one album's or concert's inconclusive search is tried again in a few minutes. */
 const MAX_INCONCLUSIVE_SEARCHES = 8;
 const INCONCLUSIVE_WINDOW_MS = 3 * 60 * 1000;
-/** An answer some indexers did not finish is reused only briefly. */
+/** An answer some indexers did not finish is kept only briefly as a fallback. */
 const INCOMPLETE_MEMO_TTL_MS = 30 * 1000;
+/**
+ * An incomplete answer is reused as is only this long (so concurrent polls never duplicate a
+ * host search); after that the next call asks the host again, which by then holds what the
+ * slow sources delivered.
+ */
+const INCOMPLETE_MEMO_REUSE_MS = 2500;
+/** Delay before an inconclusive album/concert is retried; 8 tries span 12 s, enough for a 7 s source. */
+const INCONCLUSIVE_RETRY_MS = 1500;
 
 /** Whether an indexer_search answer is final: every indexer answered or was skipped. */
 export function searchIncomplete(res: { pending?: unknown[]; indexers?: Array<{ status?: string }> } | null | undefined): boolean {
@@ -1528,8 +1536,12 @@ export class AlbumResolver {
   } {
     const memoKey = searchMemoKey(entityId, query);
     const memo = this.cache.get<SearchQueryMemo>(memoKey, { fresh: true });
+    // An incomplete answer past its reuse window is searched again; it stays the fallback.
+    let staleIncomplete: SearchQueryMemo | null = null;
     if (memo) {
-      if (memo.status === "done") {
+      if (memo.status === "done" && memo.incomplete && this.env.now() - memo.at >= INCOMPLETE_MEMO_REUSE_MS) {
+        staleIncomplete = memo;
+      } else if (memo.status === "done") {
         return {
           candidates: (memo.candidates || []).map((c) => ({ ...c })),
           rawCount: memo.rawCount,
@@ -1557,11 +1569,13 @@ export class AlbumResolver {
     }
 
     const reqAt = this.env.now();
-    this.cache.set<SearchQueryMemo>(
-      memoKey,
-      { status: "inflight", at: reqAt, rawCount: 0 },
-      SEARCH_DEDUP_WINDOW_MS
-    );
+    if (!staleIncomplete) {
+      this.cache.set<SearchQueryMemo>(
+        memoKey,
+        { status: "inflight", at: reqAt, rawCount: 0 },
+        SEARCH_DEDUP_WINDOW_MS
+      );
+    }
 
     try {
       const res = this.env.sources.resolve({
@@ -1590,6 +1604,23 @@ export class AlbumResolver {
         // flight so concurrent tracks wait, and search again after the wait window.
         this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
         return { candidates: [], rawCount: 0, fromCache: false, errored: false, deferredInFlight: false, elapsedMs, incomplete: true };
+      }
+      if (staleIncomplete && incomplete && list.length <= staleIncomplete.rawCount) {
+        // Still incomplete and no richer than before: keep the earlier answer, restart its window.
+        this.cache.set<SearchQueryMemo>(
+          memoKey,
+          { ...staleIncomplete, at: this.env.now() },
+          INCOMPLETE_MEMO_TTL_MS
+        );
+        return {
+          candidates: (staleIncomplete.candidates || []).map((c) => ({ ...c })),
+          rawCount: staleIncomplete.rawCount,
+          fromCache: false,
+          errored: false,
+          deferredInFlight: false,
+          elapsedMs,
+          incomplete: true,
+        };
       }
       const rankAt = this.env.now();
       const ordered = prioritize ? prioritize(list) : list;
@@ -1779,7 +1810,7 @@ export class AlbumResolver {
     const tries = (this.cache.get<number>(key) || 0) + 1;
     this.cache.set(key, tries, INCONCLUSIVE_WINDOW_MS);
     if (tries <= MAX_INCONCLUSIVE_SEARCHES) {
-      return { done: false, verifiedCount: 0, retryInMs: 1000 };
+      return { done: false, verifiedCount: 0, retryInMs: INCONCLUSIVE_RETRY_MS };
     }
     this.env.log("info", `resolve: ${entityId} search still inconclusive after ${MAX_INCONCLUSIVE_SEARCHES} tries; not caching a negative`);
     return { done: true, verifiedCount: 0, inconclusive: true };
