@@ -484,6 +484,8 @@ export function preScoreAlbumCandidate(
     year: number;
     releaseType: ReleaseType;
     durationSec: number;
+    /** The artist the listener sees when it differs from the album's credited artist. */
+    altArtistName?: string;
   },
   pref: QualityPreference,
   options?: { allowUnconfirmedTorrent?: boolean }
@@ -519,7 +521,15 @@ export function preScoreAlbumCandidate(
   for (const tok of artistTokens) {
     if (relWords.has(tok) || normRel.includes(tok)) artistHits++;
   }
-  const artistRatio = artistTokens.length > 0 ? artistHits / artistTokens.length : 1;
+  let artistRatio = artistTokens.length > 0 ? artistHits / artistTokens.length : 1;
+  if (album.altArtistName && artistRatio < 0.6) {
+    const altTokens = normalizeText(album.altArtistName).split(/\s+/).filter((t) => t.length >= 2 && t !== "the");
+    if (altTokens.length > 0) {
+      let altHits = 0;
+      for (const tok of altTokens) if (relWords.has(tok) || normRel.includes(tok)) altHits++;
+      artistRatio = Math.max(artistRatio, altHits / altTokens.length);
+    }
+  }
 
   // Album title match check
   const albumTokens = normAlbum.split(/\s+/).filter((t) => t.length >= 2 && t !== "the" && t !== "and");
@@ -1904,6 +1914,22 @@ export class AlbumResolver {
     if (album.year > 0) {
       queries.push(`${cleanArtist} ${cleanAlbum} ${album.year}`);
     }
+    // The library may list a track under another artist than the album's credit ("k.d. lang" on a
+    // "case/lang/veirs" album). Placed right after the primary query; the list stays at 4 or fewer.
+    const trackArtists = new Set(album.tracks.map((t) => (t.artistName || "").trim()).filter(Boolean));
+    let altArtistName: string | undefined;
+    if (trackArtists.size === 1) {
+      const trackArtist = [...trackArtists][0];
+      const cleanTrackArtist = indexerQueryText(trackArtist);
+      if (cleanTrackArtist && cleanTrackArtist !== cleanArtist) {
+        const altQuery = `${cleanTrackArtist} ${cleanAlbum}`;
+        if (!queries.includes(altQuery)) {
+          queries.splice(1, 0, altQuery);
+          queries.length = Math.min(queries.length, 4);
+          altArtistName = trackArtist;
+        }
+      }
+    }
 
     const interactive = budgetMs <= RESOLVE_STEP_BUDGET_MS;
     const byRef = new Map<string, SourceCandidate>();
@@ -1940,7 +1966,7 @@ export class AlbumResolver {
         }
         pre = preScoreAlbumCandidate(
           cand,
-          album,
+          altArtistName ? { ...album, altArtistName } : album,
           this.settings.qualityPreference,
           allowUnconfirmedTorrent ? { allowUnconfirmedTorrent: true } : undefined
         );
