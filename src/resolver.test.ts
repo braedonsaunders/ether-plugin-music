@@ -2909,4 +2909,80 @@ test("names dropped at ranking are logged once per shortlist build, not per poll
   const raws = logs.filter((l) => /raw=\d+/.test(l)).length;
   const drops = logs.filter((l) => /at name ranking/.test(l)).length;
   assert.ok(raws >= 1 && drops <= raws, `raw=${raws} dropped=${drops}`);
+
+test("indexerQueryText keeps combining marks of non-Latin scripts and still folds Latin accents", () => {
+  assert.equal(indexerQueryText("ทุกคืน"), "ทุกคืน");
+  assert.equal(indexerQueryText("The Studio Project ทุกคืน"), "The Studio Project ทุกคืน");
+  assert.equal(indexerQueryText("हिंदी"), "हिंदी");
+  assert.equal(indexerQueryText("שָׁלוֹם"), "שָׁלוֹם");
+  assert.equal(indexerQueryText("مَرْحَبًا"), "مَرْحَبًا");
+  assert.equal(indexerQueryText("Beyoncé"), "Beyonce");
+  assert.equal(indexerQueryText("Beyoncé"), "Beyonce");
+  assert.equal(indexerQueryText("AC/DC"), "AC DC");
+  assert.equal(indexerQueryText("Rock & Roll!"), "Rock Roll");
+});
+
+test("a track artist that differs from the album credit is searched after the primary query", () => {
+  const base = sampleDiscoveryAlbum();
+  const album: CanonicalAlbum = {
+    ...base,
+    id: "al-case-lang-veirs",
+    artistName: "case/lang/veirs",
+    title: "Accidental Tattoo",
+    year: 2026,
+    tracks: base.tracks.map((t) => ({ ...t, artistName: "k.d. lang" })),
+  };
+  const queries: string[] = [];
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") queries.push(q.query || "");
+    return { candidates: [] };
+  });
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  const alt = `${indexerQueryText("k.d. lang")} Accidental Tattoo`;
+  assert.equal(queries[0], "case lang veirs Accidental Tattoo");
+  assert.ok(queries.includes(alt), `alternate artist query sent: ${queries.join(" | ")}`);
+  assert.ok(queries.indexOf(alt) >= 1);
+
+  const cand = { title: "k.d. lang - Accidental Tattoo (2026) [FLAC]", nzbUrl: "https://x.test/1", indexer: "x" };
+  const args = { artistName: album.artistName, title: album.title, year: 2026, releaseType: "album" as const, durationSec: 1200 };
+  assert.equal(preScoreAlbumCandidate(cand, args, "flac_preferred").accepted, false);
+  const withAlt = preScoreAlbumCandidate(cand, { ...args, altArtistName: "k.d. lang" }, "flac_preferred");
+  assert.equal(withAlt.accepted, true, withAlt.reasons.join(", "));
+});
+
+test("a compilation with different track artists gets no extra artist query", () => {
+  const base = sampleDiscoveryAlbum();
+  const album: CanonicalAlbum = {
+    ...base,
+    id: "al-comp",
+    artistName: "Various Artists",
+    title: "Summer Hits",
+    tracks: base.tracks.map((t, i) => ({ ...t, artistName: i % 2 ? "Artist B" : "Artist A" })),
+  };
+  const queries: string[] = [];
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") queries.push(q.query || "");
+    return { candidates: [] };
+  });
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.ok(queries.length > 0);
+  assert.ok(queries.every((q) => !q.includes("Artist A") && !q.includes("Artist B")), queries.join(" | "));
+});
+
+test("an album whose tracks share the album artist sends the same queries as before", () => {
+  const album: CanonicalAlbum = {
+    ...sampleDiscoveryAlbum(),
+    id: "al-9410087",
+    artistName: "AC/DC",
+    title: "Highway to Hell",
+    year: 1979,
+    tracks: sampleDiscoveryAlbum().tracks.map((t) => ({ ...t, artistName: "AC/DC" })),
+  };
+  const queries: string[] = [];
+  const resolver = resolverFor(album, (q) => {
+    if (q.kind === "indexer_search") queries.push(q.query || "");
+    return { candidates: [] };
+  });
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  assert.deepEqual(queries.slice(0, 2), ["AC DC Highway to Hell", "ACDC Highway to Hell"]);
 });

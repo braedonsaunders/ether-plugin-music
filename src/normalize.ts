@@ -565,6 +565,9 @@ export function validExternalId(id: string): string {
  */
 export function indexerQueryText(input: string): string {
   return String(input || "")
+    // A Latin letter followed by combining marks (decomposed "é") is the plain letter. Marks after
+    // letters of other scripts (Thai, Devanagari, Hebrew points...) are part of the word and stay.
+    .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
     .replace(/[Ææ]/g, "ae")
     .replace(/[Œœ]/g, "oe")
     .replace(/[Øø]/g, "o")
@@ -574,7 +577,10 @@ export function indexerQueryText(input: string): string {
     .replace(/(?<=\p{L})\$(?=\p{L})/gu, "S")
     .replace(/(?<=\p{L})!(?=\p{L})/gu, "i")
     .replace(/['’`´]/g, "")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")
+    // A mark with no letter before it (after a space or symbol) belongs to nothing.
+    .replace(/(?<![\p{L}\p{N}\p{M}])\p{M}+/gu, "")
+    .replace(/\s{2,}/g, " ")
     .trim();
 }
 
@@ -587,7 +593,7 @@ export function joinedArtistSpelling(artist: string): string {
   const words = String(artist || "").trim().split(/\s+/).filter(Boolean);
   let changed = false;
   const out = words.map((w) => {
-    if (!/[\p{L}\p{N}][\/.\-][\p{L}\p{N}]/u.test(w)) return w;
+    if (!/[\p{L}\p{N}\p{M}][\/.\-][\p{L}\p{N}]/u.test(w)) return w;
     changed = true;
     return w.replace(/[\/.\-]/g, "");
   });
