@@ -1669,11 +1669,7 @@ export function matchTracksInRelease(
       const dirs = f.path.replace(/\\/g, "/").split("/").slice(0, -1);
       return versionWordsOf([...dirs, f.archivePath || ""].join(" / "));
     };
-    // A title found once in the whole release has no other version to be confused with.
-    const filesPerTrack = new Map<number, Set<number>>();
-    for (const h of hits) (filesPerTrack.get(h.ti) || filesPerTrack.set(h.ti, new Set()).get(h.ti)!).add(h.fi);
     assigned = assign(hits.filter((h) => {
-      if ((filesPerTrack.get(h.ti)?.size || 0) <= 1) return true;
       const own = new Set(versionWordsOf(album.tracks[h.ti].title));
       return folderWords(h.fi).every((w) => own.has(w) || allowed.has(w));
     }));

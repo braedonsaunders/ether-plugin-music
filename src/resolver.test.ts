@@ -4317,8 +4317,8 @@ test("fix 2: in a box set (many more files than the album) a member in a folder 
     { index: 21, path: "Box/CD5 Live at Wembley/02 Bravo.flac", size: 30_000_000 },
     { index: 22, path: "Box/CD6 Bonus/03 Charlie.flac", size: 30_000_000 },
   ], "flac_preferred");
-  // A title found once in the whole release has no other version to be confused with: its folder is no reason.
-  assert.deepEqual(Object.keys(only.tracks).sort(), [album.tracks[0].id, album.tracks[1].id, album.tracks[2].id]);
+  // Found once or not: a file in a folder named for another version is not the plain track.
+  assert.deepEqual(Object.keys(only.tracks), [album.tracks[2].id], "only the bonus-disc file serves");
   const twice = matchTracksInRelease(album, "Test Band - Test Album Box (6-CD) FLAC", [
     ...["Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo"].map((t, i) => ({ index: i, path: `Box/CD1/${pad2(i + 1)} ${t}.flac`, size: 30_000_000 })),
     { index: 20, path: "Box/CD1/01 Alpha.flac", size: 30_000_000 },
