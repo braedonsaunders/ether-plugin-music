@@ -4062,3 +4062,51 @@ test("an artist in another script, small lossy files and unlabelled hi-res FLAC 
   assert.equal(isPlausibleTrackSize(85_000_000, 240, 950, { lossless: true }), true);
   assert.equal(isPlausibleTrackSize(200_000, 240, 320), false);
 });
+
+test("round 3: an album-level note is forgiven on the track's side only; hyphen-joined and composer-led names", () => {
+  const f = (path: string, size = 28 * R3MB, index = 0) => ({ index, path, size });
+  const serves = (album: CanonicalAlbum, release: string, files: Array<{ index: number; path: string; size: number }>, ti = 0) =>
+    Boolean(matchTracksInRelease(album, release, files, "flac_preferred").tracks[`t${ti}`]);
+
+  // Song-first path: a studio song is not served by a file that says it is live, whatever the release is called.
+  const tune = r3Album(["Tune"], { recording: true });
+  assert.equal(serves(tune, "Coldplay - Tune (Live) [FLAC]", [f("01 Tune (Live).flac")]), false);
+  assert.equal(serves(tune, "Coldplay - Live in Paris [FLAC]", [f("01 Tune (Live).flac"), f("02 Other.flac", 28 * R3MB, 1)]), false);
+  // The other way round stays: the live song, a release that says live, a file that omits it.
+  const liveTune = r3Album(["Tune (Live)"], { recording: true });
+  assert.equal(serves(liveTune, "Coldplay - Live in Paris (Live) [FLAC]", [f("01 Tune.flac"), f("02 Other.flac", 28 * R3MB, 1)]), true);
+  assert.equal(serves(liveTune, "Coldplay - Live in Paris (Live) [FLAC]", [f("01 Tune (Acoustic).flac"), f("02 Other.flac", 28 * R3MB, 1)]), false);
+
+  // "Live Through This": the album's name is no licence for live files.
+  const hole = r3Album(["Violet", "Miss World", "Plump", "Asking for It", "Jennifer's Body"], { artist: "Hole", albumTitle: "Live Through This" });
+  const holeFiles = (suffix: string) => hole.tracks.map((t, i) => f(`0${i + 1} ${t.title}${suffix}.flac`, 28 * R3MB, i));
+  assert.equal(serves(hole, "Hole - Live Through This (1994) [FLAC]", holeFiles(" (Live)")), false);
+  assert.equal(serves(hole, "Hole - Live Through This (1994) [FLAC]", holeFiles("")), true);
+
+  // A concert album whose every title says so: files without the note serve, files with another note do not.
+  const waltz = r3Album(["Caravan (Concert Version)", "Up on Cripple Creek (Concert Version)", "The Weight (Concert Version)", "Ophelia (Concert Version)", "Stage Fright (Concert Version)"], { artist: "The Band", albumTitle: "The Last Waltz" });
+  const waltzFiles = (suffix: string) => waltz.tracks.map((t, i) => f(`0${i + 1} ${t.title.replace(" (Concert Version)", "")}${suffix}.flac`, 28 * R3MB, i));
+  assert.equal(serves(waltz, "The Band - The Last Waltz (2002) FLAC", waltzFiles("")), true);
+  assert.equal(serves(waltz, "The Band - The Last Waltz (2002) FLAC", waltzFiles(" (Concert Version)")), true);
+  assert.equal(serves(waltz, "The Band - The Last Waltz (2002) FLAC", waltzFiles(" (Studio Version)")), false);
+  assert.equal(serves(waltz, "The Band - The Last Waltz (2002) FLAC", waltzFiles(" (Demo)")), false);
+
+  // Hyphen-joined names without a number; the artist in front is still checked.
+  const para = r3Album(["Yellow", "Man"], { albumTitle: "Parachutes" });
+  const dump = (name: string) => [f(name, 9 * R3MB), f("x-filler-one.mp3", 9 * R3MB, 1), f("x-filler-two.mp3", 9 * R3MB, 2)];
+  assert.equal(serves(para, "Dump", dump("coldplay-yellow.mp3")), true);
+  assert.equal(serves(para, "Dump", dump("Coldplay-Parachutes-05-Yellow.mp3")), true);
+  assert.equal(serves(para, "Dump", dump("other_artist-yellow.mp3")), false);
+  assert.equal(serves(para, "Dump", dump("spider-man.mp3"), 1), false, "Spider-Man is not Man");
+
+  // An artist in another script: a Latin artist is never written in Cyrillic; the reverse is transliteration.
+  assert.equal(serves(para, "Dump", dump("03 - Другой - Yellow.mp3")), false);
+  const troll = r3Album(["Утекай", "Другая"], { artist: "Мумий Тролль" });
+  assert.equal(serves(troll, "Dump", dump("Mumiy Troll - Утекай.mp3")), true);
+
+  // Classical: the composer leads, the orchestra is the track's artist; a long title is its own evidence.
+  const sym = r3Album(["Symphony No. 5 in C minor, Op. 67 - I. Allegro con brio", "Other"], { artist: "Berliner Philharmoniker", albumTitle: "Symphonies" });
+  assert.equal(serves(sym, "Dump", dump("05 - Beethoven - Symphony No. 5 in C minor, Op. 67 - I. Allegro con brio.mp3")), true);
+  // A short title gets no such tolerance.
+  assert.equal(serves(para, "Dump", dump("03 - Other Artist - Yellow.mp3")), false);
+});

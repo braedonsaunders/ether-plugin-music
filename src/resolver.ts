@@ -1221,6 +1221,8 @@ export function matchAlbumReleaseFiles(
  */
 // Lossless up to 4.5x: a 24-bit/96 kHz FLAC is about 3.4x of CD-quality FLAC and is often not labelled.
 const SIZE_RATIO_LOSSLESS = { min: 0.25, max: 4.5 };
+/** A title of this many words or more is taken as specific enough to tolerate an unknown lead. */
+const LONG_TITLE_WORDS = 6;
 const SIZE_RATIO_HIRES = { min: 0.25, max: 6 };
 // Lossy down to 0.2x: a 64 kbps file against a 320 kbps yardstick is still that recording.
 const SIZE_RATIO_LOSSY = { min: 0.2, max: 2.5 };
@@ -1363,11 +1365,18 @@ export function matchTracksInRelease(
       if (!l.includes(i)) l.push(i);
     } else m.set(k, [i]);
   };
+  // A track is indexed twice: as its title stands, and with the album-level notes left out. A
+  // file is looked up as ITS name stands, so an album-level note is only ever forgiven on the
+  // track's side: "Caravan.flac" serves "Caravan (Concert Version)" on a concert album, while
+  // "Violet (Live).flac" does not serve the studio "Violet" just because the album is called
+  // "Live Through This".
   album.tracks.forEach((tr, ti) => {
     const sig = titleSignature(tr.title, ignoreQual);
     if (!sig) return;
     push(byFull, sig.full, ti);
     push(bySig, sig.sig, ti);
+    const asIs = titleSignature(tr.title);
+    if (asIs && asIs.sig !== sig.sig) push(bySig, asIs.sig, ti);
     if (isGenericTrackTitle(sig.base)) genericTrack.add(ti);
   });
 
@@ -1417,11 +1426,14 @@ export function matchTracksInRelease(
     }
     const found = new Map<number, { exact: boolean; named: boolean }>();
     for (const c of cands) {
-      const sig = titleSignature(c.run, ignoreQual);
+      const sig = titleSignature(c.run);
       if (!sig) continue;
       const take = (ti: number, exact: boolean) => {
         const verdict = classifyLead(c.lead, expectedFor(ti));
-        if (verdict === "foreign") return;
+        // Text in front of the title that is neither the artist nor the album means another
+        // artist's song, unless the title is long enough to be nobody else's: classical files
+        // lead with the composer ("Beethoven - Symphony No. 5 in C minor, Op. 67 - I. Allegro").
+        if (verdict === "foreign" && !(exact && sig.full.split(" ").length >= LONG_TITLE_WORDS)) return;
         const cur = found.get(ti);
         found.set(ti, { exact: exact || Boolean(cur?.exact), named: verdict === "named" || Boolean(cur?.named) });
       };

@@ -916,7 +916,10 @@ export interface FileTitleCandidate {
 export function fileTitleCandidates(rest: string, baseName = ""): FileTitleCandidate[] {
   const out: FileTitleCandidate[] = [];
   const seen = new Set<string>();
-  const scene = Boolean(baseName) && !/\s/.test(baseName) && /^\d{1,3}[-_]/.test(baseName) && rest.includes("-");
+  // Scene style: no spaces at all and hyphens between the parts, with or without a leading
+  // number ("05-coldplay-yellow", "coldplay-yellow"). The parts in front of a title still have
+  // to name the artist or the album, so "Spider-Man" yields "Spider Man" and never "Man".
+  const scene = Boolean(baseName) && !/\s/.test(baseName) && rest.includes("-");
   const add = (text: string, sceneStyle: boolean) => {
     const segs = (sceneStyle ? text.split("-") : text.split(/\s+[-–—]\s+/))
       .map((x) => x.replace(/_/g, " ").trim())
@@ -1005,7 +1008,8 @@ export function classifyLead(lead: string[], exp: ExpectedLead): LeadVerdict {
     if (artists.length === 0) continue; // no artist known: nothing to compare against
     // An artist written in another script than the segment ("Мумий Тролль" against a file's
     // "Mumiy Troll") cannot be compared by spelling: it says nothing either way.
-    if (exp.artists.length > 0 && exp.artists.every((a) => isLatinText(a) !== isLatinText(seg))) continue;
+    // Only that way round: a Latin-script artist is never written "Другой".
+    if (exp.artists.length > 0 && isLatinText(seg) && exp.artists.every((a) => !isLatinText(a))) continue;
     const joined = toks.join("");
     const isArtist = artists.some((a) => a.joined === joined || tokensCompatible(toks, a.tokens));
     const isVa = Boolean(exp.variousArtists) && isVariousArtistsName(seg.trim());
