@@ -28,7 +28,14 @@ import { getCuratedConcertById, type CuratedConcert } from "./concerts.ts";
 import {
   audioFormatOfPath,
   coreReleaseTitle,
-  fileTitleRuns,
+  fileTitleCandidates,
+  classifyLead,
+  hasVersionWord,
+  isBenignTitleNote,
+  isEditionOrBareLiveNote,
+  isGenericTrackTitle,
+  isTitlelessFileName,
+  type ExpectedLead,
   indexerQueryText,
   isArchivePath,
   isConcertExtraOrSamplePath,
@@ -155,6 +162,11 @@ function selectReleasesToKeep(ranked: VerifiedAlbumRelease[], wantedId?: string)
   return ranked.filter((v) => keep.has(v));
 }
 
+/** The exclude set as one comparable string. */
+function excludedSigOf(excluded: Set<string>): string {
+  return Array.from(excluded).sort().join("|");
+}
+
 function recordingPlanKey(isrc: string): string {
   return `rec_plan_v2:${isrc}`;
 }
@@ -162,14 +174,16 @@ function recordingPlanKey(isrc: string): string {
 /**
  * Seconds the host may find a file's real running time off from the one the library lists before
  * it refuses the source as wrong content (it checks only when both durationSec and a positive
- * tolerance are sent). 3 %, at least 7 s: a remaster or a trimmed silence stays inside, a
- * radio edit, a live take or an extended mix does not. Tune here.
+ * tolerance are sent). From 60 s: 3 %, at least 7 s: a remaster or a trimmed silence stays
+ * inside, a radio edit, a live take or an extended mix does not. Under 60 s: 10 %, at least 3 s
+ * (a 20 s intro may be off by 3 s, not by 10). Tune here.
  */
 export function durationToleranceFor(durationSec: number): number {
+  if (durationSec < 60) return Math.max(3, Math.round(0.1 * durationSec));
   return Math.max(7, Math.round(0.03 * durationSec));
 }
 /** Below this a running time says too little about the version to be checked. */
-const MIN_VERIFIED_DURATION_SEC = 30;
+const MIN_VERIFIED_DURATION_SEC = 10;
 
 /**
  * A single file that holds the whole album (an image + cue rip): named so, or far larger than
@@ -212,15 +226,28 @@ export function isReleaseExcluded(excluded: Set<string>, releaseId: string, cand
   if (excluded.size === 0) return false;
   if (excluded.has(releaseId) || (index >= 0 && excluded.has(`src-${index}-${releaseId}`))) return true;
   if (!candidate) return false;
-  const bases = hostReleaseBases(candidate);
+  const bases = hostReleaseBases(candidate).map(normalizeExcludeId);
   if (bases.length === 0) return false;
-  for (const e of excluded) {
-    if (!e.startsWith("kind:")) continue;
+  for (const raw of excluded) {
+    if (!raw.startsWith("kind:")) continue;
+    const e = normalizeExcludeId(raw);
     for (const b of bases) {
       if (e === b || e.startsWith(`${b}:file:`)) return true;
     }
   }
   return false;
+}
+
+/**
+ * An exclude id in comparable form: "kind:" + a hash is hex in any case (lower-cased); a URL keeps
+ * its path and query as they are (they are case-sensitive) and only its scheme and host lose case.
+ */
+function normalizeExcludeId(id: string): string {
+  const rest = id.slice("kind:".length);
+  if (/^[0-9a-f]{32,64}(?::file:[0-9a-f]+)?$/i.test(rest)) return `kind:${rest.toLowerCase()}`;
+  const url = rest.match(/^(https?:\/\/)([^\/?#]*)(.*)$/i);
+  if (url) return `kind:${url[1].toLowerCase()}${url[2].toLowerCase()}${url[3]}`;
+  return id;
 }
 
 /** At most this many other releases of a song are searched for it. */
@@ -461,6 +488,9 @@ export interface QualityClassification {
   lossless: boolean;
 }
 
+/** A release name that says its audio is 24-bit / hi-res. */
+const HI_RES_TITLE_RE = /\b(?:24\s*-?\s*bit|24bit|24[-_/ ]?(?:44|48|88|96|176|192)|(?:44|48|88|96|176|192)[-_/ ]24|hi-?res)\b/i;
+
 /**
  * Classify release quality from candidate title (and verified audio file extensions when known).
  * Enforces owner priority: FLAC > ALAC/WAV > MP3 320 / V0 / AAC 256+ / Opus > lower lossy.
@@ -479,7 +509,7 @@ export function classifyReleaseQuality(
   const hasLosslessFile = audioExts.some((a) => a.lossless);
   const firstFile = audioExts[0];
 
-  const is24Bit = /\b(?:24\s*-?\s*bit|24bit|24[-_/ ]?(?:44|48|88|96|176|192)|(?:44|48|88|96|176|192)[-_/ ]24|hi-?res)\b/i.test(t);
+  const is24Bit = HI_RES_TITLE_RE.test(t);
   // A 24-bit tag with no lossy format beside it ("96-24", "24-96") is a lossless rip whose name
   // leaves the format out; the files decide once they are listed.
   const isLossyTitle = /\b(?:mp3|aac|m4a|ogg|opus|wma|320|256|192\s*k(?:bps)?|v0|v2)\b/i.test(t);
@@ -547,6 +577,18 @@ export function classifyReleaseQuality(
     points: pref === "lossless_only" ? -1000 : 45,
     lossless: false,
   };
+}
+
+/**
+ * Album titles that name a kind of release, not one release ("Greatest Hits", "Live", "The
+ * Collection"): a folder with such a title and no artist could be anyone's.
+ */
+const GENERIC_ALBUM_TITLE_RE =
+  /^(?:the |a )?(?:(?:very )?best(?: of)?|greatest hits|hits|live|unplugged|acoustic|(?:original )?(?:motion picture )?soundtrack|ost|score|(?:the )?collection|(?:the )?essentials?|(?:the )?essential collection|singles|(?:the )?singles collection|anthology|gold|platinum|icon|remixes|rarities|b sides|demos|sessions|studio sessions|originals|complete|the complete collection|greatest|classics|favou?rites|party|christmas|holiday|love songs|ballads|instrumentals?|the album|album|ep|the ep|demo|selected|selections?|retrospective|compilation|hit singles|number ones|no ?1s)(?: (?:vol(?:ume)?|part|pt|no)? ?\d+| [ivx]{1,4})?$/;
+
+export function isGenericAlbumTitle(title: string): boolean {
+  const key = normalizeTitleKey(title).replace(/\b(?:19|20)\d\d\b/g, " ").replace(/\s{2,}/g, " ").trim();
+  return GENERIC_ALBUM_TITLE_RE.test(key);
 }
 
 /**
@@ -751,7 +793,7 @@ export function preScoreAlbumCandidate(
   if (artistRatio < 0.6) {
     // A source plugin's folder is often named after the album alone ("Discovery [FLAC]",
     // a soundtrack's own title): with the whole title in it that is name enough.
-    const strongTitle = own.ratio >= 1 && (own.tokens >= 3 || own.length >= 12);
+    const strongTitle = own.ratio >= 1 && (own.tokens >= 3 || own.length >= 12) && !isGenericAlbumTitle(cleanAlbum);
     if (isPluginCandidate(candidate) && strongTitle) {
       namePenalty += 8;
       reasons.push("no artist in name");
@@ -1171,15 +1213,68 @@ export function matchAlbumReleaseFiles(
   };
 }
 
-/** Bounds for a file's bytes against the track's running time at the file's format: generous. */
-const TRACK_SIZE_RATIO_MIN = 0.12;
-const TRACK_SIZE_RATIO_MAX = 6;
+/**
+ * Bounds for a file's bytes against the track's running time at the file's format, as a share of
+ * the typical bytes: lossless 0.25x-3x (24-bit / hi-res releases up to 6x), lossy 0.35x-2.5x. A
+ * track under 45 s gets 1.5 MB more on top of the upper bound (cover art, tags), not a wider
+ * ratio.
+ */
+const SIZE_RATIO_LOSSLESS = { min: 0.25, max: 3 };
+const SIZE_RATIO_HIRES = { min: 0.25, max: 6 };
+const SIZE_RATIO_LOSSY = { min: 0.35, max: 2.5 };
+const SHORT_TRACK_SEC = 45;
+const SHORT_TRACK_EXTRA_BYTES = 1_500_000;
 
 /** Whether a file's size is possible for a track of this length (unknown size or length pass). */
-export function isPlausibleTrackSize(sizeBytes: number, durationSec: number, typicalKbps: number): boolean {
+export function isPlausibleTrackSize(
+  sizeBytes: number,
+  durationSec: number,
+  typicalKbps: number,
+  kind: { lossless?: boolean; hiRes?: boolean } = {}
+): boolean {
   if (!(durationSec > 15) || !(sizeBytes > 0)) return true;
-  const ratio = sizeBytes / ((durationSec * typicalKbps * 1000) / 8);
-  return ratio >= TRACK_SIZE_RATIO_MIN && ratio <= TRACK_SIZE_RATIO_MAX;
+  const lossless = kind.lossless ?? typicalKbps >= 800;
+  const r = lossless ? (kind.hiRes ? SIZE_RATIO_HIRES : SIZE_RATIO_LOSSLESS) : SIZE_RATIO_LOSSY;
+  const typical = (durationSec * typicalKbps * 1000) / 8;
+  const upper = r.max * typical + (durationSec < SHORT_TRACK_SEC ? SHORT_TRACK_EXTRA_BYTES : 0);
+  return sizeBytes >= r.min * typical && sizeBytes <= upper;
+}
+
+/**
+ * A release name as the title a lone file may stand for: format, edition and year tags dropped,
+ * a note that names a version ("(Radio Edit)", "(Demo)") kept so it counts like one on a file.
+ * Edition notes and a bare "(Live)" are ignored the way isWrongVersionRelease ignores them.
+ */
+function releaseNameAsTitle(releaseTitle: string): string {
+  return String(releaseTitle || "")
+    .replace(/[\(\[\{][^()\[\]{}]*[\)\]\}]/g, (g) => {
+      const inner = g.slice(1, -1);
+      if (isEditionOrBareLiveNote(g) || isBenignTitleNote(inner) || !hasVersionWord(inner)) return " ";
+      return g;
+    })
+    .replace(/\b(?:19|20)\d\d\b/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/** The release name with every bracket and year dropped. */
+function releaseBareName(releaseTitle: string): string {
+  return String(releaseTitle || "")
+    .replace(/[\(\[\{][^()\[\]{}]*[\)\]\}]/g, " ")
+    .replace(/\b(?:19|20)\d\d\b/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/**
+ * What of a release name may stand in front of a title in a file name as the release itself: the
+ * name with the artist part ("Artist - ") left off, as the album's part of "Artist - Album", or
+ * the whole of a name that has no such part.
+ */
+function releaseAlbumParts(releaseTitle: string): string[] {
+  const bare = releaseBareName(releaseTitle);
+  const segs = bare.split(/\s+[-–—]\s+/).filter(Boolean);
+  return segs.length > 1 ? segs.slice(1) : segs;
 }
 
 /**
@@ -1190,12 +1285,18 @@ export function isPlausibleTrackSize(sizeBytes: number, durationSec: number, typ
  *     "(From ...)", "(Album Version)", "(Remastered 2011)", "- Remastered" (0.85). A note that
  *     names another version ("Live", "Remix", "Demo", "Early Version", "Radio Edit", "Mono",
  *     "Instrumental"...) on one side only is no match: the notes must be equal. File names are read
- *     as "[disc-]number title", with artist or album text before the title allowed ("Artist - Title",
- *     "01-artist-title").
+ *     as "[disc-]number title"; text before the title must name the artist or the album, a year
+ *     or a number ("Artist - Title", "01-artist-title", "Artist - Album - 03 - Title"): another
+ *     artist's name there is no match. A version note that every track of the album carries
+ *     ("Live" on a live album), or the release name and the album title both carry, is
+ *     album-level: ignored. A lone file in a release named for the song takes the release name
+ *     as its title only when its own name has none ("01.flac", "track01.flac").
  *  2. When the file has a track number and the release has as many audio files as the album has
  *     tracks (the same edition), the number (and disc) agrees with the track's.
- *  3. Its size is possible for the track's length at the file's format (0.12x to 6x of the typical
- *     bit rate); an unknown size or length passes. The host then checks the real length on open.
+ *  3. Its size is possible for the track's length at the file's format (see isPlausibleTrackSize);
+ *     an unknown size or length passes. The host then checks the real length on open.
+ *  4. A generic title ("Intro", "Interlude", "Track 5") found in a PARTIAL release also needs the
+ *     track number to agree or the file name to name the artist or album.
  * A file serves one track and a track takes one file: the best title match first, then the lowest
  * disc, then the earliest file. There is no album-wide average. A release that serves every track
  * is a whole-album match; any other count is a partial release.
@@ -1231,9 +1332,29 @@ export function matchTracksInRelease(
   if (audioFiles.length === 0) return fail("release contains no audio files");
   if (audioFiles.length > MAX_AUDIO_FILES_PER_RELEASE) return fail(`too many audio files (${audioFiles.length})`);
 
+  // Version notes that hold for the whole album are no mark of one track: the notes at least 80 %
+  // of the tracks carry (4 tracks or more), and the ones the release name and the album title
+  // both carry ("Live at Wembley"). For one song looked for on a release (the recording path), a
+  // note of the song's title that the release name carries counts as satisfied when the file
+  // omits it.
+  const albumLevel = new Set<string>();
+  if (canonicalCount >= 4) {
+    const counts = new Map<string, number>();
+    for (const tr of album.tracks) {
+      const sig = titleSignature(tr.title);
+      if (sig) for (const q of new Set(sig.quals)) counts.set(q, (counts.get(q) || 0) + 1);
+    }
+    for (const [q, n] of counts) if (n >= canonicalCount * 0.8) albumLevel.add(q);
+  }
+  const relPhrases = ` ${normalizeTitleKey(releaseTitle)} `;
+  const albumPhrases = ` ${normalizeTitleKey(album.title)} `;
+  const ignoreQual = (q: string): boolean =>
+    albumLevel.has(q) || (relPhrases.includes(` ${q} `) && (Boolean(album.recordingTarget) || albumPhrases.includes(` ${q} `)));
+
   // Titles of the album's tracks, indexed by exact text and by signature: a lookup per file title.
   const byFull = new Map<string, number[]>();
   const bySig = new Map<string, number[]>();
+  const genericTrack = new Set<number>();
   const push = (m: Map<string, number[]>, k: string, i: number) => {
     const l = m.get(k);
     if (l) {
@@ -1241,14 +1362,36 @@ export function matchTracksInRelease(
     } else m.set(k, [i]);
   };
   album.tracks.forEach((tr, ti) => {
-    const sig = titleSignature(tr.title);
+    const sig = titleSignature(tr.title, ignoreQual);
     if (!sig) return;
     push(byFull, sig.full, ti);
     push(bySig, sig.sig, ti);
+    if (isGenericTrackTitle(sig.base)) genericTrack.add(ti);
   });
 
+  // Who the file names must be who the track is by: the segments in front of a title.
+  const releaseSegments = releaseAlbumParts(releaseTitle);
+  const albumTitles = [album.title, coreReleaseTitle(album.title)];
+  const leadExpect = new Map<number, ExpectedLead>();
+  const expectedFor = (ti: number): ExpectedLead => {
+    let e = leadExpect.get(ti);
+    if (!e) {
+      const tr = album.tracks[ti];
+      const trackArtist = String(tr.artistName || "").trim();
+      const known = trackArtist !== "" && !isVariousArtistsName(trackArtist);
+      const artists = known
+        ? [trackArtist, ...(tr.featuredArtists || []), String(album.artistName || "").trim()].filter((a) => a && !isVariousArtistsName(a))
+        : [];
+      e = { artists, albums: albumTitles, releaseSegments, variousArtists: isVariousArtistsName(album.artistName) };
+      leadExpect.set(ti, e);
+    }
+    return e;
+  };
+  const releaseTitleRuns = (): ReturnType<typeof fileTitleCandidates> => fileTitleCandidates(releaseNameAsTitle(releaseTitle));
+  const hiRes = HI_RES_TITLE_RE.test(releaseTitle) || quality.tier === "flac24";
+
   const sameEdition = audioFiles.length === canonicalCount;
-  type Hit = { ti: number; fi: number; exact: boolean; numberAgrees: boolean; disc: number };
+  type Hit = { ti: number; fi: number; exact: boolean; numberAgrees: boolean; named: boolean; disc: number };
   const hits: Hit[] = [];
   const single = audioFiles.length === 1;
   for (let fi = 0; fi < audioFiles.length; fi++) {
@@ -1258,29 +1401,36 @@ export function matchTracksInRelease(
       const archDisc = af.file.archivePath.match(/(?:^|[\s._\-\/])(?:cd|disc|disk|d)\s*[._\-]?\s*0?([1-9])(?=$|[\s._\-\/])/i);
       if (archDisc) parsed.disc = Number(archDisc[1]);
     }
-    const runs = fileTitleRuns(parsed.rest, parsed.baseName);
+    const cands = fileTitleCandidates(parsed.rest, parsed.baseName);
     // One file alone in a release named for the song ("Artist - Title (2013) [FLAC]"): the
-    // release's name says what the file is when the file's own does not.
+    // release's name says what the file is only when the file's own name says nothing - no
+    // title ("01.flac", "track01.flac") or the release's name itself. A name with a title of its
+    // own decides, version notes and all.
     if (single && (album.recordingTarget || canonicalCount <= 3)) {
-      const named = releaseTitle
-        .replace(/[\(\[\{][^()\[\]{}]*[\)\]\}]/g, " ")
-        .replace(/\b(?:19|20)\d\d\b/g, " ")
-        .replace(/\s{2,}/g, " ")
-        .trim();
-      for (const r of fileTitleRuns(named)) runs.push(r);
+      const ownBare = normalizeTitleKey(releaseBareName(parsed.baseName));
+      const ownNameIsRelease = ownBare !== "" && ownBare === normalizeTitleKey(releaseBareName(releaseTitle));
+      if (isTitlelessFileName(parsed.baseName) || ownNameIsRelease) {
+        for (const c of releaseTitleRuns()) cands.push(c);
+      }
     }
-    const found = new Map<number, boolean>(); // track index -> exact
-    for (const run of runs) {
-      const sig = titleSignature(run);
+    const found = new Map<number, { exact: boolean; named: boolean }>();
+    for (const c of cands) {
+      const sig = titleSignature(c.run, ignoreQual);
       if (!sig) continue;
+      const take = (ti: number, exact: boolean) => {
+        const verdict = classifyLead(c.lead, expectedFor(ti));
+        if (verdict === "foreign") return;
+        const cur = found.get(ti);
+        found.set(ti, { exact: exact || Boolean(cur?.exact), named: verdict === "named" || Boolean(cur?.named) });
+      };
       const exactTracks = byFull.get(sig.full);
-      if (exactTracks) for (const ti of exactTracks) found.set(ti, true);
+      if (exactTracks) for (const ti of exactTracks) take(ti, true);
       const sigTracks = bySig.get(sig.sig);
-      if (sigTracks) for (const ti of sigTracks) if (!found.has(ti)) found.set(ti, false);
+      if (sigTracks) for (const ti of sigTracks) take(ti, false);
     }
     if (found.size === 0) continue;
     const fileDisc = parsed.disc ?? 1;
-    for (const [ti, exact] of found) {
+    for (const [ti, f] of found) {
       const tr = album.tracks[ti];
       let numberAgrees = false;
       if (parsed.track !== null && tr.trackNumber > 0) {
@@ -1289,8 +1439,8 @@ export function matchTracksInRelease(
         numberAgrees = (discOk && parsed.track === tr.trackNumber) || flat;
         if (sameEdition && !numberAgrees) continue;
       }
-      if (!isPlausibleTrackSize(af.file.size, tr.durationSec, af.fmt.typicalKbps)) continue;
-      hits.push({ ti, fi, exact, numberAgrees, disc: fileDisc });
+      if (!isPlausibleTrackSize(af.file.size, tr.durationSec, af.fmt.typicalKbps, { lossless: af.fmt.lossless, hiRes })) continue;
+      hits.push({ ti, fi, exact: f.exact, numberAgrees, named: f.named, disc: fileDisc });
     }
   }
 
@@ -1302,15 +1452,32 @@ export function matchTracksInRelease(
       Number(b.numberAgrees) - Number(a.numberAgrees) ||
       a.ti - b.ti
   );
-  const usedTracks = new Set<number>();
-  const usedFiles = new Set<number>();
+  const sizeBasis = album.recordingTarget ? Math.max(album.recordingTarget.releaseTrackCount, canonicalCount) : canonicalCount;
+  const wholeSizeLimit = sizeBasis + Math.min(4, Math.max(2, Math.floor(sizeBasis * 0.25)));
+  const assign = (list: Hit[]) => {
+    const usedTracks = new Set<number>();
+    const usedFiles = new Set<number>();
+    const chosen: Hit[] = [];
+    for (const h of list) {
+      if (usedTracks.has(h.ti) || usedFiles.has(h.fi)) continue;
+      usedTracks.add(h.ti);
+      usedFiles.add(h.fi);
+      chosen.push(h);
+    }
+    return { usedTracks, chosen };
+  };
+  let assigned = assign(hits);
+  // A generic title ("Intro") is in a partial release only on a file whose number agrees or whose
+  // name says whose it is: a whole-album match leaves it as it is.
+  const partialNow = assigned.usedTracks.size < canonicalCount || audioFiles.length > wholeSizeLimit;
+  if (partialNow && assigned.chosen.some((h) => genericTrack.has(h.ti))) {
+    assigned = assign(hits.filter((h) => !genericTrack.has(h.ti) || h.numberAgrees || h.named));
+  }
+  const usedTracks = assigned.usedTracks;
   const mapping: Record<string, TrackFileMapping> = {};
   let confidenceSum = 0;
   let usedArchiveMember = false;
-  for (const h of hits) {
-    if (usedTracks.has(h.ti) || usedFiles.has(h.fi)) continue;
-    usedTracks.add(h.ti);
-    usedFiles.add(h.fi);
+  for (const h of assigned.chosen) {
     const tr = album.tracks[h.ti];
     const af = audioFiles[h.fi];
     const confidence = Math.min(1, (h.exact ? 0.95 : 0.85) + (h.numberAgrees ? 0.05 : 0));
@@ -1335,8 +1502,6 @@ export function matchTracksInRelease(
   }
   // Every track found in a release of about the album's size is the album; found among many more
   // files (a discography, several editions) it is a release that merely holds the tracks.
-  const sizeBasis = album.recordingTarget ? Math.max(album.recordingTarget.releaseTrackCount, canonicalCount) : canonicalCount;
-  const wholeSizeLimit = sizeBasis + Math.min(4, Math.max(2, Math.floor(sizeBasis * 0.25)));
   return {
     matched: true,
     partial: usedTracks.size < canonicalCount || audioFiles.length > wholeSizeLimit,
@@ -1758,11 +1923,13 @@ export class AlbumResolver {
       if (sources.length > 0) {
         return { sources, ttlSec: 3600 };
       }
-      // If every cached release was excluded on failover, invalidate & re-resolve.
-      if (excluded.size > 0) {
+      // Every cached release was excluded on failover: the album is resolved again, once per
+      // distinct exclude set (the record keeps the set it was resolved under; polls of the
+      // song's fallback search with the same set must not start the album over each time).
+      if (excluded.size > 0 && cached.excludedSig !== excludedSigOf(excluded)) {
         this.cache.delete(albumCacheKey(albumId));
         this.cache.delete(albumStageKey(albumId));
-      } else if (!cached.exhausted && cached.releases.length > 0 && (cached.resumes || 0) < MAX_ALBUM_RESUMES) {
+      } else if (excluded.size === 0 && !cached.exhausted && cached.releases.length > 0 && (cached.resumes || 0) < MAX_ALBUM_RESUMES) {
         // The releases listed so far hold other tracks of the album but not this one, and the
         // shortlist was not finished: the search goes on from where it stopped (below).
       } else {
@@ -1829,7 +1996,7 @@ export class AlbumResolver {
       if (done.negative) return { sources: [], ttlSec: Math.min(emptyTtlSec, this.negativeResponseTtlSec(done)) };
       const sources = this.buildTrackSources(item, releasesForItem(done.releases, item.id), excluded);
       if (sources.length > 0) return { sources, ttlSec: 3600 };
-      if (excluded.size === 0) return { sources: [], ttlSec: emptyTtlSec };
+      if (excluded.size === 0 || done.excludedSig === excludedSigOf(excluded)) return { sources: [], ttlSec: emptyTtlSec };
       this.cache.delete(albumCacheKey(recId));
     }
     let plan = this.cache.get<RecordingPlan>(recordingPlanKey(isrc));
@@ -1913,7 +2080,8 @@ export class AlbumResolver {
         durationSec: Number(hints.durationSec || item.fields?.duration || 0),
         explicit: false,
         isrc: String(hints.isrc || "") || undefined,
-        artistName: String(hints.trackArtistName || artistName),
+        // The song's own artist (the library's), not the compilation's or the single's credit.
+        artistName: String(hints.trackArtistName || hints.artistName || artistName),
       }],
       recordingTarget: { releaseTrackCount: cand.trackCount },
     };
@@ -2132,7 +2300,7 @@ export class AlbumResolver {
     allowUsenetCheck: boolean
   ): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
     const startMs = this.env.now();
-    const excludedSig = Array.from(excluded).sort().join("|");
+    const excludedSig = excludedSigOf(excluded);
     let stage = this.cache.get<ResolveStage>(albumStageKey(albumId));
     if (stage && stage.excludedSig !== excludedSig) {
       stage = null;
@@ -2334,6 +2502,7 @@ export class AlbumResolver {
       probedRefs,
       resumes: stage.resumes || 0,
       searchIncomplete: stage.searchIncomplete || undefined,
+      excludedSig: stage.excludedSig || undefined,
     };
     this.cache.set(albumCacheKey(albumId), record, ttlMs);
     this.cache.delete(albumStageKey(albumId));

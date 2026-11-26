@@ -392,6 +392,14 @@ const VERSION_BARE_LIVE_RE = /^[(\[{]\s*live(?:\s+(?:19|20)\d\d)?\s*[)\]}]$/i;
 const VERSION_EXTRAS_RE = /\b(?:bonus|incl|including)\b/;
 
 /**
+ * Whether a bracketed group of a RELEASE name is one isWrongVersionRelease ignores at the name
+ * stage: a note about the edition or its extras, or a bare "(Live)" / "[Live 1976]" tag.
+ */
+export function isEditionOrBareLiveNote(group: string): boolean {
+  return VERSION_EDITION_NOTE_RE.test(group) || VERSION_BARE_LIVE_RE.test(group);
+}
+
+/**
  * Name-level gate for a different VERSION of the requested recording: a release name that
  * declares a remix, live recording, alternate mix, or another volume/part which the requested
  * album title (full, with its edition suffix) does not declare. Markers in the artist name
@@ -762,36 +770,65 @@ export function isVariousArtistsName(name: string): boolean {
   return /^(?:various(?:\s+artists?)?|va|v\/a|multi[\s-]?artists?)$/i.test(String(name || "").trim());
 }
 
+// Words that name ANOTHER version of a song (or a performance of it). A credit note ("feat. X",
+// "with Y", "From Z") that holds one of them is no credit: "(feat. Drake Remix)", "(With
+// Orchestra)", "(From Live at Wembley)".
+const VERSION_WORD_RE =
+  /\b(?:live|remix(?:es|ed)?|rmx|mix(?:es|ed)?|edits?|demos?|acoustic|instrumental|karaoke|version|versions|ver|sessions?|orchestra|orchestral|mono|stereo|unplugged|cover|rework(?:ed)?|bootleg|extended|radio|club|dub|cappella|acapella|piano|strings|stripped|alternate|alternative|alt|take|rehearsal|concert|tour)\b/;
+
+/** Whether a text carries a word that names another version of a song. */
+export function hasVersionWord(text: string): boolean {
+  return VERSION_WORD_RE.test(normalizeTitleKey(text));
+}
+
 // Words that, alone in a bracketed note, say nothing about WHICH recording a title is: a release
-// may or may not carry them ("Money (2011 Remaster)", "Song (Album Version)", "(Explicit)").
+// may or may not carry them ("Money (2011 Remaster)", "(Explicit)", "(Deluxe Edition)").
 const BENIGN_NOTE_WORDS = new Set(
   (
-    "album original lp full stereo digital explicit clean bonus track deluxe edition version ver " +
-    "remaster remastered mastered new hd hq anniversary expanded special standard"
+    "album original lp full stereo digital explicit clean bonus track deluxe edition " +
+    "remaster remastered mastered hd hq anniversary expanded standard"
   ).split(" ")
+);
+// "Version" is harmless only beside a word that makes it the standard one: "Album Version",
+// "Original Version", "Explicit Version", "Remastered Version", "Stereo Version" (stereo is the
+// default presentation; a mono mix is a qualifier of its own). "Single Version" (single edits
+// differ in length), "Clean Version", "New", "Special", "Early", "Late", "Alternate" are not.
+const STANDARD_VERSION_WORDS = new Set(
+  "album original lp explicit remaster remastered mastered digital hd hq stereo".split(" ")
 );
 const BENIGN_NOTE_LEAD_RE = /^(?:feat|ft|featuring|with|prod|produced by|from|music from|theme from|original motion picture|original soundtrack|ost)(?: |$)/;
 
 /**
  * Whether a bracketed or dashed note on a title is harmless (a credit, a source, a remaster or
  * edition mark). Anything else - "live", "remix", "early version", "radio edit", a name plus
- * "ver." - names another version of the song.
+ * "ver." - names another version of the song. A credit ("feat. X", "with Y", "From Z") is
+ * harmless only when what follows names no version.
  */
 export function isBenignTitleNote(note: string): boolean {
   const n = normalizeTitleKey(note);
   if (!n) return true;
-  if (BENIGN_NOTE_LEAD_RE.test(n)) return true;
-  return n.split(" ").every((w) => BENIGN_NOTE_WORDS.has(w) || /^(?:19|20)\d\d$/.test(w));
+  if (BENIGN_NOTE_LEAD_RE.test(n)) return !VERSION_WORD_RE.test(n);
+  const words = n.split(" ");
+  const isYear = (w: string) => /^(?:19|20)\d\d$/.test(w);
+  if (words.some((w) => w === "version" || w === "ver")) {
+    const others = words.filter((w) => w !== "version" && w !== "ver");
+    return others.some((w) => STANDARD_VERSION_WORDS.has(w)) && others.every((w) => STANDARD_VERSION_WORDS.has(w) || isYear(w));
+  }
+  return words.every((w) => BENIGN_NOTE_WORDS.has(w) || isYear(w));
 }
 
 const TITLE_MARKER_RE =
-  /\b(?:live|remix(?:es|ed)?|rmx|mix|demo|acoustic|instrumental|karaoke|edit|mono|sessions?|early|alternate|alternative|alt|take|unplugged|cover|cappella|acapella|reprise|dub|rehearsal|outtake|unreleased|radio|single|extended|version|ver|sped|slowed|reverb|stripped|piano|orchestral|reimagined|rework|bootleg)\b/;
+  /\b(?:live|remix(?:es|ed)?|rmx|mix|demo|acoustic|instrumental|karaoke|edit|mono|sessions?|early|alternate|alternative|alt|take|unplugged|cover|cappella|acapella|reprise|dub|rehearsal|outtake|unreleased|radio|single|extended|version|ver|sped|slowed|reverb|stripped|piano|orchestral|orchestra|strings|club|concert|tour|reimagined|rework|bootleg)\b/;
 
 export interface TitleSignature {
   /** The whole title, normalized: two titles equal here are the same text. */
   full: string;
   /** The title without its benign trailing notes, plus the notes that name a version. */
   sig: string;
+  /** The title without any trailing note, normalized. */
+  base: string;
+  /** Every note that names a version, normalized, whether or not `ignoreQual` dropped it from `sig`. */
+  quals: string[];
 }
 
 /**
@@ -799,13 +836,17 @@ export interface TitleSignature {
  * peeled off: harmless ones (feat./with credits, "From ...", "Album Version", remaster marks) are
  * dropped, the others are kept as version qualifiers. Two titles are the same song when their
  * `sig` is equal: "Money (2011 Remaster)" = "Money", but "Money (Live)" != "Money" and
- * "World Turning" != "World Turning (Early Version)".
+ * "World Turning" != "World Turning (Early Version)". `ignoreQual` names qualifiers that hold for
+ * the whole album ("Live" on every track of a live album): they are left out of `sig`.
  */
-export function titleSignature(title: string): TitleSignature | null {
+export function titleSignature(title: string, ignoreQual?: (qualifier: string) => boolean): TitleSignature | null {
   const raw = String(title || "").trim();
   const full = normalizeTitleKey(raw);
   if (!full) return null;
-  let s = stripFeaturing(raw);
+  // Credits that name no version are no part of the title, wherever they stand.
+  let s = raw.replace(/\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+([^\)\]]+)[\)\]]/gi, (m, rest: string) =>
+    hasVersionWord(rest) ? m : ""
+  );
   const quals: string[] = [];
   for (let i = 0; i < 8; i++) {
     const g = s.match(/^(.*\S)\s*[\(\[\{]([^()\[\]{}]*)[\)\]\}]\s*$/);
@@ -827,38 +868,147 @@ export function titleSignature(title: string): TitleSignature | null {
         continue;
       }
     }
+    const f = s.match(/^(.*\S)\s+(?:feat\.?|ft\.?|featuring)\s+(.+)$/i);
+    if (f && !hasVersionWord(f[2])) {
+      s = f[1];
+      continue;
+    }
     break;
   }
   const base = normalizeTitleKey(s);
-  if (!base) return { full, sig: `${full}|` };
-  return { full, sig: `${base}|${quals.sort().join(";")}` };
+  if (!base) return { full, sig: `${full}|`, base: full, quals: [] };
+  const kept = ignoreQual ? quals.filter((q) => !ignoreQual(q)) : quals;
+  return { full, sig: `${base}|${kept.sort().join(";")}`, base, quals };
+}
+
+const GENERIC_TRACK_TITLES = new Set(["intro", "outro", "interlude", "skit", "untitled", "prelude", "reprise", "bonus", "hidden track"]);
+
+/** A title that says nothing about which song it is ("Intro", "Interlude", "Track 5"). */
+export function isGenericTrackTitle(base: string): boolean {
+  return GENERIC_TRACK_TITLES.has(base) || /^track \d{1,3}$/.test(base);
+}
+
+/** A file named with no title of its own: a bare number, "track01", "audio". */
+const NO_TITLE_WORDS = new Set(
+  "track tr trk audio song music file unknown title no name noname sound recording disc cd disk side part full single mp3 flac wav".split(" ")
+);
+export function isTitlelessFileName(baseName: string): boolean {
+  const t = normalizeTitleKey(String(baseName || "").replace(/[\(\[\{][^()\[\]{}]*[\)\]\}]/g, " ")).replace(/\d+/g, " ");
+  const words = t.split(/\s+/).filter(Boolean);
+  return words.every((w) => NO_TITLE_WORDS.has(w));
+}
+
+/** A segment of a file name with the text in front of the title, and what stands before it. */
+export interface FileTitleCandidate {
+  run: string;
+  /** The segments in front of the run (artist, album, numbers), in order. */
+  lead: string[];
 }
 
 /**
- * The titles a file name may carry, longest first: a name is often "Artist - Album - 01 - Title"
- * or scene style "01-artist-title", so every tail after a separator is a candidate. `rest` is the
- * file name without extension and track number; `baseName` the one with the number kept
- * ("99 Problems").
+ * The titles a file name may carry, longest first, each with the segments in front of it: a name
+ * is often "Artist - Album - 01 - Title" or scene style "01-artist-title", so every tail after a
+ * separator is a candidate. Separators are " - " (spaces around the dash) and, in scene style (no
+ * spaces at all, starting with a track number), the hyphen; a hyphen inside a word never splits
+ * ("Spider-Man"). `rest` is the file name without extension and track number; `baseName` the one
+ * with the number kept ("99 Problems").
  */
-export function fileTitleRuns(rest: string, baseName = ""): string[] {
-  const out: string[] = [];
+export function fileTitleCandidates(rest: string, baseName = ""): FileTitleCandidate[] {
+  const out: FileTitleCandidate[] = [];
   const seen = new Set<string>();
-  const add = (text: string) => {
-    const segs = text
-      .split(/\s+[-–—]\s+/)
-      .flatMap((p) => p.split(/-(?=[^\s-])/))
-      .map((x) => x.trim())
+  const scene = Boolean(baseName) && !/\s/.test(baseName) && /^\d{1,3}[-_]/.test(baseName) && rest.includes("-");
+  const add = (text: string, sceneStyle: boolean) => {
+    const segs = (sceneStyle ? text.split("-") : text.split(/\s+[-–—]\s+/))
+      .map((x) => x.replace(/_/g, " ").trim())
       .filter(Boolean)
       .slice(0, 8);
     for (let i = 0; i < segs.length; i++) {
       const run = segs.slice(i).join(" - ");
-      if (!seen.has(run)) {
-        seen.add(run);
-        out.push(run);
+      const key = `${run}\u0000${segs.slice(0, i).join("\u0001")}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push({ run, lead: segs.slice(0, i) });
       }
     }
   };
-  add(rest.replace(/_/g, " "));
-  if (baseName && baseName !== rest) add(baseName.replace(/_/g, " "));
+  add(scene ? rest : rest.replace(/_/g, " "), scene);
+  if (baseName && baseName !== rest) add(scene ? baseName : baseName.replace(/_/g, " "), scene);
   return out;
 }
+
+/** fileTitleCandidates without the leads. */
+export function fileTitleRuns(rest: string, baseName = ""): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of fileTitleCandidates(rest, baseName)) {
+    if (!seen.has(c.run)) {
+      seen.add(c.run);
+      out.push(c.run);
+    }
+  }
+  return out;
+}
+
+/** What the segments in front of a title say about who made the file. */
+export type LeadVerdict = "none" | "neutral" | "named" | "foreign";
+
+export interface ExpectedLead {
+  /** Names of the artists the track may carry (empty: unknown, nothing is checked). */
+  artists: string[];
+  /** Album titles (the album's, its core form) a segment may name. */
+  albums: string[];
+  /** Whole segments of the release name (brackets and years removed) a segment may equal. */
+  releaseSegments: string[];
+  /** The album's artist is "Various Artists": that name in a file is no mismatch. */
+  variousArtists?: boolean;
+}
+
+const LEAD_STOP_WORDS = new Set(["the", "a", "an", "and", "feat", "ft", "featuring", "with", "of", "vs", "x"]);
+const isYearToken = (w: string) => /^(?:19|20)\d\d$/.test(w);
+
+function leadTokens(text: string): string[] {
+  return normalizeTitleKey(text)
+    .split(" ")
+    .filter((w) => w && !LEAD_STOP_WORDS.has(w) && !isYearToken(w));
+}
+
+function tokensCompatible(a: string[], b: string[]): boolean {
+  if (a.length === 0 || b.length === 0) return false;
+  const sa = new Set(a);
+  const sb = new Set(b);
+  return a.every((t) => sb.has(t)) || b.every((t) => sa.has(t));
+}
+
+/**
+ * Whether the segments in front of a file's title are consistent with the expected artist and
+ * album: each is a track or disc number, a year, the artist (all its significant words in the
+ * segment, or all the segment's words in the artist's name: "Coldplay" for "Coldplay feat. X"),
+ * the album title, or a segment of the release name. Text that is none of these names someone
+ * else: "foreign". With no artist known nothing is judged (never "foreign").
+ */
+export function classifyLead(lead: string[], exp: ExpectedLead): LeadVerdict {
+  if (lead.length === 0) return "none";
+  let named = false;
+  const artists = exp.artists.map((a) => ({ tokens: leadTokens(a), joined: leadTokens(a).join("") }));
+  const albums = exp.albums.map((a) => ({ tokens: leadTokens(a), joined: leadTokens(a).join("") })).filter((a) => a.tokens.length > 0);
+  const relSegs = new Set(exp.releaseSegments.map((r) => leadTokens(r).join(" ")).filter(Boolean));
+  for (const seg of lead) {
+    const toks = leadTokens(seg);
+    const key = normalizeTitleKey(seg);
+    // A track or disc number, a year, or nothing: says nothing about who made the file.
+    if (toks.every((w) => /^\d+$/.test(w)) || /^(?:cd|disc|disk|d|track|tr|trk|no|side)\s*\d{1,3}$/.test(key)) continue;
+    if (artists.length === 0) continue; // no artist known: nothing to compare against
+    const joined = toks.join("");
+    const isArtist = artists.some((a) => a.joined === joined || tokensCompatible(toks, a.tokens));
+    const isVa = Boolean(exp.variousArtists) && isVariousArtistsName(seg.trim());
+    const isAlbum = albums.some((a) => a.joined === joined || tokensCompatible(toks, a.tokens));
+    const isRelease = relSegs.has(toks.join(" "));
+    if (isArtist || isVa || isAlbum || isRelease) {
+      named = true;
+      continue;
+    }
+    return "foreign";
+  }
+  return named ? "named" : "neutral";
+}
+

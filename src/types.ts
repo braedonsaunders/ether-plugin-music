@@ -366,6 +366,8 @@ export interface CachedAlbumResolution {
   resumes?: number;
   /** The last search behind this record had indexers still running, timed out or failed: it is not a verdict. */
   searchIncomplete?: boolean;
+  /** The exclude set (sorted, joined) the record was resolved under; "" or absent: none. */
+  excludedSig?: string;
 }
 
 export interface VerifiedConcertRelease {

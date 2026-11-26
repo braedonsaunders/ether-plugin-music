@@ -3462,7 +3462,7 @@ test("a later play of another track re-uses the listed releases and goes on only
       listed.push(q.candidate!.nzbUrl!);
       // The first three hold tracks 1-3; the last one is the only one with track 6.
       const names = q.candidate!.nzbUrl === "https://nzb.test/r4" ? [5] : [0, 1, 2];
-      return { candidates: [{ ...q.candidate!, files: filesOf(names.map((ti) => `${pad2(ti + 1)} ${titles[ti]}.${q.candidate!.nzbUrl === "https://nzb.test/r4" ? "mp3" : "flac"}`)) }] };
+      return { candidates: [{ ...q.candidate!, files: filesOf(names.map((ti) => `${pad2(ti + 1)} ${titles[ti]}.${q.candidate!.nzbUrl === "https://nzb.test/r4" ? "mp3" : "flac"}`), q.candidate!.nzbUrl === "https://nzb.test/r4" ? 9_000_000 : 30_000_000) }] };
     }
     if (q.kind === "usenet_check") return usenetOk(q.candidate!);
     return { candidates: [] };
@@ -3666,4 +3666,385 @@ test("defect 5: an incomplete resumed search with nothing to list answers pendin
   const rec = h.cache.get<{ exhausted?: boolean; negative?: boolean }>(albumCacheKey("al-777"));
   assert.notEqual(rec?.exhausted, true);
   assert.notEqual(rec?.negative, true);
+});
+
+// ---- Review 3: file-name matching (defects 1-4, 8), exclusions (9, 10), folder guard (11) ----
+import { isPlausibleTrackSize, isGenericAlbumTitle } from "./resolver.ts";
+import { isBenignTitleNote, titleSignature, fileTitleRuns } from "./normalize.ts";
+
+const R3MB = 1_000_000;
+
+interface R3Opts {
+  artist?: string;
+  albumTitle?: string;
+  dur?: number;
+  size?: number;
+  others?: string[];
+  trackNo?: number;
+  trackArtists?: string[];
+  release?: string;
+  recording?: boolean;
+  /** Titles of the album's other tracks (default: two fillers, the files hold them). */
+  tracks?: string[];
+}
+
+function r3Album(titles: string[], o: R3Opts = {}): CanonicalAlbum {
+  const artist = o.artist ?? "Coldplay";
+  return {
+    ...sampleDiscoveryAlbum(),
+    id: "al-r3",
+    artistName: artist,
+    title: o.albumTitle ?? "Alb",
+    trackCount: titles.length,
+    discCount: 1,
+    tracks: titles.map((t, i) => ({
+      id: `t${i}`, deezerTrackId: i, title: t, disc: 1, trackNumber: i + 1, durationSec: o.dur ?? 240, explicit: false,
+      artistName: o.trackArtists?.[i] ?? artist,
+    })),
+    ...(o.recording ? { recordingTarget: { releaseTrackCount: 12 } } : {}),
+  };
+}
+
+/** Whether `file` (alone among two filler files of the same edition) serves a track titled `trackTitle`. */
+function r3Serves(file: string, trackTitle: string, o: R3Opts = {}): boolean {
+  const others = o.others ?? ["Other A", "Other B"];
+  const album = r3Album([trackTitle, ...others], o);
+  const m = file.match(/^(\d+)[ -]/);
+  album.tracks[0].trackNumber = o.trackNo ?? (m ? Number(m[1]) : 1);
+  const files = [{ index: 0, path: file, size: o.size ?? 30 * R3MB }];
+  others.forEach((t, i) => files.push({ index: i + 1, path: `${String(i + 2).padStart(2, "0")} ${t}.flac`, size: 30 * R3MB }));
+  const r = matchTracksInRelease(album, o.release ?? "Coldplay - Alb [FLAC]", files, "flac_preferred");
+  return Boolean(r.tracks["t0"]);
+}
+
+/** The same, in a dump of 30 unrelated files (so no file count or number settles it). */
+function r3ServesInDump(file: string, trackTitle: string, o: R3Opts = {}): boolean {
+  const filler = Array.from({ length: 30 }, (_, i) => `Filler ${i}`);
+  const album = r3Album([trackTitle, ...filler.slice(0, 10)], o);
+  const files = [{ index: 0, path: file, size: o.size ?? 30 * R3MB }, ...filler.map((f, i) => ({ index: i + 1, path: `${String(i + 20).padStart(2, "0")} ${f}x.flac`, size: 30 * R3MB }))];
+  return Boolean(matchTracksInRelease(album, o.release ?? "Coldplay - Alb [FLAC]", files, "flac_preferred").tracks["t0"]);
+}
+
+function r3Single(file: string, release: string, albumTracks = 1, extra: Partial<R3Opts> = {}): boolean {
+  const album = r3Album(["Atlas", ...Array.from({ length: albumTracks - 1 }, (_, i) => `Other ${i + 1}`)], { albumTitle: "Atlas", dur: 270, ...extra });
+  const r = matchTracksInRelease(album, release, [{ index: 0, path: file, size: 30 * R3MB }], "flac_preferred");
+  return Boolean(r.tracks["t0"]);
+}
+
+test("defect 1: a one-file release named for the song takes its title from the release only when the file has none", () => {
+  const rel = "Coldplay - Atlas [FLAC]";
+  for (const albumTracks of [1, 3]) {
+    // The file's own title decides, version notes and all.
+    for (const f of ["01 Atlas (Demo).flac", "01 Atlas (Live at Wembley).flac", "01 Atlas - Acoustic.flac", "01 Atlas (Tiësto Remix).flac", "01 Something Else Entirely.flac", "01 Intro.flac"]) {
+      assert.equal(r3Single(f, rel, albumTracks), false, `${f} (${albumTracks}-track album)`);
+    }
+    // No title of its own: the release name stands in.
+    for (const f of ["01.flac", "track01.flac", "audio.flac", "Track 01.flac"]) {
+      assert.equal(r3Single(f, rel, albumTracks), true, `${f} (${albumTracks}-track album)`);
+    }
+    for (const f of ["01 Atlas.flac", "Coldplay - Atlas.flac", "01-coldplay-atlas.flac"]) {
+      assert.equal(r3Single(f, rel, albumTracks), true, `${f} has the title itself`);
+    }
+    // A name that is just the release name.
+    assert.equal(r3Single("Coldplay - Atlas [FLAC].flac", rel, albumTracks), true);
+    assert.equal(r3Single("Coldplay - Atlas (2013) [FLAC].flac", "Coldplay - Atlas (2013) [FLAC]", albumTracks), true);
+  }
+  // The release name's own brackets are read for version notes.
+  for (const release of ["Coldplay - Atlas (Radio Edit) [FLAC]", "Coldplay - Atlas (Demo)", "Coldplay - Atlas (Tiësto Remix) [FLAC]", "Coldplay - Atlas - Acoustic [FLAC]"]) {
+    for (const f of ["01.flac", "track01.flac", `${release}.flac`]) assert.equal(r3Single(f, release), false, `${release} / ${f}`);
+  }
+  // Format and edition brackets are ignored.
+  for (const release of ["Coldplay - Atlas [FLAC]", "Coldplay - Atlas (2013)", "Coldplay - Atlas [single]", "Coldplay - Atlas (Deluxe)", "Coldplay - Atlas (2013) [FLAC 24-96]", "Coldplay - Atlas (Remastered) [WEB]"]) {
+    assert.equal(r3Single("01.flac", release), true, release);
+  }
+  // A bare "(Live)" on the release name is read as isWrongVersionRelease reads it at the name stage: ignored.
+  assert.equal(isWrongVersionRelease("Coldplay - Atlas (Live)", "Atlas", "Coldplay").rejected, false);
+  assert.equal(r3Single("01.flac", "Coldplay - Atlas (Live)"), true);
+  // Another artist's release does not serve the song.
+  assert.equal(r3Single("01.flac", "Other Artist - Atlas [FLAC]"), false);
+});
+
+test("defect 2: the artist in a file name is checked", () => {
+  const O = { others: ["Other A", "Other B"] };
+  for (const f of ["03 - Other Artist - Atlas.flac", "Other Artist - Atlas.flac", "03-other_artist-atlas.mp3", "Other Artist - Alb - 03 - Atlas.flac", "04. Someone Else - Atlas.flac"]) {
+    assert.equal(r3Serves(f, "Atlas", { ...O, size: 9 * R3MB, trackNo: 3 }), false, f);
+    assert.equal(r3ServesInDump(f, "Atlas", { size: 9 * R3MB }), false, `${f} (dump)`);
+  }
+  // Still served.
+  for (const f of ["01 Atlas.flac", "01-coldplay-atlas.mp3", "Coldplay - Atlas.flac", "Coldplay - Alb - 03 - Atlas.flac", "01 - Coldplay - Atlas.flac",
+    "Coldplay feat. Rihanna - Atlas.flac", "COLDPLAY - ATLAS.flac", "coldplay_-_atlas.flac", "2013 - Coldplay - Atlas.flac", "Coldplay - Alb 2013 - 01 - Atlas.flac"]) {
+    assert.equal(r3Serves(f, "Atlas", { ...O, size: 9 * R3MB }), true, f);
+  }
+  // The album named in the file; the release's own segments.
+  assert.equal(r3Serves("Coldplay - Ghost Stories - 03 - Atlas.flac", "Atlas", { albumTitle: "Ghost Stories", trackNo: 3 }), true);
+  assert.equal(r3Serves("Coldplay - Ghost Stories 2014 - 03 - Atlas.flac", "Atlas", { albumTitle: "Ghost Stories", trackNo: 3 }), true);
+  assert.equal(r3Serves("Ghost Stories - Atlas.flac", "Atlas", { albumTitle: "Ghost Stories (Deluxe Edition)" }), true);
+  assert.equal(r3Serves("Other Artist - Ghost Stories - 03 - Atlas.flac", "Atlas", { albumTitle: "Ghost Stories", trackNo: 3 }), false);
+  // Artist spellings: "The", joined names, a name with a credit.
+  assert.equal(r3Serves("Beatles - Hey Jude.flac", "Hey Jude", { artist: "The Beatles" }), true);
+  assert.equal(r3Serves("ACDC - Thunderstruck.flac", "Thunderstruck", { artist: "AC/DC" }), true);
+  assert.equal(r3Serves("Coldplay - Atlas.flac", "Atlas", { artist: "Coldplay feat. Someone" }), true);
+  assert.equal(r3Serves("Simon and Garfunkel - America.flac", "America", { artist: "Simon & Garfunkel" }), true);
+  assert.equal(r3Serves("Other Artist - America.flac", "America", { artist: "Simon & Garfunkel" }), false);
+  // Various-artists album: each track has its own artist.
+  const va = { artist: "Various Artists", trackArtists: ["Coldplay", "Other A Artist", "Other B Artist"] };
+  assert.equal(r3Serves("Coldplay - Atlas.flac", "Atlas", va), true);
+  assert.equal(r3Serves("Other Artist - Atlas.flac", "Atlas", va), false);
+  assert.equal(r3Serves("Various Artists - Atlas.flac", "Atlas", va), true);
+  assert.equal(r3Serves("Atlas.flac", "Atlas", va), true);
+  // The track's artist is unknown: nothing is judged, as before.
+  assert.equal(r3Serves("Other Artist - Atlas.flac", "Atlas", { artist: "", trackArtists: ["", "", ""], size: 9 * R3MB }), true);
+  assert.equal(r3Serves("Other Artist - Atlas.flac", "Atlas", { artist: "Various Artists", trackArtists: ["Various Artists", "x", "y"] }), true);
+  // The recording path (a song looked for on another release, compilations allowed).
+  assert.equal(r3Serves("Other Artist - Atlas.flac", "Atlas", { recording: true, others: [] }), false);
+  assert.equal(r3Serves("Coldplay - Atlas.flac", "Atlas", { recording: true, others: [] }), true);
+});
+
+test("defect 3: durations under 60 s are checked with a tight tolerance; short tracks and oversized files", () => {
+  assert.equal(durationToleranceFor(10), 3);
+  assert.equal(durationToleranceFor(20), 3);
+  assert.equal(durationToleranceFor(30), 3);
+  assert.equal(durationToleranceFor(45), 5);
+  assert.equal(durationToleranceFor(59), 6);
+  assert.equal(durationToleranceFor(60), 7);
+  assert.equal(durationToleranceFor(240), 7);
+  assert.equal(durationToleranceFor(400), 12);
+  assert.equal(durationToleranceFor(1000), 30);
+
+  // Size window: lossless 0.25x-3x of 920 kbps (4 min: 27.6 MB), lossy 0.35x-2.5x, hi-res up to 6x.
+  const flac = 920, mp3 = 320;
+  assert.equal(isPlausibleTrackSize(80 * R3MB, 240, flac, { lossless: true }), true);
+  assert.equal(isPlausibleTrackSize(84 * R3MB, 240, flac, { lossless: true }), false);
+  assert.equal(isPlausibleTrackSize(84 * R3MB, 240, flac, { lossless: true, hiRes: true }), true);
+  assert.equal(isPlausibleTrackSize(160 * R3MB, 240, flac, { lossless: true, hiRes: true }), true);
+  assert.equal(isPlausibleTrackSize(170 * R3MB, 240, flac, { lossless: true, hiRes: true }), false);
+  assert.equal(isPlausibleTrackSize(7 * R3MB, 240, flac, { lossless: true }), true);
+  assert.equal(isPlausibleTrackSize(6 * R3MB, 240, flac, { lossless: true }), false);
+  assert.equal(isPlausibleTrackSize(23 * R3MB, 240, mp3, { lossless: false }), true);
+  assert.equal(isPlausibleTrackSize(25 * R3MB, 240, mp3, { lossless: false }), false);
+  assert.equal(isPlausibleTrackSize(3.3 * R3MB, 240, mp3, { lossless: false }), false);
+  assert.equal(isPlausibleTrackSize(3.5 * R3MB, 240, mp3, { lossless: false }), true);
+  // Under 45 s: 1.5 MB on the upper bound, the ratio is the same. A 20 s FLAC is 2.3 MB typical.
+  assert.equal(isPlausibleTrackSize(8 * R3MB, 20, flac, { lossless: true }), true);
+  assert.equal(isPlausibleTrackSize(9 * R3MB, 20, flac, { lossless: true }), false);
+  assert.equal(isPlausibleTrackSize(0.5 * R3MB, 20, flac, { lossless: true }), false, "the lower bound has no allowance");
+  assert.equal(isPlausibleTrackSize(0, 20, flac), true, "unknown size passes");
+  assert.equal(isPlausibleTrackSize(9 * R3MB, 0, flac), true, "unknown length passes");
+
+  // A 20 s "Intro" does not take a 9 MB "Intro.flac" out of a 300-file dump.
+  const album = r3Album(["Intro", "Other"], { dur: 240 });
+  album.tracks[0].durationSec = 20;
+  const dump = (introSize: number, name = "Dump/Intro.flac") =>
+    Array.from({ length: 300 }, (_, i) => ({ index: i, path: i === 150 ? name : `Dump/Filler ${i}.flac`, size: i === 150 ? introSize : 30 * R3MB }));
+  assert.equal(Boolean(matchTracksInRelease(album, "Dump", dump(9 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), false, "oversized");
+  assert.equal(Boolean(matchTracksInRelease(album, "Dump", dump(2.5 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), true, "right size, artist named");
+  // Hi-res release: the same file is possible.
+  assert.equal(Boolean(matchTracksInRelease(album, "Coldplay - Dump [FLAC 24-96]", dump(9 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), true, "a release labelled hi-res may hold up to 6x");
+});
+
+test("defect 3: a generic title matches in a partial release only with its number or a named artist/album", () => {
+  const album = r3Album(["Intro", "Song Two", "Song Three", "Outro"], { albumTitle: "Ghost Stories" });
+  for (const i of [0, 1, 3]) album.tracks[i].durationSec = 60;
+  const dump = (name: string, n = 40) => [{ index: 0, path: name, size: 6 * R3MB }, ...Array.from({ length: n }, (_, i) => ({ index: i + 1, path: `Filler ${i}.flac`, size: 30 * R3MB }))];
+  const serves = (name: string, track = "t0") => Boolean(matchTracksInRelease(album, "Misc Dump", dump(name), "flac_preferred").tracks[track]);
+  assert.equal(serves("Intro.flac"), false, "bare title in a dump");
+  assert.equal(serves("Some Folder - Intro.flac"), false, "foreign text before it (rule 2)");
+  assert.equal(serves("07 Intro.flac"), false, "a number that is not the track's");
+  assert.equal(serves("01 Intro.flac"), true, "the number agrees");
+  assert.equal(serves("Coldplay - Intro.flac"), true, "artist named");
+  assert.equal(serves("Ghost Stories - Intro.flac"), true, "album named");
+  assert.equal(serves("Outro.flac", "t3"), false);
+  assert.equal(serves("04 Outro.flac", "t3"), true);
+  // A whole-album match is unchanged.
+  const whole = [{ index: 0, path: "Intro.flac", size: 6 * R3MB }, { index: 1, path: "Song Two.flac", size: 6 * R3MB }, { index: 2, path: "Song Three.flac", size: 30 * R3MB }, { index: 3, path: "Outro.flac", size: 6 * R3MB }];
+  const res = matchTracksInRelease(album, "Coldplay - Ghost Stories [FLAC]", whole, "flac_preferred");
+  assert.equal(res.partial, false);
+  assert.ok(res.tracks["t0"] && res.tracks["t3"]);
+  // Generic words are never matched to another song, and a specific title is not held back.
+  assert.equal(serves("Song Two.flac", "t1"), true);
+});
+
+test("defect 4: credit and version notes, and hyphens inside words", () => {
+  const Q = ["Song (feat. Drake Remix).flac", "Song (feat. X Live).flac", "Song (From Live at Wembley).flac", "Song (New Version).flac", "Song (Special Version).flac", "Song (With Orchestra).flac",
+    "Song (Single Version).flac", "Song (Clean Version).flac", "Song (Early Version).flac", "Song (Late Version).flac", "Song (Alternate Version).flac", "Song (ft. Y Acoustic).flac",
+    "Song (with X) (Live).flac", "Song feat. X Remix.flac", "Song feat. X (Live).flac", "Song (Mono Version).flac", "Song (Version 2).flac"];
+  for (const f of Q) {
+    assert.equal(r3ServesInDump(f, "Song"), false, `${f} must not serve "Song"`);
+    assert.equal(r3Serves(`05 ${f}`, "Song"), false, `05 ${f}`);
+  }
+  // Credits, sources, standard versions: harmless.
+  const B = ["Song (feat. X & Z).flac", "Song (feat. Jay-Z).flac", "Song (with Y).flac", "Song (From the Motion Picture X).flac", "Song (From \"X\" Soundtrack).flac",
+    "Song (Album Version).flac", "Song (Original Version).flac", "Song (Explicit Version).flac", "Song (Remastered Version).flac", "Song (Stereo Version).flac",
+    "Song (2011 Remaster).flac", "Song - Remastered 2011.flac", "Song (Explicit).flac", "Song feat. X.flac", "Song ft. X.flac", "Song (Bonus Track).flac", "Song (Deluxe Edition).flac", "Song (prod. by Z).flac"];
+  for (const f of B) assert.equal(r3ServesInDump(f, "Song"), true, `${f} serves "Song"`);
+  assert.equal(r3ServesInDump("Song.flac", "Song (feat. Drake) (Album Version)"), true);
+  assert.equal(r3ServesInDump("Song (feat. Drake Remix).flac", "Song (feat. Drake Remix)"), true, "the same note on both sides");
+  assert.equal(r3ServesInDump("Song.flac", "Song (feat. Drake Remix)"), false);
+  // isBenignTitleNote, listed.
+  const benign = ["feat. X", "ft. X & Y", "featuring Jay-Z", "with Y", "prod. Z", "From the Motion Picture X", "From \"X\" Soundtrack", "Album Version", "Original Version", "Explicit Version", "Remastered Version",
+    "Stereo Version", "2011 Remaster", "Remastered 2011", "Explicit", "Clean", "Bonus Track", "Deluxe Edition", "Digital Remaster", "Original Soundtrack", "LP Version"];
+  const notBenign = ["feat. Drake Remix", "feat. X Live", "From Live at Wembley", "With Orchestra", "New Version", "Special Version", "Single Version", "Clean Version", "Early Version", "Late Version",
+    "Alternate Version", "Version", "Version 2", "Mono Version", "Live", "Remix", "Radio Edit", "Demo", "Acoustic", "Instrumental", "with strings", "feat. DJ Mix", "prod. X (Remix)", "Taylor's Version", "Original Mix"];
+  for (const n of benign) assert.equal(isBenignTitleNote(n), true, `benign: ${n}`);
+  for (const n of notBenign) assert.equal(isBenignTitleNote(n), false, `not benign: ${n}`);
+  for (const w of ["live", "remix", "mix", "edit", "demo", "acoustic", "instrumental", "karaoke", "version", "session", "orchestra", "orchestral", "mono", "stereo", "unplugged", "cover", "rework", "bootleg", "extended", "radio", "club", "dub", "a cappella", "acapella", "piano", "strings", "stripped", "alternate", "alt", "take", "rehearsal", "concert", "tour"]) {
+    assert.equal(isBenignTitleNote(`feat. X ${w}`), false, `a credit holding "${w}"`);
+  }
+  // Hyphens inside a word never split a title.
+  assert.deepEqual(fileTitleRuns("Spider-Man"), ["Spider-Man"]);
+  assert.equal(r3ServesInDump("Spider-Man.flac", "Man"), false);
+  assert.equal(r3ServesInDump("05 Time-Out.flac", "Out"), false);
+  assert.equal(r3ServesInDump("05 Ex-Girlfriend.flac", "Girlfriend"), false);
+  assert.equal(r3ServesInDump("Spider-Man.flac", "Spider-Man"), true);
+  assert.equal(r3ServesInDump("05 Time-Out.flac", "Time-Out"), true);
+  assert.equal(r3Serves("Spider-Man.flac", "Spider-Man"), true);
+  // " - " (spaces) and the scene style "nn-artist-title" still split; there the title is the last segment(s).
+  assert.deepEqual(fileTitleRuns("Coldplay - Atlas"), ["Coldplay - Atlas", "Atlas"]);
+  assert.equal(r3ServesInDump("01-coldplay-atlas.mp3", "Atlas", { size: 9 * R3MB }), true);
+  assert.equal(r3ServesInDump("01-other_artist-atlas.mp3", "Atlas", { size: 9 * R3MB }), false);
+  assert.equal(r3ServesInDump("05-Time-Out.mp3", "Time-Out", { size: 9 * R3MB }), true);
+  assert.equal(r3ServesInDump("05-Time-Out.mp3", "Out", { size: 9 * R3MB }), false);
+  assert.equal(r3ServesInDump("05-coldplay-spider-man.mp3", "Spider-Man", { size: 9 * R3MB }), true);
+  // The versions that must stay distinct.
+  assert.equal(r3Serves("Money (Live).flac", "Money"), false);
+  assert.equal(r3Serves("World Turning.flac", "World Turning (Early Version)"), false);
+  assert.equal(r3Serves("05 - Money (2011 Remaster).flac", "Money"), true);
+  assert.equal(r3Serves("05 Money - Remastered 2011.flac", "Money"), true);
+  assert.equal(r3Serves("1-05 Money.flac", "Money", { trackNo: 5 }), true);
+  assert.equal(r3Serves("Deja Vu (feat. Jay-Z).flac", "Deja Vu (feat. JAŸ-Z) (Album Version)"), true);
+  assert.equal(r3Serves("ギルドからの招待状.flac", "ギルドからの招待状"), true);
+  assert.equal(r3Serves("ทุกคืน.flac", "ทุกคืน"), true);
+  assert.equal(r3Serves("Senorita.flac", "Señorita"), true);
+  assert.equal(r3Serves("Señorita.flac", "Senorita"), true);
+  assert.equal(r3Serves("Dont Stop.flac", "Don't Stop"), true);
+  assert.equal(r3Serves("Don’t Stop.flac", "Dont Stop"), true);
+  assert.equal(r3Serves("Rock and Roll.flac", "Rock & Roll"), true);
+  assert.equal(r3Serves("Rock & Roll.flac", "Rock and Roll"), true);
+  assert.equal(r3Serves("01 Atlas.flac", "Atlas"), true);
+  assert.equal(titleSignature("Song (feat. Drake Remix)")?.sig, "song|feat drake remix");
+});
+
+test("defect 8: version notes every track carries are album-level; the release name's notes count for a recording", () => {
+  const caravan = (n: string) => `${n} (feat. Van Morrison) (Concert Version)`;
+  const titles = ["Caravan", "Moondance", "Brown Eyed Girl", "Gloria", "Madame George"].map(caravan);
+  const live = r3Album(titles, { albumTitle: "A Night in San Francisco" });
+  const files = (names: string[]) => names.map((n, i) => ({ index: i, path: `${String(i + 1).padStart(2, "0")} ${n}.flac`, size: 30 * R3MB }));
+  const plain = ["Caravan", "Moondance", "Brown Eyed Girl", "Gloria", "Madame George"];
+  let r = matchTracksInRelease(live, "Van Morrison - A Night in San Francisco [FLAC]", files(plain), "flac_preferred");
+  assert.equal(Object.keys(r.tracks).length, 5, "files without the note serve every track");
+  assert.equal(r.partial, false);
+  r = matchTracksInRelease(live, "Van Morrison - A Night in San Francisco [FLAC]", files(plain.map((n) => `${n} (Concert Version)`)), "flac_preferred");
+  assert.equal(Object.keys(r.tracks).length, 5, "files with the note too");
+  // "(Live)" on every track.
+  const liveAll = r3Album(["Alpha (Live)", "Beta (Live)", "Gamma (Live)", "Delta (Live)"]);
+  r = matchTracksInRelease(liveAll, "Coldplay - Alb [FLAC]", files(["Alpha", "Beta", "Gamma", "Delta"]), "flac_preferred");
+  assert.equal(Object.keys(r.tracks).length, 4);
+  // A different note on a file is still a different version.
+  r = matchTracksInRelease(liveAll, "Coldplay - Alb [FLAC]", files(["Alpha (Acoustic)", "Beta", "Gamma", "Delta"]), "flac_preferred");
+  assert.equal(r.tracks["t0"], undefined);
+  assert.ok(r.tracks["t1"]);
+  // A note on only some tracks stays strict (2 of 5), and under 4 tracks nothing is album-level.
+  const some = r3Album(["Alpha (Live)", "Beta (Live)", "Gamma", "Delta", "Epsilon"]);
+  r = matchTracksInRelease(some, "Coldplay - Alb [FLAC]", files(["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]), "flac_preferred");
+  assert.equal(r.tracks["t0"], undefined);
+  assert.equal(r.tracks["t1"], undefined);
+  assert.ok(r.tracks["t2"]);
+  const three = r3Album(["Alpha (Live)", "Beta (Live)", "Gamma (Live)"]);
+  assert.equal(matchTracksInRelease(three, "Coldplay - Alb [FLAC]", files(["Alpha", "Beta", "Gamma"]), "flac_preferred").matched, false);
+  // 3 of 5 is under 80 %.
+  const sixty = r3Album(["Alpha (Live)", "Beta (Live)", "Gamma (Live)", "Delta", "Epsilon"]);
+  assert.equal(matchTracksInRelease(sixty, "Coldplay - Alb [FLAC]", files(["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]), "flac_preferred").tracks["t0"], undefined);
+  // 4 of 5 is 80 %.
+  const eighty = r3Album(["Alpha (Live)", "Beta (Live)", "Gamma (Live)", "Delta (Live)", "Epsilon"]);
+  assert.ok(matchTracksInRelease(eighty, "Coldplay - Alb [FLAC]", files(["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]), "flac_preferred").tracks["t0"]);
+  // A note the release name and the album title both carry.
+  const wembley = r3Album(["Alpha (Live at Wembley)", "Beta", "Gamma"], { albumTitle: "Live at Wembley" });
+  r = matchTracksInRelease(wembley, "Coldplay - Live at Wembley [FLAC]", files(["Alpha", "Beta", "Gamma"]), "flac_preferred");
+  assert.ok(r.tracks["t0"], "release name and album title both say it");
+  const studio = r3Album(["Alpha (Live at Wembley)", "Beta", "Gamma"], { albumTitle: "Greatest Hits" });
+  assert.equal(matchTracksInRelease(studio, "Coldplay - Greatest Hits [FLAC]", files(["Alpha", "Beta", "Gamma"]), "flac_preferred").tracks["t0"], undefined);
+  // The recording path: a note in the song's title that the release name carries is satisfied.
+  const rec = r3Album(["Alpha (Live at Wembley)"], { albumTitle: "Live at Wembley", recording: true });
+  const one = (p: string, rel: string) => matchTracksInRelease(rec, rel, [{ index: 0, path: p, size: 30 * R3MB }], "flac_preferred");
+  assert.ok(one("Alpha.flac", "Coldplay - Live at Wembley [FLAC]").tracks["t0"]);
+  assert.equal(one("Alpha.flac", "Coldplay - Greatest Hits [FLAC]").tracks["t0"], undefined);
+  assert.equal(one("Alpha (Acoustic).flac", "Coldplay - Live at Wembley [FLAC]").tracks["t0"], undefined);
+  // Still strict on the plain cases the reviewer listed.
+  assert.equal(r3Serves("Caravan.flac", "Caravan (Live)"), false);
+  assert.equal(r3Serves("Money (Live).flac", "Money"), false);
+});
+
+test("defect 9: an exclude id's hash is compared in lower case, URLs keep the case of path and query", () => {
+  const hash = "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12";
+  const cand = { title: "x", indexer: "i", infoHash: hash, size: 1 } as SourceCandidate;
+  assert.equal(isReleaseExcluded(new Set([`kind:${hash}`]), "ih:1", cand), true);
+  assert.equal(isReleaseExcluded(new Set([`kind:${hash.toUpperCase()}`]), "ih:1", cand), true);
+  assert.equal(isReleaseExcluded(new Set([`kind:${hash.toUpperCase()}:file:${"AB".repeat(32)}`]), "ih:1", cand), true);
+  assert.equal(isReleaseExcluded(new Set([`kind:${hash}:file:${"ab".repeat(32)}`]), "ih:1", cand), true);
+  assert.equal(isReleaseExcluded(new Set([`kind:${"0".repeat(40)}`]), "ih:1", cand), false);
+  const magnetCand = { title: "m", indexer: "i", magnet: `magnet:?xt=urn:btih:${hash.toUpperCase()}&dn=x`, size: 1 } as SourceCandidate;
+  assert.equal(isReleaseExcluded(new Set([`kind:${hash.toUpperCase()}`]), "mg:1", magnetCand), true);
+  const nzb = { title: "n", indexer: "i", nzbUrl: "https://Nzb.Test/get?id=AbC", size: 1 } as SourceCandidate;
+  assert.equal(isReleaseExcluded(new Set(["kind:https://nzb.test/get?id=AbC"]), "nzb:1", nzb), true, "host case");
+  assert.equal(isReleaseExcluded(new Set(["kind:HTTPS://NZB.TEST/get?id=AbC"]), "nzb:1", nzb), true, "scheme and host case");
+  assert.equal(isReleaseExcluded(new Set(["kind:https://nzb.test/get?id=abc"]), "nzb:1", nzb), false, "query is case-sensitive");
+  assert.equal(isReleaseExcluded(new Set(["kind:https://nzb.test/GET?id=AbC"]), "nzb:1", nzb), false, "path is case-sensitive");
+});
+
+test("defect 10: the album is resolved again once per distinct exclude set during the recording fallback", () => {
+  const T = Array.from({ length: 10 }, (_, i) => `Song ${i + 1}`);
+  const album = albumOf("al-700", "Test Band", "Test Album", 2001, [...T, "Bonus Song"]);
+  const mb = JSON.stringify({ recordings: [{ "artist-credit": [{ name: "Test Band" }], releases: [
+    { title: "Bonus Single", date: "2001", status: "Official", "track-count": 2, "release-group": { "primary-type": "Single" } },
+    { title: "Other Album", date: "2003", status: "Official", "track-count": 12, "release-group": { "primary-type": "Album" } },
+    { title: "Third", date: "2004", status: "Official", "track-count": 1, "release-group": { "primary-type": "Single" } },
+  ] }] });
+  const run = (exclude: string[] | undefined) => {
+    let clock = 1_760_000_000_000;
+    const cands = [1, 2, 3, 4].map((i): SourceCandidate => ({ title: `Test Band - Test Album (2001) ${i < 3 ? "FLAC" : "MP3 320"} r${i}`, indexer: "NZBgeek", nzbUrl: `https://nzb.test/r${i}`, size: 150_000_000 }));
+    const { env, calls } = makeFakeHost({
+      onResolve: (q) => {
+        clock += q.kind === "release_files" ? 400 : 200;
+        if (q.kind === "indexer_search") return { candidates: cands };
+        if (q.kind === "release_files") return { candidates: [{ ...q.candidate!, files: T.map((t, i) => ({ index: i, path: `${pad2(i + 1)} ${t}.flac`, size: 30_000_000 })) }] };
+        if (q.kind === "usenet_check") return usenetOk(q.candidate!);
+        return { candidates: [] };
+      },
+    });
+    env.now = () => clock;
+    env.http.fetch = (req) => (req.url.includes("musicbrainz.org/ws/2/recording") ? { status: 200, body: mb } : { status: 404, body: "" });
+    const cache = new KVCache(env);
+    cache.set(`album_v2:${album.id}`, album, 24 * 3_600_000);
+    const settings = review3Settings();
+    const resolver = new AlbumResolver(env, cache, new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings), settings);
+    const item = trackItemFor(album, 10);
+    item.hints = { ...(item.hints || {}), isrc: "USXXX0000001" };
+    let res = resolver.resolve({ item, ...(exclude ? { client: { exclude } } : {}) });
+    for (let i = 0; res.pending && i < 40; i++) {
+      clock += 250;
+      res = resolver.resolve({ item, ...(exclude ? { client: { exclude } } : {}) });
+    }
+    return { res, listed: calls.filter((q) => q.kind === "release_files").length };
+  };
+  const plain = run(undefined);
+  const excluded = run(["kind:https://nzb.test/unrelated"]);
+  assert.equal(plain.res.sources.length, 0);
+  assert.equal(excluded.res.sources.length, 0);
+  assert.equal(excluded.listed, plain.listed, `exclude run listed ${excluded.listed}, plain ${plain.listed}`);
+});
+
+test("defect 11: a source plugin's folder without the artist needs a title that names one release", () => {
+  const cand = (title: string): SourceCandidate => ({ title, indexer: "SlskSource", size: 60_000_000, pluginRelease: { plugin: "community.slsksource", id: "x" } });
+  const mk = (title: string): CanonicalAlbum => ({ ...sampleDiscoveryAlbum(), title, artistName: "Daft Punk" });
+  const score = (albumTitle: string, folder: string) => preScoreAlbumCandidate(cand(folder), mk(albumTitle), "flac_preferred").accepted;
+  assert.equal(score("Random Access Memories", "Random Access Memories [FLAC]"), true, "distinctive title: still let through");
+  assert.equal(score("Homework Sessions Unlimited", "Homework Sessions Unlimited [FLAC]"), true);
+  for (const t of ["Greatest Hits", "The Best Of", "Live", "Unplugged", "Original Soundtrack", "The Collection", "Singles", "The Very Best Of", "Greatest Hits Vol. 2", "Best Of 2004", "Original Motion Picture Soundtrack", "The Essential Collection"]) {
+    assert.equal(isGenericAlbumTitle(t), true, t);
+    assert.equal(score(t, `${t} [FLAC]`), false, `folder "${t}" without the artist`);
+  }
+  assert.equal(isGenericAlbumTitle("Random Access Memories"), false);
+  assert.equal(isGenericAlbumTitle("Discovery"), false);
+  // With the artist in the name nothing changes.
+  assert.equal(score("Greatest Hits", "Daft Punk - Greatest Hits [FLAC]"), true);
 });
