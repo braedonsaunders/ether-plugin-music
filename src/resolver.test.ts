@@ -4976,3 +4976,37 @@ test("u2 regression: a search that goes on probes the names carrying the album's
   h.play(item);
   assert.equal(listed[0], "Test Band - Test Album (2001) FLAC", listed.join(" | "));
 });
+
+test("a file's track number alone never refuses an exact title on a single or a release named for another album", () => {
+  const single = albumOf("al-9800", "Burna Boy", "Bigger (from GTAVI: The Album)", 2026, ["Bigger (from GTAVI: The Album)"], {}, 169);
+  single.releaseType = "single";
+  const serves = (rel: string, path: string, album = single) =>
+    Object.keys(matchTracksInRelease(album, rel, [{ index: 0, path, size: 20_793_977 }], "flac_preferred").tracks).length === 1;
+  const gta = "Grand Theft Auto VI - The Album [FLAC]";
+  for (const [rel, path] of [
+    [gta, "113 - Burna Boy - Bigger.flac"],
+    ["musicgh - Burna Boy - [] Grand Theft Auto VI The Album (2026) [FLAC]", "13 - Burna Boy - Bigger.flac"],
+    ["Latte's CD Rips - Burna Boy - Grand Theft Auto VI: The Album [FLAC]", "Disc 1/13. Burna Boy - Bigger.flac"],
+    ["Burna Boy - Bigger [FLAC]", "13 - Bigger.flac"],
+    [gta, "13 - Burna Boy - Bigger (from GTAVI The Album).flac"],
+    [gta, "1-13 Burna Boy - Bigger.flac"],
+    [gta, "A3 Burna Boy - Bigger.flac"],
+    [gta, "Burna Boy - Bigger.flac"],
+    [gta, "01 - Burna Boy - Bigger.flac"],
+    [gta, "01 - Bigger.flac"],
+  ] as Array<[string, string]>) assert.equal(serves(rel, path), true, `${rel} | ${path}`);
+  // The title or the lead artist still decide.
+  assert.equal(serves(gta, "13 - Burna Boy - Bigger (Remix).flac"), false);
+  assert.equal(serves(gta, "13 - Other Artist - Bigger.flac"), false);
+  assert.equal(serves(gta, "13 - Burna Boy - Biggest.flac"), false);
+
+  // A normal 12-track album in its own release: the number still decides between two files of a like title.
+  const titles = ["Alpha Song", "Beta Song", "Gamma Song", "Delta Song", "Epsilon Song", "Zeta Song", "Eta Song", "Theta Song", "Iota Song", "Kappa Song", "Lambda Song", "Mu Song"];
+  const album = albumOf("al-9801", "Some Artist", "Some Album", 2020, titles);
+  const files = titles.map((t, i) => `${pad2(i + 1)} ${t}.flac`);
+  files[4] = "05 Epsilon Song.flac";
+  files[0] = "09 Alpha Song.flac";
+  const r = matchTracksInRelease(album, "Some Artist - Some Album [FLAC]", filesOf(files), "flac_preferred");
+  assert.equal(r.tracks[album.tracks[0].id], undefined, "Alpha Song is track 1, the file says 9: the same edition's numbering decides");
+  assert.ok(r.tracks[album.tracks[4].id]);
+});

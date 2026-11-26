@@ -1570,6 +1570,11 @@ export function matchTracksInRelease(
   const hiRes = HI_RES_TITLE_RE.test(releaseTitle) || quality.tier === "flac24";
 
   const sameEdition = audioFiles.length === canonicalCount;
+  const releaseNamesAlbum = (() => {
+    const core = normalizeTitleKey(coreReleaseTitle(album.title));
+    return core.length >= 3 && releaseAlbumParts(releaseTitle).some((part) => isAlbumPartOf(normalizeTitleKey(part), core));
+  })();
+  const numberDecides = canonicalCount > 3 && !album.recordingTarget && releaseNamesAlbum;
   type Hit = { ti: number; fi: number; exact: boolean; numberAgrees: boolean; named: boolean; disc: number; lr: number };
   const hits: Hit[] = [];
   const single = audioFiles.length === 1;
@@ -1624,7 +1629,10 @@ export function matchTracksInRelease(
         const discOk = album.discCount <= 1 || parsed.disc === null || parsed.disc === tr.disc;
         const flat = album.discCount > 1 && parsed.disc === null && parsed.track === ti + 1;
         numberAgrees = (discOk && parsed.track === tr.trackNumber) || flat;
-        if (sameEdition && !numberAgrees) continue;
+        // A number that disagrees refuses a file only where the release is this album's own edition
+        // of 4 tracks or more: on a single, a short release, or a release named for another album (the
+        // parent album, a compilation, a soundtrack) it is that release's own numbering.
+        if (sameEdition && numberDecides && !numberAgrees) continue;
       }
       if (!isPlausibleTrackSize(af.file.size, tr.durationSec, af.fmt.typicalKbps, { lossless: af.fmt.lossless, hiRes })) continue;
       hits.push({ ti, fi, exact: f.exact, numberAgrees, named: f.named, disc: fileDisc, lr: f.lr });
