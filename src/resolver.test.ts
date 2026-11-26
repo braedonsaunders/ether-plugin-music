@@ -7,6 +7,7 @@ import type {
   KindResolveRequest,
   SourceCandidate,
   SourceQuery,
+  VerifiedAlbumRelease,
 } from "./types.ts";
 import { KVCache, isHostFaultOrAbort } from "./kv.ts";
 import { DeezerClient } from "./deezer.ts";
@@ -26,11 +27,15 @@ import {
   buildArchiveTrackHint,
   classifyReleaseQuality,
   classifyVideoQuality,
+  durationToleranceFor,
   expandReleaseFiles,
   formatDroppedAtNameRanking,
+  isReleaseExcluded,
   isStrictlyNarrowerQuery,
   isUsenetCandidate,
   matchAlbumReleaseFiles,
+  matchTracksInRelease,
+  pickRecordingReleases,
   matchConcertReleaseFiles,
   preScoreAlbumCandidate,
   preScoreConcertCandidate,
@@ -3100,4 +3105,390 @@ test("an incomplete answer is asked again about 3 seconds later, and only once p
   for (let i = 1; i < searchedAt.length; i++) {
     assert.ok(searchedAt[i] - searchedAt[i - 1] >= 2500, `searches too close: ${JSON.stringify(searchedAt)}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Track-first acceptance: which of the album's tracks does a release verifiably hold?
+// ---------------------------------------------------------------------------------------------
+
+function albumOf(
+  id: string,
+  artistName: string,
+  title: string,
+  year: number,
+  titles: string[],
+  extra: Partial<CanonicalAlbum> = {},
+  durationSec = 240
+): CanonicalAlbum {
+  const n = Number(id.replace(/\D/g, "")) || 1;
+  return {
+    ...sampleDiscoveryAlbum(),
+    id,
+    deezerAlbumId: n,
+    artistName,
+    title,
+    year,
+    releaseDate: `${year}-01-01`,
+    durationSec: titles.length * durationSec,
+    trackCount: titles.length,
+    discCount: 1,
+    tracks: titles.map((t, i) => ({
+      id: `tr-${n}${String(i + 1).padStart(2, "0")}`,
+      deezerTrackId: n * 1000 + i,
+      title: t,
+      disc: 1,
+      trackNumber: i + 1,
+      durationSec,
+      explicit: false,
+      artistName,
+    })),
+    ...extra,
+  };
+}
+
+const trackTitles = (prefix: string, n: number, from = 1) => Array.from({ length: n }, (_, i) => `${prefix} ${from + i}`);
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+function harness(
+  album: CanonicalAlbum,
+  onResolve: (q: SourceQuery) => { candidates?: SourceCandidate[] },
+  extra: { mbBody?: string } = {}
+) {
+  const { env, calls } = makeFakeHost({ onResolve: onResolve as never });
+  const logs: string[] = [];
+  env.log = (...args: unknown[]) => { logs.push(String(args[1])); };
+  if (extra.mbBody) {
+    env.http.fetch = (req) => req.url.includes("musicbrainz.org/ws/2/recording")
+      ? { status: 200, body: extra.mbBody! }
+      : { status: 404, body: "" };
+  }
+  const cache = new KVCache(env);
+  cache.set(`album_v2:${album.id}`, album, 600_000);
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  const resolver = new AlbumResolver(env, cache, catalog, settings);
+  const play = (item: KindItem, exclude?: string[]) => {
+    const req = (): KindResolveRequest => ({ item, ...(exclude ? { client: { exclude } } : {}) });
+    let r = resolver.resolve(req());
+    for (let i = 0; i < 14 && r.pending; i++) r = resolver.resolve(req());
+    return r;
+  };
+  return { resolver, env, calls, logs, cache, play };
+}
+
+const usenetOk = (cand: SourceCandidate) => ({ candidates: [{ ...cand, usenetCheck: { available: true, checked: 8, missing: 0 } }] });
+const filesOf = (names: string[], size = 30_000_000) => names.map((path, index) => ({ index, path, size }));
+
+test("Kick 25 (Deluxe Edition): the 12-track standard release serves the tracks it holds, not the bonus tracks", () => {
+  const titles = [...trackTitles("Standard Song", 12), ...trackTitles("Bonus Song", 13)];
+  const album = albumOf("al-9025", "INXS", "Kick 25 (Deluxe Edition)", 2012, titles);
+  const cand: SourceCandidate = { title: "INXS - Kick 25 (2012) FLAC", indexer: "NZBgeek", nzbUrl: "https://nzb.test/kick25", size: 360_000_000 };
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [cand] };
+    if (q.kind === "release_files") return { candidates: [{ ...cand, files: filesOf(titles.slice(0, 12).map((t, i) => `INXS - Kick 25/${pad2(i + 1)} - ${t}.flac`)) }] };
+    if (q.kind === "usenet_check") return usenetOk(cand);
+    return { candidates: [] };
+  });
+  const held = h.play(trackItemFor(album, 4));
+  assert.equal(held.sources.length, 1, "a track the release holds");
+  assert.equal(held.sources[0].release?.fileIndex, 4);
+  assert.match(held.sources[0].label || "", /partial/);
+  const bonus = h.play(trackItemFor(album, 20));
+  assert.equal(bonus.sources.length, 0, "a bonus track the release does not hold");
+  assert.ok(h.logs.some((l) => /resolve-album: partial al-9025 \[usenet\] "INXS - Kick 25 \(2012\) FLAC" serves=12\/25 tracks requested=yes/.test(l)), h.logs.join("\n"));
+  // Asking again for the bonus track does not search again and again.
+  const searches = h.calls.filter((q) => q.kind === "indexer_search").length;
+  h.play(trackItemFor(album, 20));
+  h.play(trackItemFor(album, 21));
+  assert.equal(h.calls.filter((q) => q.kind === "indexer_search").length, searches);
+});
+
+test("B'Day (14 tracks): a 19-track deluxe release serves every standard track", () => {
+  const titles = trackTitles("Standard Song", 14);
+  const album = albumOf("al-9014", "Beyoncé", "B'Day", 2006, titles);
+  const deluxe = [...titles, ...trackTitles("Deluxe Extra", 5)];
+  const cand: SourceCandidate = { title: "Beyonce - B'Day (Deluxe Edition) (2007) FLAC", indexer: "NZBgeek", nzbUrl: "https://nzb.test/bday", size: 570_000_000 };
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [cand] };
+    if (q.kind === "release_files") return { candidates: [{ ...cand, files: filesOf(deluxe.map((t, i) => `${pad2(i + 1)}. ${t}.flac`)) }] };
+    if (q.kind === "usenet_check") return usenetOk(cand);
+    return { candidates: [] };
+  });
+  for (const ti of [0, 6, 13]) {
+    const r = h.play(trackItemFor(album, ti));
+    assert.equal(r.sources.length, 1, `track ${ti + 1}`);
+    assert.equal(r.sources[0].release?.fileIndex, ti);
+  }
+  // The same release is also a 31-file one: more files than the album has tracks never rejects it.
+  const wide = [...deluxe, ...trackTitles("Remix Extra", 12)];
+  assert.equal(matchTracksInRelease(album, cand.title!, filesOf(wide.map((t, i) => `${pad2(i + 1)} ${t}.flac`)), "flac_preferred").tracks[album.tracks[3].id]?.fileIndex, 3);
+});
+
+test("The Studio Album Collection (68 tracks): a release of one constituent album serves that album's tracks", () => {
+  const titles = [
+    ...trackTitles("Chic Song", 20),
+    ...["Take It Off", "Burn", "Baby Doll", "Stage Fright", "Your Love", "Loving Feeling", "Mind Games", "Rapture", "Hard Times", "Closer"],
+    ...trackTitles("Later Song", 38, 31),
+  ];
+  const album = albumOf("al-9068", "Chic", "The Studio Album Collection 1977-1992", 2018, titles, {}, 240);
+  const cand: SourceCandidate = { title: "Chic - Take It Off (1981) FLAC", indexer: "NZBgeek", nzbUrl: "https://nzb.test/takeitoff", size: 300_000_000 };
+  const own = titles.slice(20, 30);
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [cand] };
+    if (q.kind === "release_files") return { candidates: [{ ...cand, files: filesOf(own.map((t, i) => `Chic - Take It Off/${pad2(i + 1)} ${t}.flac`)) }] };
+    if (q.kind === "usenet_check") return usenetOk(cand);
+    return { candidates: [] };
+  });
+  const r = h.play(trackItemFor(album, 22));
+  assert.equal(r.sources.length, 1);
+  assert.equal(r.sources[0].release?.fileIndex, 2);
+  assert.ok(h.calls.some((q) => q.kind === "indexer_search" && /chic baby doll/i.test(q.query || "")), "the song itself is searched for a box set");
+  // A track of another album of the box set is not in it.
+  assert.equal(h.play(trackItemFor(album, 5)).sources.length, 0);
+  // One file shared on its own, named "Artist - Album Year - Number - Title".
+  const lone = matchTracksInRelease(album, "Chic - Take It Off 1981 - 10 - Baby Doll", filesOf(["Chic - Take It Off 1981 - 10 - Baby Doll.flac"]), "flac_preferred");
+  assert.deepEqual(Object.keys(lone.tracks), [album.tracks[22].id]);
+  // The name check does not drop one album of a box set for lacking the box set's title.
+  assert.equal(preScoreAlbumCandidate(cand, { ...album, trackCount: 68 }, "flac_preferred").accepted, true);
+});
+
+test("Atlas (From the Hunger Games soundtrack): a one-file Soulseek folder and a 6-file scene release serve the single", () => {
+  const album = albumOf("al-9001", "Coldplay", "Atlas (From “The Hunger Games: Catching Fire” Soundtrack)", 2013, ["Atlas (From “The Hunger Games: Catching Fire” Soundtrack)"], { releaseType: "single" }, 270);
+  const plugin: SourceCandidate = { title: "Coldplay - Atlas (2013) [FLAC]", indexer: "SlskSource", size: 30_000_000, pluginRelease: { plugin: "community.slsksource", id: "folder1" } };
+  const scene: SourceCandidate = { title: "Coldplay-Atlas-WEB-2013-BPM", indexer: "NZBgeek", nzbUrl: "https://nzb.test/atlas", size: 54_000_000 };
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [plugin, scene] };
+    if (q.kind === "release_files") {
+      if (q.candidate?.pluginRelease) return { candidates: [{ ...plugin, files: [{ index: 0, path: "01 Atlas.flac", size: 30_000_000 }] }] };
+      return { candidates: [{ ...scene, files: filesOf([
+        "01-coldplay-atlas.mp3",
+        "02-coldplay-atlas_(instrumental).mp3",
+        "03-coldplay-atlas_(acapella).mp3",
+        "04-coldplay-atlas_(live).mp3",
+        "05-coldplay-atlas_(radio_edit).mp3",
+        "00-coldplay-atlas-web-2013-bpm.nfo.mp3",
+      ], 9_000_000) }] };
+    }
+    if (q.kind === "usenet_check") return usenetOk(scene);
+    return { candidates: [] };
+  });
+  const r = h.play(trackItemFor(album, 0));
+  const byKind = new Map(r.sources.map((s) => [s.release?.candidate?.pluginRelease ? "plugin" : "usenet", s]));
+  assert.equal(r.sources.length, 2, h.logs.join("\n"));
+  assert.equal(byKind.get("plugin")?.release?.fileIndex, 0);
+  assert.equal(byKind.get("usenet")?.release?.fileHint, "01-coldplay-atlas.mp3", "not the instrumental, live or radio edit");
+  // Unnumbered, artist-less file names serve it too.
+  const bare = matchTracksInRelease(album, "Coldplay - Atlas [FLAC]", filesOf(["Atlas.flac"]), "flac_preferred");
+  assert.equal(bare.matched, true);
+});
+
+test("First in Line on a 29-track various-artists soundtrack: the single-track fallback serves it", () => {
+  const album = albumOf("al-9100", "Some Band", "Some Album", 2010, trackTitles("Album Song", 10));
+  const own = album.tracks[3];
+  const item = trackItemFor(album, 3);
+  item.hints = { ...(item.hints || {}), isrc: "USABC1200004", trackArtistName: "Some Band" };
+  own.title = "First in Line";
+  item.title = "First in Line";
+  const folder: SourceCandidate = { title: "VA - Original Motion Picture Soundtrack (2012) [FLAC]", indexer: "SlskSource", size: 870_000_000, pluginRelease: { plugin: "community.slsksource", id: "ost" } };
+  const soundtrack = [...trackTitles("OST Cue", 13), "First in Line", ...trackTitles("OST Cue", 15, 14)];
+  const h = harness(album, (q) => {
+    // Only the query for the song itself finds the folder.
+    if (q.kind === "indexer_search") return { candidates: /first in line/i.test(q.query || "") ? [folder] : [] };
+    if (q.kind === "release_files") return { candidates: [{ ...folder, files: filesOf(soundtrack.map((t, i) => `VA - OST/${pad2(i + 1)} - ${t}.flac`)) }] };
+    return { candidates: [] };
+  }, { mbBody: JSON.stringify({ recordings: [{ "artist-credit": [{ name: "Some Band" }], releases: [
+    { title: "Original Motion Picture Soundtrack", status: "Official", "track-count": 29, "artist-credit": [{ name: "Various Artists" }], "release-group": { "primary-type": "Album", "secondary-types": ["Soundtrack"] } },
+  ] }] }) });
+  const r = h.play(item);
+  assert.equal(r.sources.length, 1, h.logs.join("\n"));
+  assert.equal(r.sources[0].release?.fileIndex, 13);
+  assert.ok(h.calls.some((q) => q.kind === "indexer_search" && /some band first in line/i.test(q.query || "")), "the song itself is among the queries");
+});
+
+test("version safety: a live, early or remix file is not the studio song; a remaster is", () => {
+  const album = albumOf("al-9200", "Pink Floyd", "Wish You Were Here", 1975, ["Money", "World Turning (Early Version)", "Time", "Us and Them (feat. Someone)"]);
+  const serve = (name: string, files = [name], count = 4) =>
+    matchTracksInRelease(album, "Pink Floyd - Wish You Were Here FLAC", filesOf(files).concat([]).slice(0, count), "flac_preferred").tracks;
+  assert.deepEqual(Object.keys(serve("05 Money (Live).flac")), [], "Money (Live) is not Money");
+  assert.deepEqual(Object.keys(serve("Money - Live.flac")), []);
+  assert.deepEqual(Object.keys(serve("Money (Demo).flac")), []);
+  assert.deepEqual(Object.keys(serve("Money (Radio Edit).flac")), []);
+  assert.deepEqual(Object.keys(serve("Pink Floyd - Money (Mono).flac")), []);
+  assert.deepEqual(Object.keys(serve("World Turning.flac")), [], "World Turning is not World Turning (Early Version)");
+  assert.deepEqual(Object.keys(serve("World Turning (Early Version).flac")), [album.tracks[1].id]);
+  for (const ok of ["Money (2011 Remaster).flac", "Money - Remastered 2011.flac", "Money (Album Version).flac", "Money.flac", "Pink Floyd - Money.flac", "money-(remastered).flac"]) {
+    assert.deepEqual(Object.keys(serve(ok)), [album.tracks[0].id], ok);
+  }
+  assert.deepEqual(Object.keys(serve("Us and Them.flac")), [album.tracks[3].id], "a credit on one side only");
+  assert.deepEqual(Object.keys(serve("Us and Them (with Someone Else).flac")), [album.tracks[3].id]);
+  // Same edition (4 files for 4 tracks): a track number that disagrees is another song.
+  const same = matchTracksInRelease(album, "Pink Floyd - Wish You Were Here FLAC", filesOf(["03 Money.flac", "03 Time.flac", "04 Filler.flac", "01 Filler Two.flac"]), "flac_preferred");
+  assert.deepEqual(Object.keys(same.tracks), [album.tracks[2].id], "Time is track 3 and agrees; Money is track 1, not 3");
+  // A different edition ignores numbers.
+  const other = matchTracksInRelease(album, "Pink Floyd - Wish You Were Here FLAC", filesOf(["07 Money.flac", "08 Filler.flac"]), "flac_preferred");
+  assert.deepEqual(Object.keys(other.tracks), [album.tracks[0].id]);
+  // A file of the wrong size for the track's length is not it (a 3 s sample, a 20 minute mix).
+  assert.deepEqual(Object.keys(matchTracksInRelease(album, "x FLAC", [{ index: 0, path: "Money.flac", size: 900_000_000 }], "flac_preferred").tracks), []);
+  // Two files for one track: the lowest disc, then the first.
+  const two = matchTracksInRelease(album, "x FLAC", filesOf(["CD2/01 Money.flac", "CD1/05 Money.flac", "Money.flac"]), "flac_preferred");
+  assert.equal(two.tracks[album.tracks[0].id].file, "CD1/05 Money.flac");
+  assert.equal(Object.keys(two.tracks).length, 1, "one file never serves two tracks");
+});
+
+test("sources: every verified release for a track is returned, whole albums first, each verified by duration on open", () => {
+  assert.equal(durationToleranceFor(240), 7);
+  assert.equal(durationToleranceFor(400), 12);
+  assert.equal(durationToleranceFor(1000), 30);
+  const titles = trackTitles("Disc Song", 5);
+  const album = albumOf("al-9300", "Test Band", "Test Album", 2001, titles, {}, 400);
+  const mk = (id: string, partial: boolean, kind: "usenet" | "plugin", score: number): VerifiedAlbumRelease => ({
+    releaseId: kind === "usenet" ? `nzb:https://nzb.test/${id}` : `plg:community.slsksource:${id}`,
+    sourceKind: kind,
+    qualityTier: "flac",
+    codec: "FLAC",
+    mime: "audio/flac",
+    label: `FLAC ${id}`,
+    score,
+    candidate: kind === "usenet" ? { title: id, nzbUrl: `https://nzb.test/${id}` } : { title: id, pluginRelease: { plugin: "community.slsksource", id } },
+    ...(partial ? { partial: true } : {}),
+    tracks: { [album.tracks[0].id]: { fileIndex: 0, file: "01.flac", fileHint: "01.flac", size: 40_000_000, mime: "audio/flac", confidence: 0.95 } },
+  });
+  const h = harness(album, () => ({ candidates: [] }));
+  h.cache.set(albumCacheKey(album.id), {
+    albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true,
+    releases: [mk("partial-a", true, "usenet", 190), mk("whole-d", false, "usenet", 160), mk("whole-b", false, "plugin", 120), mk("partial-c", true, "plugin", 150)],
+  }, 3_600_000);
+  const r = h.play(trackItemFor(album, 0));
+  assert.deepEqual(r.sources.map((s) => s.label?.replace(" · partial", "")), ["FLAC whole-d", "FLAC whole-b", "FLAC partial-a", "FLAC partial-c"], "whole albums first, then partial, each by rank");
+  for (const s of r.sources) {
+    assert.equal(s.durationSec, 400);
+    assert.equal(s.durationToleranceSec, 12);
+  }
+  // No tolerance for a track whose length is unknown or under 30 s.
+  const unknown = trackItemFor(album, 0);
+  unknown.hints = { ...(unknown.hints || {}), durationSec: 0 };
+  unknown.fields = { ...(unknown.fields || {}), duration: 0 };
+  assert.equal(h.play(unknown).sources[0].durationToleranceSec, undefined);
+  const brief = trackItemFor(album, 0);
+  brief.hints = { ...(brief.hints || {}), durationSec: 25 };
+  assert.equal(h.play(brief).sources[0].durationToleranceSec, undefined);
+  // Not for a single-file image of the whole album.
+  const imageRel = mk("image", false, "usenet", 100);
+  imageRel.candidate.title = "Test Band - Test Album (image + cue) FLAC";
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, releases: [imageRel] }, 3_600_000);
+  assert.equal(h.play(trackItemFor(album, 0)).sources[0].durationToleranceSec, undefined);
+  // The cap.
+  const many = Array.from({ length: 8 }, (_, i) => mk(`rel-${i}`, false, "usenet", 100 - i));
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, releases: many }, 3_600_000);
+  assert.equal(h.play(trackItemFor(album, 0)).sources.length, 5);
+});
+
+test("client.exclude in the host's id form removes that source from the answer", () => {
+  const album = albumOf("al-9400", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 5));
+  const usenet: VerifiedAlbumRelease = {
+    releaseId: "nzb:https://nzb.test/one", sourceKind: "usenet", qualityTier: "flac", codec: "FLAC", mime: "audio/flac", label: "usenet", score: 150,
+    candidate: { title: "one", nzbUrl: "https://nzb.test/one" },
+    tracks: { [album.tracks[0].id]: { fileIndex: 0, file: "01.flac", fileHint: "01.flac", size: 1, mime: "audio/flac", confidence: 1 } },
+  };
+  const plugin: VerifiedAlbumRelease = {
+    ...usenet, releaseId: "plg:community.slsksource:abc", sourceKind: "plugin", label: "plugin", score: 140,
+    candidate: { title: "two", pluginRelease: { plugin: "community.slsksource", id: "abc" } },
+  };
+  const torrent: VerifiedAlbumRelease = {
+    ...usenet, releaseId: "ih:aabbccddeeff00112233445566778899aabbccdd", sourceKind: "debrid", label: "torrent", score: 130,
+    candidate: { title: "three", infoHash: "AABBCCDDEEFF00112233445566778899AABBCCDD", cached: true },
+  };
+  const h = harness(album, () => ({ candidates: [] }));
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, releases: [usenet, plugin, torrent] }, 3_600_000);
+  const item = trackItemFor(album, 0);
+  const labels = (exclude?: string[]) => h.play(item, exclude).sources.map((s) => s.label);
+  assert.deepEqual(labels(), ["usenet", "plugin", "torrent"]);
+  assert.deepEqual(labels(["kind:https://nzb.test/one:file:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]), ["plugin", "torrent"]);
+  assert.deepEqual(labels(["kind:plugin:community.slsksource:lazy:abc"]), ["usenet", "torrent"]);
+  assert.deepEqual(labels(["kind:plugin:community.slsksource:lazy:abc:file:1234"]), ["usenet", "torrent"]);
+  assert.deepEqual(labels(["kind:aabbccddeeff00112233445566778899aabbccdd"]), ["usenet", "plugin"]);
+  // The plugin's own refs still work, and an unrelated host id removes nothing.
+  assert.deepEqual(labels(["plg:community.slsksource:abc"]), ["usenet", "torrent"]);
+  assert.deepEqual(labels(["kind:https://nzb.test/other"]), ["usenet", "plugin", "torrent"]);
+  assert.equal(isReleaseExcluded(new Set(["kind:https://nzb.test/one-more"]), usenet.releaseId, usenet.candidate), false, "a longer url is another release");
+});
+
+test("a source plugin's folder without the artist in its name reaches the file stage when the album title is in it", () => {
+  const titles = trackTitles("Hunt Theme", 6);
+  const album = albumOf("al-9500", "Capcom Sound Team", "Monster Hunter Tri Original Soundtrack", 2009, titles);
+  const folder: SourceCandidate = { title: "Monster Hunter Tri Original Soundtrack - FLAC (16bit-44.1kHz)", indexer: "SlskSource", size: 180_000_000, pluginRelease: { plugin: "community.slsksource", id: "mh" } };
+  const asNzb: SourceCandidate = { ...folder, pluginRelease: undefined, nzbUrl: "https://nzb.test/mh" };
+  assert.equal(preScoreAlbumCandidate(asNzb, album, "flac_preferred").reasons[0], "artist name mismatch", "Usenet keeps the rule");
+  const pre = preScoreAlbumCandidate(folder, album, "flac_preferred");
+  assert.equal(pre.accepted, true);
+  const withArtist = preScoreAlbumCandidate({ ...folder, title: `Capcom Sound Team - ${folder.title}` }, album, "flac_preferred");
+  assert.ok(withArtist.score > pre.score, "a name that carries the artist scores higher");
+  // A short title is not enough to take an artist-less name.
+  const short = { ...album, title: "Discovery" };
+  assert.equal(preScoreAlbumCandidate({ ...folder, title: "Discovery [FLAC]" }, short, "flac_preferred").accepted, false);
+  // Letters of other scripts count: a Japanese soundtrack named by its own title.
+  const jp = { ...album, artistName: "Capcom", title: "モンスターハンター3 (tri-) オリジナル・サウンドトラック" };
+  assert.equal(preScoreAlbumCandidate({ ...folder, title: "モンスターハンター3 (tri-) オリジナル・サウンドトラック - FLAC (16bit-44.1kHz)" }, jp, "flac_preferred").accepted, true);
+
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [folder] };
+    if (q.kind === "release_files") return { candidates: [{ ...folder, files: filesOf(titles.map((t, i) => `${pad2(i + 1)} ${t}.flac`)) }] };
+    return { candidates: [] };
+  });
+  const r = h.play(trackItemFor(album, 2));
+  assert.equal(r.sources.length, 1);
+  assert.equal(r.sources[0].release?.fileIndex, 2);
+});
+
+test("a later play of another track re-uses the listed releases and goes on only with the rest of the shortlist", () => {
+  const titles = trackTitles("Shared Song", 6);
+  const album = albumOf("al-9600", "Test Band", "Test Album", 2001, titles);
+  const mk = (i: number, flac: boolean): SourceCandidate => ({
+    title: flac ? `Test Band - Test Album (2001) FLAC repost ${i}` : `Test Band - Test Album (2001) MP3 320 repost ${i}`,
+    indexer: "NZBgeek", nzbUrl: `https://nzb.test/r${i}`, size: flac ? 150_000_000 : 60_000_000,
+  });
+  const cands = [mk(1, true), mk(2, true), mk(3, true), mk(4, false)];
+  const listed: string[] = [];
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: cands };
+    if (q.kind === "release_files") {
+      listed.push(q.candidate!.nzbUrl!);
+      // The first three hold tracks 1-3; the last one is the only one with track 6.
+      const names = q.candidate!.nzbUrl === "https://nzb.test/r4" ? [5] : [0, 1, 2];
+      return { candidates: [{ ...q.candidate!, files: filesOf(names.map((ti) => `${pad2(ti + 1)} ${titles[ti]}.${q.candidate!.nzbUrl === "https://nzb.test/r4" ? "mp3" : "flac"}`)) }] };
+    }
+    if (q.kind === "usenet_check") return usenetOk(q.candidate!);
+    return { candidates: [] };
+  });
+  assert.equal(h.play(trackItemFor(album, 0)).sources.length, 3);
+  assert.equal(listed.length, 3, "the last candidate was not needed yet");
+  const sixth = h.play(trackItemFor(album, 5));
+  assert.equal(sixth.sources.length, 1, h.logs.join("\n"));
+  assert.equal(sixth.sources[0].release?.candidate?.nzbUrl, "https://nzb.test/r4");
+  assert.deepEqual(listed, ["https://nzb.test/r1", "https://nzb.test/r2", "https://nzb.test/r3", "https://nzb.test/r4"], "nothing listed twice");
+  // The earlier releases still answer for their tracks.
+  assert.equal(h.play(trackItemFor(album, 1)).sources.length, 3);
+  // A track nothing holds ends: the shortlist is used up, no further searching or listing.
+  const searches = h.calls.length;
+  assert.equal(h.play(trackItemFor(album, 4)).sources.length, 0);
+  assert.equal(h.play(trackItemFor(album, 4)).sources.length, 0);
+  assert.equal(h.calls.length, searches, "no loop");
+});
+
+test("an edition of the library album is tried by the single-track fallback, after the other releases", () => {
+  const releases = [
+    { title: "Kick", year: 1987, primaryType: "Album", secondaryTypes: [], trackCount: 12, artistName: "INXS" },
+    { title: "Kick (Deluxe Edition)", year: 2012, primaryType: "Album", secondaryTypes: [], trackCount: 25, artistName: "INXS" },
+    { title: "Need You Tonight", year: 1987, primaryType: "Single", secondaryTypes: [], trackCount: 2, artistName: "INXS" },
+    { title: "Kick 25", year: 2012, primaryType: "Album", secondaryTypes: [], trackCount: 25, artistName: "INXS" },
+  ];
+  const picked = pickRecordingReleases(releases, "Kick 25");
+  assert.deepEqual(picked.map((p) => p.title), ["Need You Tonight", "Kick"], "the single first; one edition last; the library's own title is not repeated");
 });
