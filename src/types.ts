@@ -132,6 +132,8 @@ export interface SourceCandidate {
   codec?: string;
   files?: ReleaseFile[];
   usenetCheck?: UsenetCheckResult;
+  /** A release a source plugin answered a category search with: no hash, magnet or NZB. */
+  pluginRelease?: { plugin: string; id: string };
 }
 
 export interface SourceQuery {
@@ -178,6 +180,11 @@ export interface PlayableSource {
   mime: string;
   size?: number;
   durationSec?: number;
+  /**
+   * With a positive value and `durationSec`, the host reads the file's real running time on open
+   * and refuses the source as wrong content when it differs by more than this many seconds.
+   */
+  durationToleranceSec?: number;
   url?: string;
   headers?: Record<string, string>;
   release?: ReleaseHint;
@@ -322,7 +329,7 @@ export interface TrackFileMapping {
 
 export interface VerifiedAlbumRelease {
   releaseId: string;
-  sourceKind: "usenet" | "debrid";
+  sourceKind: "usenet" | "debrid" | "plugin";
   qualityTier: "flac24" | "flac" | "lossless" | "lossy_high" | "lossy";
   codec: string;
   mime: string;
@@ -336,6 +343,11 @@ export interface VerifiedAlbumRelease {
    * and relies on Ether's acquire-time cache check + release.track selection.
    */
   isUnconfirmedDebridFallback?: boolean;
+  /**
+   * True when the release serves only some of the album's tracks (`tracks` lists them): another
+   * edition, one album of a box set, a single, a soundtrack holding the song.
+   */
+  partial?: boolean;
   /** Map from canonical track ID (e.g. "tr-3135553") -> matched file in release. */
   tracks: Record<string, TrackFileMapping>;
 }
@@ -346,11 +358,21 @@ export interface CachedAlbumResolution {
   expiresAt: number;
   releases: VerifiedAlbumRelease[];
   negative?: boolean;
+  /** Every release of the shortlist was listed: a track none of `releases` serves has no copy here. */
+  exhausted?: boolean;
+  /** Refs of the candidates already listed, so a later search for another track skips them. */
+  probedRefs?: string[];
+  /** How often the search went on for a track the cached releases did not serve. */
+  resumes?: number;
+  /** The last search behind this record had indexers still running, timed out or failed: it is not a verdict. */
+  searchIncomplete?: boolean;
+  /** The exclude set (sorted, joined) the record was resolved under; "" or absent: none. */
+  excludedSig?: string;
 }
 
 export interface VerifiedConcertRelease {
   releaseId: string;
-  sourceKind: "usenet" | "debrid";
+  sourceKind: "usenet" | "debrid" | "plugin";
   qualityTier: "uhd" | "1080p" | "720p" | "sd";
   codec: string;
   mime: string;

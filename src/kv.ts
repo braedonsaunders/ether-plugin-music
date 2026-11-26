@@ -157,6 +157,52 @@ function isBulkyArtistAlbumsPageKey(k: string): boolean {
   return k.startsWith("dz:artist:") && k.includes(":albums:p:");
 }
 
+/**
+ * Host limits (ether-src internal/plugins/store.go): 10 000 keys and 50 MiB per plugin, where each
+ * key is charged its value bytes plus 256. A put that would cross either limit fails with
+ * quota_exceeded; nothing is evicted by the host and expired entries are never reaped.
+ */
+const KEY_CHARGE_BYTES = 256;
+/** Reads one eviction round may spend inspecting entries (each read is a host call). */
+const EVICT_READ_BUDGET = 150;
+const WRITE_FAIL_LOG_INTERVAL_MS = 60_000;
+
+/**
+ * Eviction class of a key, derived from its prefix. Lower classes are given up first.
+ *   -1 never evicted: rate gates and small control keys (rl:, ss:, kv:)
+ *    0 dead legacy prefixes
+ *    1 search memos and probe/retry counters (sq_v1:, search_retry:, exp:artist:keys:, imdb_concert_v1:,
+ *      dz:search:, playlists_bucket)
+ *    2 rebuildable provider data (dz:*, mb:, caa:, lrc:, artist_art_v1:, curated:, rec_plan_v1:)
+ *    3 catalogue data (album_v2:, concert_meta_v1:, backfill:, exp:alb_parent:) and unknown prefixes
+ *    4 verified results and in-progress stage state (alb_rel_v12:, concert_rel_v2:, alb_stage_v6:, concert_stage_v2:)
+ */
+export function kvKeyClass(key: string): number {
+  if (key.startsWith("rl:") || key.startsWith("ss:") || key.startsWith("kv:")) return -1;
+  for (const p of LEGACY_BLOAT_PREFIXES) if (key.startsWith(p)) return 0;
+  if (
+    key.startsWith("sq_v1:") || key.startsWith("search_retry:") || key.startsWith("exp:artist:keys:") ||
+    key.startsWith("imdb_concert_v1:") || key.startsWith("dz:search:") || key === "playlists_bucket"
+  ) return 1;
+  if (
+    key.startsWith("dz:") || key.startsWith("mb:") || key.startsWith("caa:") || key.startsWith("lrc:") ||
+    key.startsWith("artist_art_v1:") || key.startsWith("curated:") || key.startsWith("rec_plan_v")
+  ) return 2;
+  if (
+    key.startsWith("alb_rel_v") || key.startsWith("concert_rel_v2:") ||
+    key.startsWith("alb_stage_v") || key.startsWith("concert_stage_v2:")
+  ) return 4;
+  return 3;
+}
+
+function keyPrefixForLog(key: string): string {
+  const at = key.indexOf(":");
+  return at > 0 ? key.slice(0, at + 1) : key.slice(0, 12);
+}
+
+/** Last "write failed" log time per host kv object, so the limit holds across KVCache instances. */
+const lastWriteFailLog = new WeakMap<object, number>();
+
 export class KVCache {
   private env: HostEnv;
   private mem = new Map<string, { v: unknown; exp: number }>();
@@ -211,25 +257,134 @@ export class KVCache {
     const envObj: CacheEnvelope<T> = { v: value, exp };
     this.mem.set(key, envObj);
     if (options?.persist === false) return;
-    const payload = JSON.stringify(envObj);
+    this.putPersisted(key, JSON.stringify(envObj));
+  }
+
+  /**
+   * Write to the host store. On quota_exceeded, evict (expired first, then low-value classes by
+   * oldest expiry) and retry; a write that still fails is logged at most once a minute with the
+   * key prefix and size (never the value). The in-memory copy stays for this call either way.
+   */
+  private putPersisted(key: string, payload: string): boolean {
+    let lastErr: unknown;
     try {
       this.env.kv.put(key, payload);
+      return true;
     } catch (err) {
       rethrowHostFault(err);
-      if (isQuotaError(err)) {
-        const evicted = this.evictForSpace(64, key);
-        if (evicted > 0) {
-          try {
-            this.env.kv.put(key, payload);
-            this.env.log("info", `kv: reclaimed ${evicted} stale/bulky keys after quota_exceeded`);
-            return;
-          } catch (retryErr) {
-            rethrowHostFault(retryErr);
-          }
+      lastErr = err;
+    }
+    if (isQuotaError(lastErr)) {
+      const need = payload.length;
+      for (const factor of [1, 6]) {
+        const evicted = this.evictForWrite(key, need * factor);
+        if (evicted === 0) break;
+        try {
+          this.env.kv.put(key, payload);
+          this.env.log("info", `kv: evicted ${evicted} entries to store ${keyPrefixForLog(key)} (${payload.length} bytes)`);
+          return true;
+        } catch (retryErr) {
+          rethrowHostFault(retryErr);
+          lastErr = retryErr;
         }
       }
-      // Transient write fault or exhausted quota: keep in-memory cache for this call.
     }
+    this.logWriteFailure(key, payload.length, lastErr);
+    return false;
+  }
+
+  private logWriteFailure(key: string, size: number, err: unknown): void {
+    const now = this.env.now();
+    const last = lastWriteFailLog.get(this.env.kv);
+    if (last !== undefined && now - last < WRITE_FAIL_LOG_INTERVAL_MS) return;
+    lastWriteFailLog.set(this.env.kv, now);
+    const msg = typeof err === "string" ? err : String((err as { message?: unknown })?.message || err);
+    const code = extractFaultCode(err, msg) || "error";
+    try {
+      this.env.log("warn", `kv: write failed prefix=${keyPrefixForLog(key)} bytes=${size} code=${code}`);
+    } catch { /* logging must never fail a write */ }
+  }
+
+  /**
+   * Make room for one write of about `needBytes` (value bytes; each freed key also frees its 256-byte charge). Called only
+   * after the host refused a put, so the full key listing costs nothing on normal writes.
+   * Order: dead legacy prefixes; then expired entries of any class (found by reading at most
+   * EVICT_READ_BUDGET entries, lowest class first); then live entries of the lowest class first,
+   * oldest expiry first (expiry minus a fixed per-prefix TTL is the write time, so this is
+   * least-recently-written). Rate gates and control keys are never touched. Returns deletions.
+   */
+  evictForWrite(keepKey: string, needBytes: number): number {
+    let keys: string[];
+    try {
+      keys = this.env.kv.list("");
+    } catch (err) {
+      rethrowHostFault(err);
+      return 0;
+    }
+    const now = this.env.now();
+    const byClass: string[][] = [[], [], [], [], []];
+    for (const k of keys) {
+      if (!k || k === keepKey) continue;
+      const c = kvKeyClass(k);
+      if (c >= 0) byClass[c].push(k);
+    }
+    let deleted = 0;
+    let freed = 0;
+    const enough = () => deleted > 0 && freed >= needBytes;
+    const drop = (k: string, size: number): void => {
+      try {
+        this.env.kv.delete(k);
+        this.mem.delete(k);
+        deleted++;
+        freed += size + KEY_CHARGE_BYTES;
+      } catch (err) {
+        rethrowHostFault(err);
+      }
+    };
+
+    for (const k of byClass[0]) {
+      if (enough()) return deleted;
+      drop(k, 0);
+    }
+
+    // Expired entries first, whatever their class; remember expiry of the live ones we read.
+    let reads = EVICT_READ_BUDGET;
+    const live: Array<Array<{ k: string; exp: number; size: number }>> = [[], [], [], [], []];
+    const unread: string[][] = [[], [], [], [], []];
+    for (let c = 1; c <= 4; c++) {
+      for (const k of byClass[c]) {
+        if (enough()) return deleted;
+        if (reads <= 0) { unread[c].push(k); continue; }
+        reads--;
+        let raw: string | null = null;
+        try {
+          raw = this.env.kv.get(k);
+        } catch (err) {
+          rethrowHostFault(err);
+        }
+        if (!raw) continue;
+        let exp = Number.POSITIVE_INFINITY;
+        try {
+          const parsed = JSON.parse(raw) as { exp?: unknown };
+          if (typeof parsed?.exp === "number") exp = parsed.exp;
+        } catch { /* unreadable entry: treat as live, unknown expiry */ }
+        if (exp <= now) drop(k, raw.length);
+        else live[c].push({ k, exp, size: raw.length });
+      }
+    }
+
+    for (let c = 1; c <= 4; c++) {
+      live[c].sort((a, b) => a.exp - b.exp);
+      for (const e of live[c]) {
+        if (enough()) return deleted;
+        drop(e.k, e.size);
+      }
+      for (const k of unread[c]) {
+        if (enough()) return deleted;
+        drop(k, 0);
+      }
+    }
+    return deleted;
   }
 
   delete(key: string): void {
@@ -418,11 +573,7 @@ export class KVCache {
       return false;
     }
     stamps.push(now);
-    try {
-      this.env.kv.put(bucketKey + ":win", JSON.stringify(stamps));
-    } catch (err) {
-      rethrowHostFault(err);
-    }
+    this.putPersisted(bucketKey + ":win", JSON.stringify(stamps));
     return true;
   }
 
@@ -433,20 +584,12 @@ export class KVCache {
     const now = this.env.now();
     const nextAt = this.getNumber(bucketKey + ":nextAt");
     if (now < nextAt) return false;
-    try {
-      this.env.kv.put(bucketKey + ":nextAt", String(now + minIntervalMs));
-    } catch (err) {
-      rethrowHostFault(err);
-    }
+    this.putPersisted(bucketKey + ":nextAt", String(now + minIntervalMs));
     return true;
   }
 
   setCooldown(bucketKey: string, durationMs: number): void {
-    try {
-      this.env.kv.put(bucketKey + ":cooldown", String(this.env.now() + durationMs));
-    } catch (err) {
-      rethrowHostFault(err);
-    }
+    this.putPersisted(bucketKey + ":cooldown", String(this.env.now() + durationMs));
   }
 
   private getNumber(key: string): number {

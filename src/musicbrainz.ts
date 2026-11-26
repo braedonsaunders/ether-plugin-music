@@ -133,8 +133,11 @@ export class MusicBrainzClient {
    * Every official release that carries a recording, by its ISRC: the album it came from,
    * singles, EPs, deluxe editions, soundtracks and compilations. Same 1 req/s gate as above;
    * "busy" means the slot was taken (ask again shortly). Cached 30 days (misses 7).
+   * "miss" is an answer (MusicBrainz knows no release for it); "failed" is none (HTTP 5xx or any
+   * other error status, network error, timeout, a body that is not a recordings answer): never
+   * cached, and a caller must not take it for "nothing found".
    */
-  lookupRecordingReleases(isrc: string): { status: "ok"; releases: MBRecordingRelease[] } | { status: "busy" | "miss" } {
+  lookupRecordingReleases(isrc: string): { status: "ok"; releases: MBRecordingRelease[] } | { status: "busy" | "miss" | "failed" } {
     const code = isrc.trim().toUpperCase();
     const cacheKey = `mb:isrc:${code}`;
     const cached = this.cache.get<MBRecordingRelease[] | { miss: true }>(cacheKey);
@@ -155,8 +158,9 @@ export class MusicBrainzClient {
         this.cache.setCooldown(MB_RATE_BUCKET, 10_000);
         return { status: "busy" };
       }
+      if (resp.status === 404) return { status: "miss" };
       if (resp.status < 200 || resp.status >= 300 || !resp.body) {
-        return { status: "miss" };
+        return { status: "failed" };
       }
       const data = JSON.parse(resp.body) as {
         recordings?: Array<{
@@ -171,8 +175,9 @@ export class MusicBrainzClient {
           }>;
         }>;
       };
+      if (!data || !Array.isArray(data.recordings)) return { status: "failed" };
       const out: MBRecordingRelease[] = [];
-      for (const rec of data.recordings || []) {
+      for (const rec of data.recordings) {
         const recArtist = (rec["artist-credit"] || []).map((a) => a.name || "").join(" ").trim();
         for (const rel of rec.releases || []) {
           if (!rel.title || (rel.status && rel.status !== "Official")) continue;
@@ -195,7 +200,7 @@ export class MusicBrainzClient {
       return { status: "ok", releases: out.slice(0, 60) };
     } catch (err) {
       rethrowHostFault(err);
-      return { status: "miss" };
+      return { status: "failed" };
     }
   }
 

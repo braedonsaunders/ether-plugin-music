@@ -79,15 +79,23 @@ export function tokensOf(input: string): string[] {
 export function textSimilarity(a: string, b: string): number {
   const na = normalizeText(a);
   const nb = normalizeText(b);
+  return similarityOfNormalized(na, tokenSetOfNormalized(na), nb, tokenSetOfNormalized(nb));
+}
+
+/** The words of a text that normalizeText has already been through. */
+export function tokenSetOfNormalized(norm: string): Set<string> {
+  return new Set(norm.split(" ").filter((t) => t.length > 0));
+}
+
+/**
+ * textSimilarity for texts already normalized and split: comparing every track with every file
+ * of a release would otherwise normalize the same strings thousands of times.
+ */
+export function similarityOfNormalized(na: string, setA: Set<string>, nb: string, setB: Set<string>): number {
   if (!na || !nb) return 0;
   if (na === nb) return 1;
+  if (setA.size === 0 || setB.size === 0) return 0;
 
-  const ta = tokensOf(na);
-  const tb = tokensOf(nb);
-  if (ta.length === 0 || tb.length === 0) return 0;
-
-  const setA = new Set(ta);
-  const setB = new Set(tb);
   let inter = 0;
   for (const t of setA) {
     if (setB.has(t)) inter++;
@@ -316,10 +324,16 @@ export function computeAlbumOrderIndex(
  * discography, box set, live bootleg, tribute, karaoke, or non-studio pack that must be
  * rejected when the requested item is a studio album.
  */
+/** Names that are collections whatever else they carry. */
+const HARD_DISCOGRAPHY_RE = /\b(?:discography|complete\s+studio\s+albums|complete\s+albums|studio\s+albums\s+collection|all\s+albums|\d{4}\s*-\s*\d{4}|va|various|top\s*\d+)\b/i;
+
 export function isRejectedReleaseForRequest(
   releaseTitle: string,
   requestedAlbumTitle: string,
-  requestedReleaseType: ReleaseType
+  requestedReleaseType: ReleaseType,
+  // allowCompilations: the question is whether a release holds one song (or the library's
+  // album is itself a various-artists one), so a compilation or soundtrack name is no reason.
+  opts?: { allowCompilations?: boolean; /** The release name carries this album's artist and core title: an edition of it. */ sameAlbumEdition?: boolean }
 ): { rejected: boolean; reason?: string } {
   const rel = String(releaseTitle || "");
   const reqNorm = normalizeText(requestedAlbumTitle);
@@ -331,14 +345,19 @@ export function isRejectedReleaseForRequest(
 
   // Discography / multi-album packs always fail album-unit matching.
   if (/\b(?:discography|complete\s+studio\s+albums|complete\s+albums|studio\s+albums\s+collection|all\s+albums|box\s*set|\d+\s*cd\s*box|\b\d{4}\s*-\s*\d{4}\b)\b/i.test(rel)) {
-    if (!/\b(?:box|complete|anthology)\b/i.test(reqNorm)) {
-      return { rejected: true, reason: "discography or multi-album box set" };
+    // Not when the requested album is itself such a set ("The Studio Album Collection 1977-1992").
+    if (!/\b(?:box|complete|anthology|collection|discography|albums|(?:19|20)\d\d (?:19|20)\d\d)\b/i.test(reqNorm)) {
+      // "Super Deluxe Edition (6 CD Box Set)" of the very album requested is an edition of it, not a
+      // discography: unless it is a many-disc set, a various-artists pack or spans years.
+      const editionBox = opts?.sameAlbumEdition && !HARD_DISCOGRAPHY_RE.test(rel) && !/\b\d{3,}\s*-?\s*cd\b/i.test(rel);
+      if (!editionBox) return { rejected: true, reason: "discography or multi-album box set" };
     }
   }
 
   // When requesting a studio album/EP/single, reject compilations & greatest hits unless requested.
   if (requestedReleaseType === "album" || requestedReleaseType === "ep" || requestedReleaseType === "single") {
     if (
+      !opts?.allowCompilations &&
       /\b(?:greatest\s+hits|best\s+of|the\s+very\s+best|anthology|compilation|various\s+artists|\bva\s+-|\bva\b|essential\s+collection|hits\s+collection|ultimate\s+collection|now\s+thats\s+what\s+i\s+call)\b/i.test(rel) &&
       !/\b(?:greatest\s+hits|best\s+of|anthology|compilation|essential|ultimate)\b/i.test(reqNorm)
     ) {
@@ -355,6 +374,120 @@ export function isRejectedReleaseForRequest(
       !/\b(?:live|unplugged|concert|sessions|bbc)\b/i.test(reqNorm)
     ) {
       return { rejected: true, reason: "live recording rejected for studio album request" };
+    }
+  }
+
+  return { rejected: false };
+}
+
+const VERSION_REMIX_RE = /\b(?:remix(?:es|ed)?|rmx|dj mix|club mix|extended mix|dub mix|vip mix)\b/;
+const VERSION_LIVE_RE = /\b(?:live|in concert|unplugged|bootleg|soundboard|broadcast)\b/;
+// Alternate mixes. "5.1"/"4.1" are matched on the raw text because normalizeText splits them.
+const VERSION_ALT_RE =
+  /\b(?:quad|quadraphonic|surround|atmos|instrumentals?|karaoke|a ?cappella|acapella|acappella|demos?|acoustic|drumless|mono mix|stereo mix)\b/g;
+// Not a sample rate ("44.1", "24-44.1") or a version ("v4.1"); "SACD.5.1" in a dotted name counts.
+const VERSION_SURROUND_RE = /(?<![\dv])(?<!\d\.)[457]\.1(?:ch)?(?![\d])/g;
+const VERSION_VOLUME_RE = /\b(volume|vol|part|pt) (\d{1,2})\b/g;
+// A bracketed note that describes the edition or its extras ("Deluxe Edition incl. Live Bonus
+// Disc", "Remastered + Demos"), or a bare "(Live)" / "[Live 1976]" tag, says nothing reliable
+// about which recording the release is: a live album is often tagged that way.
+const VERSION_GROUP_RE = /[(\[{][^()\[\]{}]*[)\]}]/g;
+const VERSION_EDITION_NOTE_RE =
+  /\b(?:bonus|deluxe|edition|expanded|remaster(?:ed|s)?|anniversary|incl|including|with|discs?|tracks?|reissue)\b/i;
+const VERSION_BARE_LIVE_RE = /^[(\[{]\s*live(?:\s+(?:19|20)\d\d)?\s*[)\]}]$/i;
+const VERSION_EXTRAS_RE = /\b(?:bonus|incl|including)\b/;
+
+/**
+ * Whether a bracketed group of a RELEASE name is one isWrongVersionRelease ignores at the name
+ * stage: a note about the edition or its extras, or a bare "(Live)" / "[Live 1976]" tag.
+ */
+export function isEditionOrBareLiveNote(group: string): boolean {
+  return VERSION_EDITION_NOTE_RE.test(group) || VERSION_BARE_LIVE_RE.test(group);
+}
+
+/**
+ * Name-level gate for a different VERSION of the requested recording: a release name that
+ * declares a remix, live recording, alternate mix, or another volume/part which the requested
+ * album title (full, with its edition suffix) does not declare. Markers in the artist name
+ * (the band "Live") and in notes about the edition's extras are ignored. Cheap: a handful of
+ * precompiled regexes per call.
+ */
+export function isWrongVersionRelease(
+  releaseTitle: string,
+  requestedAlbumTitle: string,
+  artistName = ""
+): { rejected: boolean; reason?: string; softVolume?: boolean } {
+  const shown = String(releaseTitle || "").replace(VERSION_GROUP_RE, (g) =>
+    VERSION_EDITION_NOTE_RE.test(g) || VERSION_BARE_LIVE_RE.test(g) ? " " : g
+  );
+  const rawRel = shown.toLowerCase();
+  const rawReq = String(requestedAlbumTitle || "").toLowerCase();
+  let rel = normalizeText(shown);
+  const req = normalizeText(requestedAlbumTitle);
+
+  // Drop the artist's own name (first occurrence) so "Live", "Broadcast" etc. as artists don't count.
+  const artist = normalizeText(artistName);
+  if (artist) {
+    const padded = ` ${rel} `;
+    const at = padded.indexOf(` ${artist} `);
+    if (at >= 0) rel = (padded.slice(0, at) + " " + padded.slice(at + artist.length + 1)).trim();
+  }
+
+  // A name that lists extras outside brackets ("Album.Deluxe.Incl.Live.Bonus.Disc") is not judged
+  // on remix/live/mix words: they describe the extras.
+  const listsExtras = VERSION_EXTRAS_RE.test(rel);
+
+  if (!listsExtras && VERSION_REMIX_RE.test(rel) && !VERSION_REMIX_RE.test(req)) {
+    return { rejected: true, reason: "remix, not requested" };
+  }
+
+  if (!listsExtras && VERSION_LIVE_RE.test(rel) && !VERSION_LIVE_RE.test(req)) {
+    return { rejected: true, reason: "live recording, not requested" };
+  }
+
+  const altOf = (norm: string, raw: string): Set<string> => {
+    const out = new Set<string>();
+    for (const m of norm.matchAll(VERSION_ALT_RE)) {
+      const w = m[0].replace(/s$/, "").replace(/ /g, "");
+      out.add(w === "acapella" ? "acappella" : w);
+    }
+    for (const _m of raw.matchAll(VERSION_SURROUND_RE)) out.add("surround");
+    return out;
+  };
+  const relAlt = listsExtras ? new Set<string>() : altOf(rel, rawRel);
+  if (relAlt.size > 0) {
+    const reqAlt = altOf(req, rawReq);
+    for (const a of relAlt) {
+      if (!reqAlt.has(a)) {
+        return { rejected: true, reason: "alternate mix, not requested" };
+      }
+    }
+  }
+
+  const volOf = (norm: string): Map<string, Set<string>> => {
+    const out = new Map<string, Set<string>>();
+    for (const m of norm.matchAll(VERSION_VOLUME_RE)) {
+      const fam = m[1] === "part" || m[1] === "pt" ? "part" : "volume";
+      const n = String(Number(m[2]));
+      (out.get(fam) || out.set(fam, new Set()).get(fam)!).add(n);
+    }
+    return out;
+  };
+  const relVol = volOf(rel);
+  if (relVol.size > 0) {
+    const reqVol = volOf(req);
+    const reqWords = new Set(req.split(" ").map((w) => (/^\d+$/.test(w) ? String(Number(w)) : w)));
+    for (const [fam, nums] of relVol) {
+      const want = reqVol.get(fam);
+      if (!want) {
+        // The request has no marker of this kind. A request with the other kind (vol vs part)
+        // counts as declared, and so does one that carries the number itself ("Now 5" / "Vol 5").
+        if (reqVol.size === 0 && ![...nums].some((n) => reqWords.has(n))) {
+          return { rejected: true, reason: "different volume", softVolume: true };
+        }
+        continue;
+      }
+      if (![...nums].some((n) => want.has(n))) return { rejected: true, reason: "different volume" };
     }
   }
 
@@ -475,6 +608,8 @@ export interface ParsedTrackFilename {
   track: number | null;
   titleGuess: string;
   baseName: string;
+  /** The file name without extension and without the leading disc/track number (underscores as spaces). */
+  rest: string;
 }
 
 /**
@@ -540,7 +675,7 @@ export function parseTrackFilename(filePath: string, totalDiscs = 1): ParsedTrac
     }
   }
 
-  return { disc, track, titleGuess, baseName };
+  return { disc, track, titleGuess, baseName, rest: rest.replace(/_/g, " ").trim() };
 }
 
 export function validExternalId(id: string): string {
@@ -550,3 +685,416 @@ export function validExternalId(id: string): string {
     .slice(0, 120);
   return cleaned || "m-unknown";
 }
+
+/**
+ * Text an indexer's full-text search can match: Latin accents folded, punctuation turned into
+ * spaces ("AC/DC" -> "AC DC", "Beyoncé" -> "Beyonce"). Letters of other scripts are kept.
+ */
+export function indexerQueryText(input: string): string {
+  return String(input || "")
+    // A Latin letter followed by combining marks (decomposed "é") is the plain letter. Marks after
+    // letters of other scripts (Thai, Devanagari, Hebrew points...) are part of the word and stay.
+    .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
+    .replace(/[Ææ]/g, "ae")
+    .replace(/[Œœ]/g, "oe")
+    .replace(/[Øø]/g, "o")
+    .replace(/[ß]/g, "ss")
+    .replace(/[Łł]/g, "l")
+    .replace(/[À-ɏ]/g, (ch) => ch.normalize("NFD").replace(/[̀-ͯ]/g, ""))
+    .replace(/(?<=\p{L})\$(?=\p{L})/gu, "S")
+    .replace(/(?<=\p{L})!(?=\p{L})/gu, "i")
+    .replace(/['’`´]/g, "")
+    .replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")
+    // A mark with no letter before it (after a space or symbol) belongs to nothing.
+    .replace(/(?<![\p{L}\p{N}\p{M}])\p{M}+/gu, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/**
+ * The spelling release names use when an artist's name is split by punctuation and written as
+ * one word ("AC/DC" -> "ACDC", "R.E.M." -> "REM", "blink-182" -> "blink182"). Empty when the
+ * name has no such word.
+ */
+export function joinedArtistSpelling(artist: string): string {
+  const words = String(artist || "").trim().split(/\s+/).filter(Boolean);
+  let changed = false;
+  const out = words.map((w) => {
+    if (!/[\p{L}\p{N}\p{M}][\/.\-][\p{L}\p{N}]/u.test(w)) return w;
+    changed = true;
+    return w.replace(/[\/.\-]/g, "");
+  });
+  if (!changed) return "";
+  const joined = indexerQueryText(out.join(" "));
+  return joined && joined !== indexerQueryText(artist) ? joined : "";
+}
+
+/**
+ * An album or single title without "(feat. ...)", "[From ...]" and edition tags: what release
+ * names carry, used for searching and for comparing titles.
+ */
+export function coreReleaseTitle(title: string): string {
+  const original = String(title || "").trim();
+  let out = original;
+  let prev = "";
+  while (out !== prev) {
+    prev = out;
+    out = stripFeaturing(out)
+      .replace(/\s*[\(\[]\s*(?:from|music\s+from|original|soundtrack|ost)\b[^\)\]]*[\)\]]\s*$/i, "")
+      .trim();
+    out = stripEditionSuffix(out);
+  }
+  return out || original;
+}
+
+/**
+ * A track title as a song query wants it: credits ("(feat. X)"), catalogue labels ("(Concert
+ * Version)", "(Album Version)", "(From ...)"), remaster notes and a trailing "- Live" or
+ * "- 2011 Remaster" clause dropped, every trailing bracketed note too. Never empty.
+ */
+export function coreTrackTitle(title: string): string {
+  const original = String(title || "").trim();
+  let out = coreReleaseTitle(original);
+  let prev = "";
+  while (out !== prev) {
+    prev = out;
+    out = out
+      .replace(/\s*[\(\[\{][^()\[\]{}]*[\)\]\}]\s*$/, "")
+      .replace(/\s+[-\u2013\u2014]\s+[^-\u2013\u2014]*\b(?:live|remaster(?:ed)?|version|mix|edit|mono|stereo|demo|acoustic|session|single|radio)\b[^-\u2013\u2014]*$/i, "")
+      .trim();
+  }
+  return out || coreReleaseTitle(original) || original;
+}
+
+const PART_TAIL_RE =
+  /[\s,:;\-\u2013\u2014]*(?<![\p{L}\p{N}])(?:part|pt|vol|volume|\u0447\u0430\u0441\u0442\u044c|\u0447|\u2116|no)\.?\s*(?:\d{1,3}|[ivx]{1,4})\s*$/iu;
+
+/** A title without a trailing "part 2" / "Vol. 3" / "\u0447\u0430\u0441\u0442\u044c 1" counter; the title itself when it has none. */
+export function stripPartTail(title: string): string {
+  const t = String(title || "").trim();
+  const out = t.replace(PART_TAIL_RE, "").trim();
+  return out && out !== t ? out : t;
+}
+
+const QUERY_STOP_WORDS = new Set(["the", "a", "an", "and", "of", "&", "und", "le", "la", "el", "los", "las"]);
+
+/**
+ * The song queries tried for one track, best first, each "artist title" as an indexer or
+ * Soulseek wants it: (1) the artist and the core title (credits, catalogue labels, remaster
+ * notes dropped); (2) for a long title (more than 6 words, or a query of more than 7), the artist's
+ * first significant word and the first 5 words of the title without brackets ("SaD Fade To
+ * Black"); (3) the same without a trailing "part N" counter. Duplicates (by words) are left out.
+ */
+export function trackQueryVariants(artist: string, title: string): string[] {
+  const artistText = indexerQueryText(artist);
+  const rawTitle = String(title || "");
+  const coreTitle = indexerQueryText(coreTrackTitle(rawTitle));
+  if (!coreTitle) return [];
+  const out: string[] = [];
+  const add = (q: string) => {
+    const t = q.replace(/\s{2,}/g, " ").trim();
+    if (t && !out.some((o) => normalizeTitleKey(o) === normalizeTitleKey(t))) out.push(t);
+  };
+  add(`${artistText} ${coreTitle}`);
+  const words = (t: string) => t.split(/\s+/).filter(Boolean);
+  const bracketless = indexerQueryText(rawTitle.replace(/[\(\[\{][^()\[\]{}]*[\)\]\}]/g, " "));
+  if (words(indexerQueryText(rawTitle)).length > 6 || words(`${artistText} ${coreTitle}`).length > 7) {
+    const sig = words(artistText).filter((w) => !QUERY_STOP_WORDS.has(w.toLowerCase()));
+    const lead = sig.length === 0 ? [] : sig[0].length <= 2 && sig.length > 1 ? sig.slice(0, 2) : sig.slice(0, 1);
+    const shortTitle = words(bracketless || coreTitle).slice(0, 5).join(" ");
+    add(`${lead.join(" ")} ${shortTitle}`);
+  }
+  const noTail = stripPartTail(coreTitle);
+  if (noTail !== coreTitle) add(`${artistText} ${noTail}`);
+  return out;
+}
+
+/**
+ * normalizeText for titles in any script: accents folded and punctuation dropped like
+ * normalizeText, but letters and digits of other scripts (Japanese, Korean, Cyrillic...) are kept,
+ * so such titles still compare. normalizeText turns them into nothing.
+ */
+export function normalizeTitleKey(input: string): string {
+  return String(input || "")
+    .replace(/[Ææ]/g, "ae")
+    .replace(/[Œœ]/g, "oe")
+    .replace(/[Øø]/g, "o")
+    .replace(/[ß]/g, "ss")
+    .replace(/[Ðð]/g, "d")
+    .replace(/[Þþ]/g, "th")
+    .replace(/[Łł]/g, "l")
+    .normalize("NFD")
+    .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
+    .normalize("NFKC")
+    .replace(/['’`´]/g, "")
+    .replace(/[&+]/g, " and ")
+    .replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/** "Various Artists" and its short forms: a credit that names no band. */
+export function isVariousArtistsName(name: string): boolean {
+  return /^(?:various(?:\s+artists?)?|va|v\/a|multi[\s-]?artists?)$/i.test(String(name || "").trim());
+}
+
+// Words that name ANOTHER version of a song (or a performance of it). A credit note ("feat. X",
+// "with Y", "From Z") that holds one of them is no credit: "(feat. Drake Remix)", "(With
+// Orchestra)", "(From Live at Wembley)".
+const VERSION_WORD_RE =
+  /\b(?:live|remix(?:es|ed)?|rmx|mix(?:es|ed)?|edits?|demos?|acoustic|instrumental|karaoke|version|versions|ver|sessions?|orchestra|orchestral|mono|stereo|unplugged|cover|rework(?:ed)?|bootleg|extended|radio|club|dub|cappella|acapella|piano|strings|stripped|alternate|alternative|alt|take|rehearsal|concert|tour)\b/;
+
+/** The words of a text that name another version of a song ("live", "remix", "demo"...), normalized. */
+export function versionWordsOf(text: string): string[] {
+  const re = new RegExp(VERSION_WORD_RE.source, "g");
+  return Array.from(normalizeTitleKey(text).matchAll(re), (m) => m[0]);
+}
+
+/** Whether a text carries a word that names another version of a song. */
+export function hasVersionWord(text: string): boolean {
+  return VERSION_WORD_RE.test(normalizeTitleKey(text));
+}
+
+// Words that, alone in a bracketed note, say nothing about WHICH recording a title is: a release
+// may or may not carry them ("Money (2011 Remaster)", "(Explicit)", "(Deluxe Edition)").
+const BENIGN_NOTE_WORDS = new Set(
+  (
+    "album original lp full stereo digital explicit clean bonus track deluxe edition " +
+    "remaster remastered mastered hd hq anniversary expanded standard"
+  ).split(" ")
+);
+// "Version" is harmless only beside a word that makes it the standard one: "Album Version",
+// "Original Version", "Explicit Version", "Remastered Version", "Stereo Version" (stereo is the
+// default presentation; a mono mix is a qualifier of its own). "Single Version" (single edits
+// differ in length), "Clean Version", "New", "Special", "Early", "Late", "Alternate" are not.
+const STANDARD_VERSION_WORDS = new Set(
+  "album original lp explicit remaster remastered mastered digital hd hq stereo".split(" ")
+);
+const BENIGN_NOTE_LEAD_RE = /^(?:feat|ft|featuring|with|prod|produced by|from|music from|theme from|original motion picture|original soundtrack|ost)(?: |$)/;
+
+/**
+ * Whether a bracketed or dashed note on a title is harmless (a credit, a source, a remaster or
+ * edition mark). Anything else - "live", "remix", "early version", "radio edit", a name plus
+ * "ver." - names another version of the song. A credit ("feat. X", "with Y", "From Z") is
+ * harmless only when what follows names no version.
+ */
+export function isBenignTitleNote(note: string): boolean {
+  const n = normalizeTitleKey(note);
+  if (!n) return true;
+  if (BENIGN_NOTE_LEAD_RE.test(n)) return !VERSION_WORD_RE.test(n);
+  const words = n.split(" ");
+  const isYear = (w: string) => /^(?:19|20)\d\d$/.test(w);
+  if (words.some((w) => w === "version" || w === "ver")) {
+    const others = words.filter((w) => w !== "version" && w !== "ver");
+    return others.some((w) => STANDARD_VERSION_WORDS.has(w)) && others.every((w) => STANDARD_VERSION_WORDS.has(w) || isYear(w));
+  }
+  return words.every((w) => BENIGN_NOTE_WORDS.has(w) || isYear(w));
+}
+
+const TITLE_MARKER_RE =
+  /\b(?:live|remix(?:es|ed)?|rmx|mix|demo|acoustic|instrumental|karaoke|edit|mono|sessions?|early|alternate|alternative|alt|take|unplugged|cover|cappella|acapella|reprise|dub|rehearsal|outtake|unreleased|radio|single|extended|version|ver|sped|slowed|reverb|stripped|piano|orchestral|orchestra|strings|club|concert|tour|reimagined|rework|bootleg)\b/;
+
+export interface TitleSignature {
+  /** The whole title, normalized: two titles equal here are the same text. */
+  full: string;
+  /** The title without its benign trailing notes, plus the notes that name a version. */
+  sig: string;
+  /** The title without any trailing note, normalized. */
+  base: string;
+  /** Every note that names a version, normalized, whether or not `ignoreQual` dropped it from `sig`. */
+  quals: string[];
+}
+
+/**
+ * What a track title says about WHICH recording it is. Trailing brackets and " - ..." notes are
+ * peeled off: harmless ones (feat./with credits, "From ...", "Album Version", remaster marks) are
+ * dropped, the others are kept as version qualifiers. Two titles are the same song when their
+ * `sig` is equal: "Money (2011 Remaster)" = "Money", but "Money (Live)" != "Money" and
+ * "World Turning" != "World Turning (Early Version)". `ignoreQual` names qualifiers that hold for
+ * the whole album ("Live" on every track of a live album): they are left out of `sig`.
+ */
+export function titleSignature(title: string, ignoreQual?: (qualifier: string) => boolean): TitleSignature | null {
+  const raw = String(title || "").trim();
+  const full = normalizeTitleKey(raw);
+  if (!full) return null;
+  // Credits that name no version are no part of the title, wherever they stand.
+  let s = raw.replace(/\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+([^\)\]]+)[\)\]]/gi, (m, rest: string) =>
+    hasVersionWord(rest) ? m : ""
+  );
+  const quals: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const g = s.match(/^(.*\S)\s*[\(\[\{]([^()\[\]{}]*)[\)\]\}]\s*$/);
+    if (g) {
+      if (!isBenignTitleNote(g[2])) quals.push(normalizeTitleKey(g[2]));
+      s = g[1].replace(/[\s\-–—:]+$/, "");
+      continue;
+    }
+    const d = s.match(/^(.*\S)\s+[-–—]\s+([^-–—]+)$/);
+    if (d) {
+      const clause = normalizeTitleKey(d[2]);
+      if (isBenignTitleNote(d[2])) {
+        s = d[1];
+        continue;
+      }
+      if (clause.split(" ").length <= 5 && TITLE_MARKER_RE.test(clause)) {
+        quals.push(clause);
+        s = d[1];
+        continue;
+      }
+    }
+    const f = s.match(/^(.*\S)\s+(?:feat\.?|ft\.?|featuring)\s+(.+)$/i);
+    if (f && !hasVersionWord(f[2])) {
+      s = f[1];
+      continue;
+    }
+    break;
+  }
+  const base = normalizeTitleKey(s);
+  if (!base) return { full, sig: `${full}|`, base: full, quals: [] };
+  const kept = ignoreQual ? quals.filter((q) => !ignoreQual(q)) : quals;
+  return { full, sig: `${base}|${kept.sort().join(";")}`, base, quals };
+}
+
+const GENERIC_TRACK_TITLES = new Set(["intro", "outro", "interlude", "skit", "untitled", "prelude", "reprise", "bonus", "hidden track"]);
+
+/** A title that says nothing about which song it is ("Intro", "Interlude", "Track 5"). */
+export function isGenericTrackTitle(base: string): boolean {
+  return GENERIC_TRACK_TITLES.has(base) || /^track \d{1,3}$/.test(base);
+}
+
+/** A file named with no title of its own: a bare number, "track01", "audio". */
+const NO_TITLE_WORDS = new Set(
+  "track tr trk audio song music file unknown title no name noname sound recording disc cd disk side part full single mp3 flac wav".split(" ")
+);
+export function isTitlelessFileName(baseName: string): boolean {
+  const t = normalizeTitleKey(String(baseName || "").replace(/[\(\[\{][^()\[\]{}]*[\)\]\}]/g, " ")).replace(/\d+/g, " ");
+  const words = t.split(/\s+/).filter(Boolean);
+  return words.every((w) => NO_TITLE_WORDS.has(w));
+}
+
+/** A segment of a file name with the text in front of the title, and what stands before it. */
+export interface FileTitleCandidate {
+  run: string;
+  /** The segments in front of the run (artist, album, numbers), in order. */
+  lead: string[];
+}
+
+/**
+ * The titles a file name may carry, longest first, each with the segments in front of it: a name
+ * is often "Artist - Album - 01 - Title" or scene style "01-artist-title", so every tail after a
+ * separator is a candidate. Separators are " - " (spaces around the dash) and, in scene style (no
+ * spaces at all, starting with a track number), the hyphen; a hyphen inside a word never splits
+ * ("Spider-Man"). `rest` is the file name without extension and track number; `baseName` the one
+ * with the number kept ("99 Problems").
+ */
+export function fileTitleCandidates(rest: string, baseName = ""): FileTitleCandidate[] {
+  const out: FileTitleCandidate[] = [];
+  const seen = new Set<string>();
+  // Scene style: no spaces at all and hyphens between the parts, with or without a leading
+  // number ("05-coldplay-yellow", "coldplay-yellow"). The parts in front of a title still have
+  // to name the artist or the album, so "Spider-Man" yields "Spider Man" and never "Man".
+  const scene = Boolean(baseName) && !/\s/.test(baseName) && rest.includes("-");
+  const add = (text: string, sceneStyle: boolean) => {
+    const segs = (sceneStyle ? text.split("-") : text.split(/\s+[-–—]\s+/))
+      .map((x) => x.replace(/_/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 8);
+    for (let i = 0; i < segs.length; i++) {
+      const run = segs.slice(i).join(" - ");
+      const key = `${run}\u0000${segs.slice(0, i).join("\u0001")}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push({ run, lead: segs.slice(0, i) });
+      }
+    }
+  };
+  add(scene ? rest : rest.replace(/_/g, " "), scene);
+  if (baseName && baseName !== rest) add(scene ? baseName : baseName.replace(/_/g, " "), scene);
+  return out;
+}
+
+/** fileTitleCandidates without the leads. */
+export function fileTitleRuns(rest: string, baseName = ""): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of fileTitleCandidates(rest, baseName)) {
+    if (!seen.has(c.run)) {
+      seen.add(c.run);
+      out.push(c.run);
+    }
+  }
+  return out;
+}
+
+/** What the segments in front of a title say about who made the file. */
+export type LeadVerdict = "none" | "neutral" | "named" | "foreign";
+
+export interface ExpectedLead {
+  /** Names of the artists the track may carry (empty: unknown, nothing is checked). */
+  artists: string[];
+  /** Album titles (the album's, its core form) a segment may name. */
+  albums: string[];
+  /** Whole segments of the release name (brackets and years removed) a segment may equal. */
+  releaseSegments: string[];
+  /** The album's artist is "Various Artists": that name in a file is no mismatch. */
+  variousArtists?: boolean;
+}
+
+const LEAD_STOP_WORDS = new Set(["the", "a", "an", "and", "feat", "ft", "featuring", "with", "of", "vs", "x"]);
+const isYearToken = (w: string) => /^(?:19|20)\d\d$/.test(w);
+
+function leadTokens(text: string): string[] {
+  return normalizeTitleKey(text)
+    .split(" ")
+    .filter((w) => w && !LEAD_STOP_WORDS.has(w) && !isYearToken(w));
+}
+
+function tokensCompatible(a: string[], b: string[]): boolean {
+  if (a.length === 0 || b.length === 0) return false;
+  const sa = new Set(a);
+  const sb = new Set(b);
+  return a.every((t) => sb.has(t)) || b.every((t) => sa.has(t));
+}
+
+/**
+ * Whether the segments in front of a file's title are consistent with the expected artist and
+ * album: each is a track or disc number, a year, the artist (all its significant words in the
+ * segment, or all the segment's words in the artist's name: "Coldplay" for "Coldplay feat. X"),
+ * the album title, or a segment of the release name. Text that is none of these names someone
+ * else: "foreign". With no artist known nothing is judged (never "foreign").
+ */
+/** True when the text's letters are all Latin (or it has none). */
+function isLatinText(s: string): boolean {
+  return !/[^\p{Script=Latin}\P{L}]/u.test(String(s || ""));
+}
+
+export function classifyLead(lead: string[], exp: ExpectedLead): LeadVerdict {
+  if (lead.length === 0) return "none";
+  let named = false;
+  const artists = exp.artists.map((a) => ({ tokens: leadTokens(a), joined: leadTokens(a).join("") }));
+  const albums = exp.albums.map((a) => ({ tokens: leadTokens(a), joined: leadTokens(a).join("") })).filter((a) => a.tokens.length > 0);
+  const relSegs = new Set(exp.releaseSegments.map((r) => leadTokens(r).join(" ")).filter(Boolean));
+  for (const seg of lead) {
+    const toks = leadTokens(seg);
+    const key = normalizeTitleKey(seg);
+    // A track or disc number, a year, or nothing: says nothing about who made the file.
+    if (toks.every((w) => /^\d+$/.test(w)) || /^(?:cd|disc|disk|d|track|tr|trk|no|side)\s*\d{1,3}$/.test(key)) continue;
+    if (artists.length === 0) continue; // no artist known: nothing to compare against
+    // An artist written in another script than the segment ("Мумий Тролль" against a file's
+    // "Mumiy Troll") cannot be compared by spelling: it says nothing either way.
+    // Only that way round: a Latin-script artist is never written "Другой".
+    if (exp.artists.length > 0 && isLatinText(seg) && exp.artists.every((a) => !isLatinText(a))) continue;
+    const joined = toks.join("");
+    const isArtist = artists.some((a) => a.joined === joined || tokensCompatible(toks, a.tokens));
+    const isVa = Boolean(exp.variousArtists) && isVariousArtistsName(seg.trim());
+    const isAlbum = albums.some((a) => a.joined === joined || tokensCompatible(toks, a.tokens));
+    const isRelease = relSegs.has(toks.join(" "));
+    if (isArtist || isVa || isAlbum || isRelease) {
+      named = true;
+      continue;
+    }
+    return "foreign";
+  }
+  return named ? "named" : "neutral";
+}
+

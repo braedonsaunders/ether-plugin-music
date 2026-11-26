@@ -15,7 +15,7 @@ import { MusicCatalog } from "./catalog.ts";
 import { AlbumResolver } from "./resolver.ts";
 import { SUBSONIC_PREFIX, SubsonicAdapter, hostedSubsonicHost, setServerVersion } from "./subsonic.ts";
 
-export const PLUGIN_VERSION = "0.3.0";
+export const PLUGIN_VERSION = "0.3.1";
 setServerVersion(PLUGIN_VERSION);
 
 function parseBody(req: EtherRequest): Record<string, any> {
