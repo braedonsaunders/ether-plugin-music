@@ -4252,3 +4252,65 @@ test("fix 1b: when every source came back and the search is not finished, it goe
   assert.equal(again.sources[0].id, "nzb:https://nzb.test/two", "the release found now leads");
   assert.equal(again.sources[1].id, "nzb:https://nzb.test/one");
 });
+
+test("fix 2: probing does not stop at a lone archive member or partial release; whole plain files lead", () => {
+  const album = albumOf("al-9504", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 8), {}, 240);
+  const item = trackItemFor(album, 2);
+  const mk = (n: number): SourceCandidate => ({ title: `Test Band - Test Album (2001) FLAC r${n}`, indexer: "NZBgeek", nzbUrl: `https://nzb.test/r${n}`, size: 250_000_000 });
+  const boxMembers = [2, 3, 4].map((i, k) => ({ index: k, path: `Box/CD3/${pad2(i + 1)} Disc Song ${i + 1}.flac`, size: 30_000_000 }));
+  const answer = (withWhole: boolean) => (q: SourceQuery) => {
+    if (q.kind === "indexer_search") return { candidates: withWhole ? [mk(1), mk(3)] : [mk(1)] };
+    if (q.kind === "release_files") {
+      const c = q.candidate as SourceCandidate;
+      if (c.nzbUrl === "https://nzb.test/r1") return { candidates: [{ ...c, files: [{ index: 0, path: "box.rar", size: 90_000_000, members: boxMembers }] }] };
+      if (c.nzbUrl === "https://nzb.test/r2") return { candidates: [{ ...c, files: [{ index: 0, path: "other.rar", size: 90_000_000, members: boxMembers.map((m) => ({ ...m, path: m.path.replace("CD3", "CD4") })) }] }] };
+      return { candidates: [{ ...c, files: filesOf(album.tracks.map((t, i) => `${pad2(i + 1)} ${t.title}.flac`)) }] };
+    }
+    if (q.kind === "usenet_check") return usenetOk(q.candidate as SourceCandidate);
+    return { candidates: [] };
+  };
+  const timed = (h: ReturnType<typeof harness>) => {
+    let clock = 1_760_000_000_000;
+    h.env.now = () => clock;
+    const inner = h.env.sources.resolve;
+    h.env.sources.resolve = (q) => { clock += 450; return inner(q); };
+    return h;
+  };
+  // A lone archive member, then more candidates: the loop goes on and finds the plain whole album.
+  const h = timed(harness(album, answer(true)));
+  const r = h.play(item);
+  assert.equal(r.sources.length, 2, h.logs.join("\n"));
+  assert.equal(r.sources[0].release?.candidate?.nzbUrl, "https://nzb.test/r3", "the whole plain album leads");
+  assert.ok(/partial/.test(r.sources[1].label || ""), "the member follows");
+  // With nothing else to find, the lone member is still offered once the candidates are exhausted.
+  const h2 = timed(harness(album, answer(false)));
+  const r2 = h2.play(item);
+  assert.equal(r2.sources.length, 1);
+  assert.match(r2.sources[0].label || "", /partial/);
+});
+
+test("fix 2: in a box set (many more files than the album) a member in a folder named for another version is not the track", () => {
+  const album = albumOf("al-9505", "Test Band", "Test Album", 2001, ["Alpha", "Bravo", "Charlie", "Delta"], {}, 240);
+  const files = (dir: string) => [
+    ...["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf"].map((t, i) => ({ index: i, path: `Box/CD1/${pad2(i + 1)} ${t}.flac`, size: 30_000_000 })),
+    { index: 20, path: `Box/${dir}/01 Alpha.flac`, size: 30_000_000 },
+  ];
+  // The CD1 member serves Alpha in every case; look at what the remix-folder file did.
+  const mapped = (dir: string, release?: string) => matchTracksInRelease(album, release || "Test Band - Test Album Box (6-CD) FLAC", files(dir), "flac_preferred").tracks[album.tracks[0].id]?.file;
+  assert.equal(mapped("CD4 Remixes"), "Box/CD1/01 Alpha.flac");
+  assert.equal(mapped("CD2 Bonus"), "Box/CD1/01 Alpha.flac");
+  // Only the remix-folder file exists for a track: refused.
+  const only = matchTracksInRelease(album, "Test Band - Test Album Box (6-CD) FLAC", [
+    ...["Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo"].map((t, i) => ({ index: i, path: `Box/CD1/${pad2(i + 1)} ${t}.flac`, size: 30_000_000 })),
+    { index: 20, path: "Box/CD4 Remixes/01 Alpha.flac", size: 30_000_000 },
+    { index: 21, path: "Box/CD5 Live at Wembley/02 Bravo.flac", size: 30_000_000 },
+    { index: 22, path: "Box/CD6 Bonus/03 Charlie.flac", size: 30_000_000 },
+  ], "flac_preferred");
+  assert.deepEqual(Object.keys(only.tracks), [album.tracks[2].id], "only the bonus-disc file serves");
+  // A live box set: the same folder is the release's own version.
+  const live = matchTracksInRelease(album, "Test Band - Live at Wembley Box (6-CD) FLAC", [
+    ...["Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo"].map((t, i) => ({ index: i, path: `Box/CD1/${pad2(i + 1)} ${t}.flac`, size: 30_000_000 })),
+    { index: 21, path: "Box/CD5 Live at Wembley/02 Bravo.flac", size: 30_000_000 },
+  ], "flac_preferred");
+  assert.deepEqual(Object.keys(live.tracks), [album.tracks[1].id]);
+});

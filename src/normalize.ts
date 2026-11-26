@@ -776,6 +776,12 @@ export function isVariousArtistsName(name: string): boolean {
 const VERSION_WORD_RE =
   /\b(?:live|remix(?:es|ed)?|rmx|mix(?:es|ed)?|edits?|demos?|acoustic|instrumental|karaoke|version|versions|ver|sessions?|orchestra|orchestral|mono|stereo|unplugged|cover|rework(?:ed)?|bootleg|extended|radio|club|dub|cappella|acapella|piano|strings|stripped|alternate|alternative|alt|take|rehearsal|concert|tour)\b/;
 
+/** The words of a text that name another version of a song ("live", "remix", "demo"...), normalized. */
+export function versionWordsOf(text: string): string[] {
+  const re = new RegExp(VERSION_WORD_RE.source, "g");
+  return Array.from(normalizeTitleKey(text).matchAll(re), (m) => m[0]);
+}
+
 /** Whether a text carries a word that names another version of a song. */
 export function hasVersionWord(text: string): boolean {
   return VERSION_WORD_RE.test(normalizeTitleKey(text));

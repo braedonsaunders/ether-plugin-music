@@ -53,6 +53,7 @@ import {
   textSimilarity,
   titleSignature,
   tokenSetOfNormalized,
+  versionWordsOf,
   videoFormatOfPath,
 } from "./normalize.ts";
 
@@ -93,6 +94,8 @@ const MAX_PLUGIN_PROBES = 4;
 // Room for every kind the shortlist can hold: 6 Debrid, the Usenet ones, 4 unconfirmed, the plugin ones.
 const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
+/** Probing for a second source beside a lone partial or archive-member one stops after this long. */
+const MORE_PROBING_MAX_MS = 20_000;
 /** A request for a track this soon after the last answer for it is the host asking again (not at once, not much later). */
 const REPEAT_MIN_GAP_MS = 2000;
 const REPEAT_WINDOW_MS = 90_000;
@@ -469,6 +472,8 @@ interface ResolveStage {
   listed?: ListedCandidate;
   /** The search behind this stage had indexers still running, timed out or failed. */
   searchIncomplete?: boolean;
+  /** When the stage's probing began: lone partial sources are only waited past for so long. */
+  startedAt?: number;
 }
 
 /** A release a source plugin answered the search with: Ether lists and opens it through that plugin. */
@@ -1505,6 +1510,25 @@ export function matchTracksInRelease(
     return { usedTracks, chosen };
   };
   let assigned = assign(hits);
+  // Found among many more files than the album has (a box set, a collection), a file inside a
+  // folder or archive named for another version ("CD4 - Remixes", "Demos & B-Sides", "Live") is
+  // that version's: such a member may be another mix of the song, and the host cannot always
+  // measure an archive member, so the version words of its folders must be the track's own too.
+  if (audioFiles.length > wholeSizeLimit) {
+    const allowed = new Set([
+      ...versionWordsOf(album.title),
+      ...versionWordsOf(releaseTitle),
+    ]);
+    const folderWords = (fi: number): string[] => {
+      const f = audioFiles[fi].file;
+      const dirs = f.path.replace(/\\/g, "/").split("/").slice(0, -1);
+      return versionWordsOf([...dirs, f.archivePath || ""].join(" / "));
+    };
+    assigned = assign(hits.filter((h) => {
+      const own = new Set(versionWordsOf(album.tracks[h.ti].title));
+      return folderWords(h.fi).every((w) => own.has(w) || allowed.has(w));
+    }));
+  }
   // A generic title ("Intro") is in a partial release only on a file whose number agrees or whose
   // name says whose it is: a whole-album match leaves it as it is.
   const partialNow = assigned.usedTracks.size < canonicalCount || audioFiles.length > wholeSizeLimit;
@@ -2492,6 +2516,7 @@ export class AlbumResolver {
         searchIncomplete: searched.incomplete || undefined,
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
+        startedAt: this.env.now(),
       };
       this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
 
@@ -2514,7 +2539,7 @@ export class AlbumResolver {
       }
       // Always allow at least 1 probe on a fresh continuation call; stop before blowing budget.
       if (stage.nextIdx > 0 && this.env.now() - startMs >= budgetMs) {
-        if (serving.length > 0) {
+        if (this.enoughServing(stage, serving)) {
           // We already have a verified match — return it immediately rather than waiting!
           break;
         }
@@ -2527,19 +2552,19 @@ export class AlbumResolver {
       // (Real-Debrid / AllDebrid / Debrid-Link) may invoke acquireOn (~0.5-1.5s); yield
       // cleanly if we already consumed part of the 5s route budget.
       if (isUsenetCandidate(cand) && this.env.now() - startMs >= 900) {
-        if (serving.length > 0) break;
+        if (this.enoughServing(stage, serving)) break;
         this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
         return { done: false, verifiedCount: 0 };
       }
       if (!isUsenetCandidate(cand) && !cand.cached && this.env.now() - startMs >= 1500) {
-        if (serving.length > 0) break;
+        if (this.enoughServing(stage, serving)) break;
         this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
         return { done: false, verifiedCount: 0 };
       }
       stage.nextIdx++;
       if (this.probeSingleCandidate(stage, cand, preScore, allowUsenetCheck, startMs)) {
         // Its usenet_check did not fit this slice: it runs first in the next one.
-        if (serving.length > 0) break;
+        if (this.enoughServing(stage, serving)) break;
         this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
         return { done: false, verifiedCount: 0 };
       }
@@ -2570,6 +2595,27 @@ export class AlbumResolver {
     }
 
     return this.finalizeAlbumResolution(albumId, stage);
+  }
+
+  /**
+   * Whether the sources found for the wanted track are enough to stop probing for more. A whole
+   * album as a plain file is: the repeat logic finds another when the host refuses it. A lone
+   * partial release or archive member is not (the host measures an archive member badly and a
+   * box set's member may be another mix), so probing goes on until a second source is found, the
+   * candidates run out, or MORE_PROBING_MAX_MS has passed.
+   */
+  private enoughServing(stage: ResolveStage, serving: VerifiedAlbumRelease[]): boolean {
+    if (serving.length === 0) return false;
+    const wanted = stage.wantedId;
+    const trackCount = stage.album.tracks.length;
+    // Solid: a whole album as plain files, or a plain-file partial release holding most of the album
+    // (another edition of it). Weak: a member of an archive, or a partial that holds a few tracks
+    // of a larger set (a box set, a collection, a loose file).
+    const solid = (v: VerifiedAlbumRelease) =>
+      !(wanted && v.tracks[wanted]?.isArchiveMember) && (!v.partial || Object.keys(v.tracks).length >= trackCount * 0.6);
+    if (serving.some(solid)) return true;
+    if (serving.length >= 2) return true;
+    return this.env.now() - (stage.startedAt ?? this.env.now()) >= MORE_PROBING_MAX_MS;
   }
 
   /**
