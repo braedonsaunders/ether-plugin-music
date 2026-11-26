@@ -27,6 +27,7 @@ import {
   classifyReleaseQuality,
   classifyVideoQuality,
   expandReleaseFiles,
+  formatDroppedAtNameRanking,
   isStrictlyNarrowerQuery,
   isUsenetCandidate,
   matchAlbumReleaseFiles,
@@ -2856,4 +2857,56 @@ test("a refresh that comes back empty or fails keeps the earlier incomplete answ
   assert(searches >= 3, `expected refreshes, got ${searches}`);
   // The first answer's candidate was still probed after the empty and the failed refresh.
   assert(seenLists.some((n) => n >= 2), `candidate lost after refresh: ${JSON.stringify(seenLists)}`);
+
+test("dropped-at-name-ranking line: grouping, order, caps, source suffix, null case", () => {
+  assert.equal(formatDroppedAtNameRanking("al-1", [], 5), null);
+  const dropped = [
+    { name: "A1", reason: "album title mismatch" },
+    { name: "B1", indexer: "SlskSource", reason: "artist name mismatch" },
+    { name: "B2", reason: "artist name mismatch" },
+    { name: "B3", reason: "artist name mismatch" },
+    { name: "B4 " + "x".repeat(100), reason: "artist name mismatch" },
+    { name: "C1", reason: "size outside plausible album range" },
+    { name: "C2", reason: "size outside plausible album range" },
+    { name: "D1", reason: "uncached torrent" },
+    { name: "E1", reason: "" },
+  ];
+  const line = formatDroppedAtNameRanking("al-1", dropped, 12)!;
+  console.log(line);
+  assert.match(line, /^resolve-album: al-1 dropped 9 of 12 at name ranking: artist name mismatch x4 \[/);
+  assert.ok(line.indexOf("artist name mismatch x4") < line.indexOf("size outside plausible album range x2"));
+  assert.match(line, /"B1" \(SlskSource\)/);
+  assert.ok(!line.includes('"B4'), "only three examples per reason");
+  assert.ok(!line.includes("no reason"), "only the 4 most frequent reasons");
+  const longName = formatDroppedAtNameRanking("al-1", [{ name: "y".repeat(200), reason: "r" }], 1)!;
+  assert.ok(longName.includes(`"${"y".repeat(70)}..."`));
+  assert.ok(!longName.includes("y".repeat(71)));
+  const many = Array.from({ length: 40 }, (_, i) => ({ name: "n".repeat(70) + i, indexer: "Src", reason: `reason ${i % 4} ` + "z".repeat(60) }));
+  const capped = formatDroppedAtNameRanking("al-1", many, 40)!;
+  assert.ok(capped.length <= 900 && capped.endsWith("..."));
+});
+
+test("names dropped at ranking are logged once per shortlist build, not per poll", () => {
+  const album = sampleDiscoveryAlbum();
+  const bad: SourceCandidate[] = [
+    { title: "Other Band - Discovery (2001) [FLAC]", nzbUrl: "https://althub.test/1", indexer: "altHUB", size: 130_000_000 },
+    { title: "Other Band - Discovery (2001) [FLAC] repost", nzbUrl: "https://althub.test/2", indexer: "altHUB", size: 130_000_000 },
+    { title: "Other Band - Discovery [MP3]", nzbUrl: "https://althub.test/3", indexer: "altHUB", size: 130_000_000 },
+    { title: "Daft Punk - Homework (1997) [FLAC]", nzbUrl: "https://althub.test/4", indexer: "altHUB", size: 130_000_000 },
+  ];
+  const resolver = resolverFor(album, (q) => (q.kind === "indexer_search" ? { candidates: bad } : { candidates: [] }));
+  const logs: string[] = [];
+  (resolver as unknown as { env: HostEnv }).env.log = (_l: string, line: string) => { logs.push(line); };
+  resolver.resolve({ item: trackItemFor(album, 0) });
+  const first = logs.filter((l) => /dropped \d+ of \d+ at name ranking/.test(l));
+  assert.equal(first.length, 1, logs.join("\n"));
+  console.log(first[0]);
+  assert.match(first[0], /dropped 4 of 4/);
+  assert.match(first[0], /artist name mismatch x3/);
+  assert.match(first[0], /album title mismatch x1/);
+  assert.match(first[0], /Other Band - Discovery/);
+  for (let i = 0; i < 5; i++) resolver.resolve({ item: trackItemFor(album, 0) });
+  const raws = logs.filter((l) => /raw=\d+/.test(l)).length;
+  const drops = logs.filter((l) => /at name ranking/.test(l)).length;
+  assert.ok(raws >= 1 && drops <= raws, `raw=${raws} dropped=${drops}`);
 });
