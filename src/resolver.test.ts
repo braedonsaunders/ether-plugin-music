@@ -38,7 +38,7 @@ import {
   searchMemoKey,
 } from "./resolver.ts";
 import { buildConcertItem, getCuratedConcertById } from "./concerts.ts";
-import { isRejectedReleaseForRequest, parseTrackFilename } from "./normalize.ts";
+import { isRejectedReleaseForRequest, isWrongVersionRelease, parseTrackFilename } from "./normalize.ts";
 
 function makeFakeHost(opts: {
   onResolve?: (q: SourceQuery) => { candidates?: SourceCandidate[] };
@@ -3036,4 +3036,68 @@ test("name gate keeps the requested version and ordinary edition words", () => {
   const v1 = versionCheck("Artist - Volume 1 (2004) FLAC", va("Artist", "Volume 2", 2005));
   assert.equal(v1.accepted, false);
   assert.match(v1.reasons.join(","), /volume/);
+});
+
+test("name gate: notes about extras, bare live tags and radio edits are not a different version", () => {
+  const keep: Array<[string, string, string]> = [
+    ["Artist - Album (Deluxe Edition incl. Live Bonus Disc) FLAC", "Album", "Artist"],
+    ["Artist.-.Album.Deluxe.Edition.Incl.Live.Bonus.Disc.FLAC", "Album", "Artist"],
+    ["Radiohead - Kid A Mnesia (Live Bonus)", "Kid A Mnesia", "Radiohead"],
+    ["Artist - Album (Remastered + Demos) FLAC", "Album", "Artist"],
+    ["Artist - Album (Deluxe Edition with Demos)", "Album", "Artist"],
+    ["Artist - Album (Deluxe) [Bonus Tracks: Acoustic Version]", "Album", "Artist"],
+    ["Artist - Song (Radio Edit) (2010) Single", "Song", "Artist"],
+    ["Artist - Album (Remixed & Remastered)", "Album", "Artist"],
+    ["DJ Shadow - Endtroducing (Mixed By DJ Shadow)", "Endtroducing", "DJ Shadow"],
+    ["Various - Now That's What I Call Music! Vol 5", "Now That's What I Call Music! 5", "Various Artists"],
+    ["Peter Frampton - Frampton Comes Alive! (Live 1976)", "Frampton Comes Alive!", "Peter Frampton"],
+    ["Johnny Cash - At Folsom Prison (Live) [FLAC]", "At Folsom Prison", "Johnny Cash"],
+    ["The Band - The Last Waltz [Live]", "The Last Waltz", "The Band"],
+    ["Artist - Album v4.1", "Album", "Artist"],
+  ];
+  for (const [rel, album, artist] of keep) {
+    assert.equal(isWrongVersionRelease(rel, album, artist).rejected, false, rel);
+  }
+  const drop: Array<[string, string, string, RegExp]> = [
+    ["Jay-Z - The Black Album (Acapella)", "The Black Album", "Jay-Z", /alternate mix/],
+    ["Buena.Vista.Social.Club-Buena.Vista.Social.Club.At.Carnegie.Hall.Live", "Buena Vista Social Club", "Buena Vista Social Club", /live/],
+    ["Fleetwood Mac-Fleetwood Mac Live 1975-24BIT-96KHZ-WEB-FLAC-2", "Fleetwood Mac (Deluxe Edition)", "Fleetwood Mac", /live/],
+    ["U2.-.Atomic.City.(Tiësto.Remix).(2024).[24Bit-48kHz].FLAC", "Atomic City", "U2", /remix/],
+    ["bjork - homogenic (surrounded) [5.1 dts rip] (1997) FLAC", "Homogenic", "Björk", /alternate mix/],
+    ["Various - Now That's What I Call Music! Vol 6", "Now That's What I Call Music! 5", "Various Artists", /volume/],
+    ["Artist - Album (Live at Wembley 1986)", "Album", "Artist", /live/],
+  ];
+  for (const [rel, album, artist, why] of drop) {
+    const v = isWrongVersionRelease(rel, album, artist);
+    assert.equal(v.rejected, true, rel);
+    assert.match(v.reason || "", why, rel);
+  }
+});
+
+test("an incomplete answer is asked again about 3 seconds later, and only once per window", () => {
+  const album = sampleDiscoveryAlbum();
+  const cand: SourceCandidate = { title: "Daft Punk - Discovery (2001) [FLAC]", nzbUrl: "https://althub.test/api?t=get&id=1", indexer: "altHUB", size: 300_000_000 };
+  let elapsed = 0;
+  const searchedAt: number[] = [];
+  const { resolver, advance } = clockedResolverFor(album, (req: any) => {
+    if (req.kind === "indexer_search") {
+      searchedAt.push(elapsed);
+      return { candidates: [cand], indexers: [{ status: "answered" }, { status: "pending" }] } as any;
+    }
+    if (req.kind === "release_files") return { files: [{ path: "unrelated.flac", size: 1 }] } as any;
+    return null as any;
+  });
+  const item = trackItemFor(album, 0);
+  // Polls every 500 ms for 7 seconds, as a waiting client does.
+  for (let i = 0; i <= 14; i++) {
+    resolver.resolve({ item });
+    advance(500);
+    elapsed += 500;
+  }
+  assert.equal(searchedAt[0], 0);
+  assert.ok(searchedAt.length >= 2, `no second search: ${JSON.stringify(searchedAt)}`);
+  assert.ok(searchedAt[1] <= 3000, `second search too late: ${JSON.stringify(searchedAt)}`);
+  for (let i = 1; i < searchedAt.length; i++) {
+    assert.ok(searchedAt[i] - searchedAt[i - 1] >= 2500, `searches too close: ${JSON.stringify(searchedAt)}`);
+  }
 });

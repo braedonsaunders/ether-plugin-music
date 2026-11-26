@@ -369,29 +369,40 @@ export function isRejectedReleaseForRequest(
   return { rejected: false };
 }
 
-const VERSION_REMIX_RE =
-  /\b(?:remix(?:es|ed)?|rmx|mixed by|dj mix|club mix|extended mix|radio edit|radio mix|dub mix|vip mix)\b/;
+const VERSION_REMIX_RE = /\b(?:remix(?:es|ed)?|rmx|dj mix|club mix|extended mix|dub mix|vip mix)\b/;
 const VERSION_LIVE_RE = /\b(?:live|in concert|unplugged|bootleg|soundboard|broadcast)\b/;
 // Alternate mixes. "5.1"/"4.1" are matched on the raw text because normalizeText splits them.
 const VERSION_ALT_RE =
-  /\b(?:quad|quadraphonic|surround|atmos|instrumentals?|karaoke|a ?cappella|demos?|acoustic|drumless|mono mix|stereo mix)\b/g;
-const VERSION_SURROUND_RE = /(?<![\d.])[457]\.1(?:ch)?(?![\d])/g;
+  /\b(?:quad|quadraphonic|surround|atmos|instrumentals?|karaoke|a ?cappella|acapella|acappella|demos?|acoustic|drumless|mono mix|stereo mix)\b/g;
+const VERSION_SURROUND_RE = /(?<![\d.v])[457]\.1(?:ch)?(?![\d])/g;
 const VERSION_VOLUME_RE = /\b(volume|vol|part|pt) (\d{1,2})\b/g;
+// A bracketed note that describes the edition or its extras ("Deluxe Edition incl. Live Bonus
+// Disc", "Remastered + Demos"), or a bare "(Live)" / "[Live 1976]" tag, says nothing reliable
+// about which recording the release is: a live album is often tagged that way.
+const VERSION_GROUP_RE = /[(\[{][^()\[\]{}]*[)\]}]/g;
+const VERSION_EDITION_NOTE_RE =
+  /\b(?:bonus|deluxe|edition|expanded|remaster(?:ed|s)?|anniversary|incl|including|with|discs?|tracks?|reissue)\b/i;
+const VERSION_BARE_LIVE_RE = /^[(\[{]\s*live(?:\s+(?:19|20)\d\d)?\s*[)\]}]$/i;
+const VERSION_EXTRAS_RE = /\b(?:bonus|incl|including)\b/;
 
 /**
  * Name-level gate for a different VERSION of the requested recording: a release name that
  * declares a remix, live recording, alternate mix, or another volume/part which the requested
  * album title (full, with its edition suffix) does not declare. Markers in the artist name
- * (the band "Live") are ignored. Cheap: a handful of precompiled regexes per call.
+ * (the band "Live") and in notes about the edition's extras are ignored. Cheap: a handful of
+ * precompiled regexes per call.
  */
 export function isWrongVersionRelease(
   releaseTitle: string,
   requestedAlbumTitle: string,
   artistName = ""
 ): { rejected: boolean; reason?: string } {
-  const rawRel = String(releaseTitle || "").toLowerCase();
+  const shown = String(releaseTitle || "").replace(VERSION_GROUP_RE, (g) =>
+    VERSION_EDITION_NOTE_RE.test(g) || VERSION_BARE_LIVE_RE.test(g) ? " " : g
+  );
+  const rawRel = shown.toLowerCase();
   const rawReq = String(requestedAlbumTitle || "").toLowerCase();
-  let rel = normalizeText(releaseTitle);
+  let rel = normalizeText(shown);
   const req = normalizeText(requestedAlbumTitle);
 
   // Drop the artist's own name (first occurrence) so "Live", "Broadcast" etc. as artists don't count.
@@ -402,21 +413,28 @@ export function isWrongVersionRelease(
     if (at >= 0) rel = (padded.slice(0, at) + " " + padded.slice(at + artist.length + 1)).trim();
   }
 
-  if (VERSION_REMIX_RE.test(rel) && !VERSION_REMIX_RE.test(req)) {
+  // A name that lists extras outside brackets ("Album.Deluxe.Incl.Live.Bonus.Disc") is not judged
+  // on remix/live/mix words: they describe the extras.
+  const listsExtras = VERSION_EXTRAS_RE.test(rel);
+
+  if (!listsExtras && VERSION_REMIX_RE.test(rel) && !VERSION_REMIX_RE.test(req)) {
     return { rejected: true, reason: "remix, not requested" };
   }
 
-  if (VERSION_LIVE_RE.test(rel) && !VERSION_LIVE_RE.test(req)) {
+  if (!listsExtras && VERSION_LIVE_RE.test(rel) && !VERSION_LIVE_RE.test(req)) {
     return { rejected: true, reason: "live recording, not requested" };
   }
 
   const altOf = (norm: string, raw: string): Set<string> => {
     const out = new Set<string>();
-    for (const m of norm.matchAll(VERSION_ALT_RE)) out.add(m[0].replace(/s$/, "").replace(/ /g, ""));
-    for (const m of raw.matchAll(VERSION_SURROUND_RE)) out.add("surround");
+    for (const m of norm.matchAll(VERSION_ALT_RE)) {
+      const w = m[0].replace(/s$/, "").replace(/ /g, "");
+      out.add(w === "acapella" ? "acappella" : w);
+    }
+    for (const _m of raw.matchAll(VERSION_SURROUND_RE)) out.add("surround");
     return out;
   };
-  const relAlt = altOf(rel, rawRel);
+  const relAlt = listsExtras ? new Set<string>() : altOf(rel, rawRel);
   if (relAlt.size > 0) {
     const reqAlt = altOf(req, rawReq);
     for (const a of relAlt) {
@@ -438,11 +456,15 @@ export function isWrongVersionRelease(
   const relVol = volOf(rel);
   if (relVol.size > 0) {
     const reqVol = volOf(req);
+    const reqWords = new Set(req.split(" ").map((w) => (/^\d+$/.test(w) ? String(Number(w)) : w)));
     for (const [fam, nums] of relVol) {
       const want = reqVol.get(fam);
       if (!want) {
-        // The request has no marker of this kind; a request with the other kind (vol vs part) counts as declared.
-        if (reqVol.size === 0) return { rejected: true, reason: "different volume" };
+        // The request has no marker of this kind. A request with the other kind (vol vs part)
+        // counts as declared, and so does one that carries the number itself ("Now 5" / "Vol 5").
+        if (reqVol.size === 0 && ![...nums].some((n) => reqWords.has(n))) {
+          return { rejected: true, reason: "different volume" };
+        }
         continue;
       }
       if (![...nums].some((n) => want.has(n))) return { rejected: true, reason: "different volume" };

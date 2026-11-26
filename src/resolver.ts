@@ -1605,7 +1605,7 @@ export class AlbumResolver {
           incomplete: Boolean(memo.incomplete || memo.errored),
         };
       }
-      if (this.env.now() - memo.at < SEARCH_INFLIGHT_WAIT_MS) {
+      if (!staleIncomplete && this.env.now() - memo.at < SEARCH_INFLIGHT_WAIT_MS) {
         return {
           candidates: [],
           rawCount: 0,
@@ -1618,11 +1618,15 @@ export class AlbumResolver {
       }
       // The previous attempt never finished (a host timeout cut it off): it says nothing about
       // the album, so search again rather than calling it an error.
-      this.cache.delete(memoKey);
+      if (!staleIncomplete) this.cache.delete(memoKey);
     }
 
     const reqAt = this.env.now();
-    if (!staleIncomplete) {
+    if (staleIncomplete) {
+      // Restart the reuse window before asking: a poll that arrives while this search runs
+      // reuses the earlier answer instead of starting its own search.
+      this.cache.set<SearchQueryMemo>(memoKey, { ...staleIncomplete, at: reqAt }, INCOMPLETE_MEMO_TTL_MS);
+    } else {
       this.cache.set<SearchQueryMemo>(
         memoKey,
         { status: "inflight", at: reqAt, rawCount: 0 },
@@ -2018,6 +2022,7 @@ export class AlbumResolver {
         }
       }
     }
+    const scoredAlbum = altArtistName ? { ...album, altArtistName } : album;
 
     const interactive = budgetMs <= RESOLVE_STEP_BUDGET_MS;
     const byRef = new Map<string, SourceCandidate>();
@@ -2054,7 +2059,7 @@ export class AlbumResolver {
         }
         pre = preScoreAlbumCandidate(
           cand,
-          altArtistName ? { ...album, altArtistName } : album,
+          scoredAlbum,
           this.settings.qualityPreference,
           allowUnconfirmedTorrent ? { allowUnconfirmedTorrent: true } : undefined
         );
