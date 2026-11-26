@@ -810,8 +810,13 @@ export function preScoreAlbumCandidate(
   if (!relTitle) return { accepted: false, score: 0, reasons: ["empty candidate title"] };
 
   const variousArtists = isVariousArtistsName(album.artistName);
+  const normRelEarly = normalizeText(relTitle);
+  const sameAlbumEdition =
+    !variousArtists && normalizeText(album.artistName) !== "" && normalizeText(coreReleaseTitle(album.title)).length >= 3 &&
+    normRelEarly.includes(`${normalizeText(album.artistName)} ${normalizeText(coreReleaseTitle(album.title))}`);
   const rej = isRejectedReleaseForRequest(relTitle, album.title, album.releaseType, {
     allowCompilations: Boolean(album.recording) || Boolean(album.lenient) || variousArtists,
+    sameAlbumEdition,
   });
   if (rej.rejected) {
     return { accepted: false, score: 0, reasons: [rej.reason || "rejected release type"] };
@@ -926,6 +931,12 @@ export function preScoreAlbumCandidate(
     }
   }
 
+  // A box set of the album's own edition: listed, after the plain editions.
+  const boxEdition = sameAlbumEdition && /box\s*set|\b\d+\s*-?\s*cd\b/i.test(relTitle);
+  if (boxEdition) {
+    namePenalty += 10;
+    reasons.push("box-set edition of this album");
+  }
   let score = qual.points * 0.45 + (artistRatio < 0.6 ? 0 : artistRatio * 20) + Math.min(1, albumRatio) * 25 - namePenalty;
   reasons.push(qual.label);
 
@@ -1019,7 +1030,7 @@ export function preScoreAlbumCandidate(
     // Reject absurdly tiny or gigantic (likely discography/video); a one-song or few-song
     // request takes releases of any size above the lower bound.
     const fewTracks = Boolean(album.recording) || (album.trackCount || 0) > 0 && (album.trackCount || 0) <= 3;
-    if (ratio < 0.03 || (!fewTracks && ratio > 9.0)) {
+    if (ratio < 0.03 || (!fewTracks && !boxEdition && ratio > 9.0)) {
       return { accepted: false, score: 0.1, reasons: ["size outside plausible album range"] };
     }
   }
@@ -1654,7 +1665,11 @@ export function matchTracksInRelease(
       const dirs = f.path.replace(/\\/g, "/").split("/").slice(0, -1);
       return versionWordsOf([...dirs, f.archivePath || ""].join(" / "));
     };
+    // A title found once in the whole release has no other version to be confused with.
+    const filesPerTrack = new Map<number, Set<number>>();
+    for (const h of hits) (filesPerTrack.get(h.ti) || filesPerTrack.set(h.ti, new Set()).get(h.ti)!).add(h.fi);
     assigned = assign(hits.filter((h) => {
+      if ((filesPerTrack.get(h.ti)?.size || 0) <= 1) return true;
       const own = new Set(versionWordsOf(album.tracks[h.ti].title));
       return folderWords(h.fi).every((w) => own.has(w) || allowed.has(w));
     }));
@@ -3401,6 +3416,16 @@ export class AlbumResolver {
       droppedAtNames.push({ name: m.cand.title || "", indexer: m.cand.indexer, reason: "name does not tie it to the song (beyond the few listed)" });
     }
 
+    if (skipRefs.size > 0 && !trackQuery) {
+      // A search that goes on (the host came back, or the track was not served): the names that carry
+      // the album's artist and title, not looked at yet, come before the rest.
+      const coreKey = ` ${normalizeTitleKey(coreReleaseTitle(album.title))} `;
+      const artKey = normalizeTitleKey(album.artistName).split(" ").filter((w) => w.length >= 2 && w !== "the");
+      for (const r of preRanked) {
+        const key = ` ${normalizeTitleKey(r.cand.title || "")} `;
+        if (coreKey.trim().length >= 3 && key.includes(coreKey) && artKey.every((w) => key.includes(` ${w} `))) r.score += 15;
+      }
+    }
     if (placeHint) {
       // A requested box set: the folder of the sub-album (or the disc) the track is known to sit on is probed first.
       const discRe = placeHint.disc > 0 ? new RegExp(`(?:^|[^a-z0-9])(?:cd|disc|disk|d)\\s*0?${placeHint.disc}(?![0-9])`, "i") : null;

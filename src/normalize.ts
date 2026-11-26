@@ -324,13 +324,16 @@ export function computeAlbumOrderIndex(
  * discography, box set, live bootleg, tribute, karaoke, or non-studio pack that must be
  * rejected when the requested item is a studio album.
  */
+/** Names that are collections whatever else they carry. */
+const HARD_DISCOGRAPHY_RE = /\b(?:discography|complete\s+studio\s+albums|complete\s+albums|studio\s+albums\s+collection|all\s+albums|\d{4}\s*-\s*\d{4}|va|various|top\s*\d+)\b/i;
+
 export function isRejectedReleaseForRequest(
   releaseTitle: string,
   requestedAlbumTitle: string,
   requestedReleaseType: ReleaseType,
   // allowCompilations: the question is whether a release holds one song (or the library's
   // album is itself a various-artists one), so a compilation or soundtrack name is no reason.
-  opts?: { allowCompilations?: boolean }
+  opts?: { allowCompilations?: boolean; /** The release name carries this album's artist and core title: an edition of it. */ sameAlbumEdition?: boolean }
 ): { rejected: boolean; reason?: string } {
   const rel = String(releaseTitle || "");
   const reqNorm = normalizeText(requestedAlbumTitle);
@@ -344,7 +347,10 @@ export function isRejectedReleaseForRequest(
   if (/\b(?:discography|complete\s+studio\s+albums|complete\s+albums|studio\s+albums\s+collection|all\s+albums|box\s*set|\d+\s*cd\s*box|\b\d{4}\s*-\s*\d{4}\b)\b/i.test(rel)) {
     // Not when the requested album is itself such a set ("The Studio Album Collection 1977-1992").
     if (!/\b(?:box|complete|anthology|collection|discography|albums|(?:19|20)\d\d (?:19|20)\d\d)\b/i.test(reqNorm)) {
-      return { rejected: true, reason: "discography or multi-album box set" };
+      // "Super Deluxe Edition (6 CD Box Set)" of the very album requested is an edition of it, not a
+      // discography: unless it is a many-disc set, a various-artists pack or spans years.
+      const editionBox = opts?.sameAlbumEdition && !HARD_DISCOGRAPHY_RE.test(rel) && !/\b\d{3,}\s*-?\s*cd\b/i.test(rel);
+      if (!editionBox) return { rejected: true, reason: "discography or multi-album box set" };
     }
   }
 
