@@ -120,6 +120,9 @@ const FRESH_SEARCH_TTL_MS = 10 * 60 * 1000;
 function freshSearchKey(albumId: string): string {
   return `fresh_search_v1:${albumId}`;
 }
+function unscoredKey(albumId: string): string {
+  return `unscored_v1:${albumId}`;
+}
 function servedKey(itemId: string): string {
   return `served_v1:${itemId}`;
 }
@@ -516,6 +519,8 @@ interface ResolveStage {
   searchIncomplete?: boolean;
   /** When the stage's probing began: lone partial sources are only waited past for so long. */
   startedAt?: number;
+  /** Candidates were left unscored for want of time: the album is not exhausted. */
+  hadUnscored?: boolean;
   /** A song-query stage: it adds to the album's record without ending the album's own search. */
   trackPhase?: boolean;
   /** The album record's `exhausted` as the song query found it (that search says nothing of the album's shortlist). */
@@ -2742,6 +2747,7 @@ export class AlbumResolver {
         excludedSig,
         rawCandidateCount: searched.rawCount,
         searchIncomplete: searched.incomplete || undefined,
+        ...(searched.unscored ? { hadUnscored: true } : {}),
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
         startedAt: this.env.now(),
@@ -2887,7 +2893,7 @@ export class AlbumResolver {
       this.cache.delete(albumStageKey(albumId));
       return { done: true, verifiedCount: 0 };
     }
-    if (finalReleases.length === 0 && stage.searchIncomplete) {
+    if (finalReleases.length === 0 && (stage.searchIncomplete || stage.hadUnscored)) {
       // Nothing playable among what the indexers had answered so far: no verdict yet.
       this.cache.delete(albumStageKey(albumId));
       return this.inconclusive(albumId);
@@ -2906,7 +2912,7 @@ export class AlbumResolver {
     // An unfinished search says nothing about what else exists: never "exhausted".
     const exhausted = stage.trackPhase
       ? Boolean(stage.priorExhausted)
-      : !stage.searchIncomplete && (stage.nextIdx >= stage.preRanked.length || (stage.resumes || 0) >= MAX_ALBUM_RESUMES);
+      : !stage.searchIncomplete && ((stage.nextIdx >= stage.preRanked.length && !stage.hadUnscored) || (stage.resumes || 0) >= MAX_ALBUM_RESUMES);
     const record: CachedAlbumResolution = {
       albumId,
       resolvedAt: now,
@@ -3004,6 +3010,8 @@ export class AlbumResolver {
     rawCount: number;
     deferredInFlight: boolean;
     incomplete?: boolean;
+    /** Candidates the call ran out of time to score: carried to the next search of this album. */
+    unscored?: number;
   } {
     // Indexers match words: punctuation and accents in a name ("AC/DC", "Beyoncé") and tags a
     // release name never carries ("(feat. ...)", "[From ...]") make a query match little or nothing.
@@ -3195,9 +3203,30 @@ export class AlbumResolver {
       if (!res.fromCache && interactive && res.elapsedMs >= 1400) break;
     }
 
+    // Candidates an earlier call ran out of time to score join this one's.
+    const carried = this.cache.get<SourceCandidate[]>(unscoredKey(album.id));
+    if (carried && carried.length > 0) {
+      this.cache.delete(unscoredKey(album.id));
+      for (const c of carried) {
+        const ref = candidateRefOf(c);
+        if (isReleaseExcluded(excluded, ref, c) || byRef.has(ref)) continue;
+        byRef.set(ref, c);
+        rawCandidates.push(c);
+      }
+    }
     if (rawCandidates.length === 0) {
       return { ordered: [], rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
     }
+    // The likeliest names are scored first: the album's title words, then the artist's.
+    const wordsOf = (t: string) => normalizeTitleKey(t).split(" ").filter((w) => w.length >= 3 && w !== "the" && w !== "and");
+    const albumWords = wordsOf(coreReleaseTitle(album.title));
+    const artistWords = wordsOf(album.artistName);
+    const promise = (c: SourceCandidate): number => {
+      const key = ` ${normalizeTitleKey(c.title || "")} `;
+      const hit = (ws: string[]) => (ws.length === 0 ? 0 : ws.filter((w) => key.includes(` ${w} `)).length / ws.length);
+      return hit(albumWords) * 2 + hit(artistWords);
+    };
+    rawCandidates.sort((a, b) => promise(b) - promise(a));
 
     // Batch debrid_check for top torrent infoHashes (capped at 25, prioritizing lossless + seeders)
     // so popular albums never burn the 5s route budget checking 80+ obscure torrents.
@@ -3239,6 +3268,7 @@ export class AlbumResolver {
     const maybes: Array<{ cand: SourceCandidate; score: number; shareArtist: boolean }> = [];
     const volumeRanked: Array<{ cand: SourceCandidate; score: number; volume: true }> = [];
     const droppedAtNames: DroppedCandidate[] = [];
+    const leftover: SourceCandidate[] = [];
     for (const cand of rawCandidates) {
       if (skipRefs.size > 0 && skipRefs.has(candidateRefOf(cand))) continue;
       const isUsenet = isUsenetCandidate(cand);
@@ -3248,6 +3278,10 @@ export class AlbumResolver {
       }
 
       const pre = scoreOf(cand, false);
+      if (!pre.accepted && pre.reasons[0] === "not scored: out of time") {
+        leftover.push(cand);
+        continue;
+      }
       if (!pre.accepted) {
         if (pre.volumeOnly) {
           // Another volume of a series, and the request names none: listed last, if it is the
@@ -3331,7 +3365,8 @@ export class AlbumResolver {
     );
     const droppedLine = formatDroppedAtNameRanking(album.id, droppedAtNames, rawCandidates.length);
     if (droppedLine) this.env.log("debug", droppedLine);
-    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
+    if (leftover.length > 0) this.cache.set(unscoredKey(album.id), leftover.slice(0, 60).map(compactCandidateForMemo), STAGE_CACHE_TTL_MS * 2);
+    return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete, unscored: leftover.length };
   }
 
   /**

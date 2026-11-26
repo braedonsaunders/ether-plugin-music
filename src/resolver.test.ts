@@ -4657,3 +4657,22 @@ test("build 19 / 2: on the album path a release of this album serves a title wit
   // A release that is not this album keeps the strict rule.
   assert.equal(serves("The Band - Big Band Classics [FLAC]", "01 Caravan.flac"), false);
 });
+
+test("build 19 / 3: candidates the call had no time to score are carried to the next call, likeliest first; 'Band, The' is 'The Band'", () => {
+  const album = albumOf("al-9570", "The Band", "The Last Waltz", 2002, trackTitles("Waltz Song", 5), {}, 240);
+  const noise = Array.from({ length: 20 }, (_, i): SourceCandidate => ({ title: `Protest Hero ${i} - Pacific Myth ${i} [FLAC]`, indexer: "NZBgeek", nzbUrl: `https://nzb.test/n${i}`, size: 150_000_000 }));
+  const good: SourceCandidate = { title: "Band, The - The Last Waltz [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/good", size: 150_000_000 };
+  let slow = true;
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") { if (slow) { slow = false; advance(h, 3000); } return { candidates: [...noise, good] }; }
+    if (q.kind === "release_files") return { candidates: [{ ...(q.candidate as SourceCandidate), files: filesOf(album.tracks.map((t, i) => `${pad2(i + 1)} ${t.title}.flac`)) }] };
+    if (q.kind === "usenet_check") return usenetOk(q.candidate as SourceCandidate);
+    return { candidates: [] };
+  });
+  const r = h.play(trackItemFor(album, 0));
+  assert.equal(r.sources.length, 1, h.logs.join("\n"));
+  assert.equal(r.sources[0].release?.candidate?.nzbUrl, "https://nzb.test/good");
+  assert.ok(h.logs.some((l) => /unscored=\d+/.test(l)), "the first call did run out of time");
+  assert.ok(!h.logs.some((l) => /dropped .*not scored: out of time/.test(l)), "never dropped for want of time");
+  assert.equal(preScoreAlbumCandidate({ title: "Band, The - The Last Waltz, Disc 2 [FLAC]", nzbUrl: "https://nzb.test/d2", size: 300_000_000 }, { artistName: "The Band", title: "The Last Waltz", year: 2002, releaseType: "album", durationSec: 1200 }, "flac_preferred").accepted, true);
+});
