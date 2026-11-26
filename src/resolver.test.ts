@@ -4868,6 +4868,43 @@ test("a source that answered lately and now reports an error is down: a miss fou
   assert.ok(odd.logs.every((l) => !/indexer_search failed/.test(l)), odd.logs.join("\n"));
 });
 
+const U2_TITLES = ["Zoo Station", "Even Better Than the Real Thing", "One", "Until the End of the World", "Who's Gonna Ride Your Wild Horses", "So Cruel", "The Fly", "Mysterious Ways", "Tryin' to Throw Your Arms Around the World", "Ultraviolet (Light My Way)", "Acrobat", "Love Is Blindness", "Blow Your House Down", "Lady with the Spinning Head (UV1)", "Satellite of Love", "Heaven and Hell", "Salome (Zooromancer Remix)", "Where Did It All Go Wrong?", "Down All the Days", "Fortunate Son", "Oh Berlin", "Near the Island", "Everybody Loves a Winner", "Alex Descends Into Hell", "Paint It Black", "Zoo Station (Bonus)"];
+function u2Scenario(opts: { bonusDir?: string; extraSearch?: (q: SourceQuery) => SourceCandidate[] } = {}) {
+  const album = albumOf("al-9700", "U2", "Achtung Baby (Deluxe Edition)", 2011, U2_TITLES, {}, 240);
+  const target = album.tracks[12];
+  const item = trackItemFor(album, 12);
+  const mk = (title: string, n: number): SourceCandidate => ({ title, indexer: "DrunkenSlug", nzbUrl: `https://nzb.test/u2-${n}`, size: 3_000_000_000 });
+  const superDeluxe = mk("U2 - Achtung Baby (Super Deluxe Edition)(6-CD)(2011)(flac)", 1);
+  const musik = mk("Musikjunkie-U2 - 2011 Achtung Baby Deluxe Edition 6 CD FLAC Bitrate Lossless", 2);
+  const boxName = mk("U2 - Achtung Baby (Super Deluxe Edition) (6 CD Box Set) (2011)", 3);
+  const deluxe = mk("U2 - Achtung Baby (Deluxe Edition) (2011) FLAC", 4);
+  const plain = mk("U2 - Achtung Baby (2011) FLAC", 5);
+  const dir = opts.bonusDir || "CD4 - B-Sides and Bonus Tracks";
+  const memberFiles = (rar: string, members: Array<[string, string]>) => [{ index: 0, path: rar, size: 80_000_000, members: members.map(([d, n], i) => ({ index: i, path: `${d}/${n}`, size: 30_000_000, stored: true })) }];
+  const num = (i: number) => `${pad2(i + 1)}. U2 - ${U2_TITLES[i]}.flac`;
+  const filesFor = (c: SourceCandidate) => {
+    if (c.nzbUrl.endsWith("u2-1") || c.nzbUrl.endsWith("u2-2") || c.nzbUrl.endsWith("u2-3")) {
+      return memberFiles("u2.part01.rar", [
+        ...[0, 1, 2, 3, 4, 5, 6, 7].map((i): [string, string] => ["CD1 - Achtung Baby", num(i)]),
+        [dir, "02. U2 - Blow Your House Down.flac"], [dir, "01. U2 - Salome.flac"],
+      ]);
+    }
+    if (c.nzbUrl.endsWith("u2-4")) {
+      return memberFiles("deluxe.part01.rar", [...[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19].map((i): [string, string] => ["U2 - Achtung Baby (Deluxe Edition)", `202-u2-${U2_TITLES[i].toLowerCase().replace(/[^a-z0-9]+/g, "_")}.flac`])]);
+    }
+    return memberFiles("plain.part01.rar", [0, 1, 2, 3, 4, 5, 6].map((i): [string, string] => ["U2 - Achtung Baby", num(i)]));
+  };
+  const calls: SourceQuery[] = [];
+  const h = harness(album, (q) => {
+    calls.push(q);
+    if (q.kind === "indexer_search") return { candidates: [boxName, deluxe, plain, musik, superDeluxe, ...(opts.extraSearch?.(q) || [])] };
+    if (q.kind === "release_files") return { candidates: [{ ...(q.candidate as SourceCandidate), files: filesFor(q.candidate as SourceCandidate) }] };
+    if (q.kind === "usenet_check") return usenetOk(q.candidate as SourceCandidate);
+    return { candidates: [] };
+  });
+  return { album, item, target, h, calls, cands: { superDeluxe, musik, boxName, deluxe, plain } };
+}
+
 test("u2 regression: the 6-CD super deluxe edition still serves a bonus track and leads the sources", () => {
   const { item, h, cands } = u2Scenario();
   const r = h.play(item);
