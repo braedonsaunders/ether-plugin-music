@@ -342,7 +342,8 @@ export function isRejectedReleaseForRequest(
 
   // Discography / multi-album packs always fail album-unit matching.
   if (/\b(?:discography|complete\s+studio\s+albums|complete\s+albums|studio\s+albums\s+collection|all\s+albums|box\s*set|\d+\s*cd\s*box|\b\d{4}\s*-\s*\d{4}\b)\b/i.test(rel)) {
-    if (!/\b(?:box|complete|anthology)\b/i.test(reqNorm)) {
+    // Not when the requested album is itself such a set ("The Studio Album Collection 1977-1992").
+    if (!/\b(?:box|complete|anthology|collection|discography|albums|(?:19|20)\d\d (?:19|20)\d\d)\b/i.test(reqNorm)) {
       return { rejected: true, reason: "discography or multi-album box set" };
     }
   }
@@ -378,7 +379,8 @@ const VERSION_LIVE_RE = /\b(?:live|in concert|unplugged|bootleg|soundboard|broad
 // Alternate mixes. "5.1"/"4.1" are matched on the raw text because normalizeText splits them.
 const VERSION_ALT_RE =
   /\b(?:quad|quadraphonic|surround|atmos|instrumentals?|karaoke|a ?cappella|acapella|acappella|demos?|acoustic|drumless|mono mix|stereo mix)\b/g;
-const VERSION_SURROUND_RE = /(?<![\d.v])[457]\.1(?:ch)?(?![\d])/g;
+// Not a sample rate ("44.1", "24-44.1") or a version ("v4.1"); "SACD.5.1" in a dotted name counts.
+const VERSION_SURROUND_RE = /(?<![\dv])(?<!\d\.)[457]\.1(?:ch)?(?![\d])/g;
 const VERSION_VOLUME_RE = /\b(volume|vol|part|pt) (\d{1,2})\b/g;
 // A bracketed note that describes the edition or its extras ("Deluxe Edition incl. Live Bonus
 // Disc", "Remastered + Demos"), or a bare "(Live)" / "[Live 1976]" tag, says nothing reliable

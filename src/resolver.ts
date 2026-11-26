@@ -2116,6 +2116,12 @@ export class AlbumResolver {
       // Self-heal legacy KV bloat from <=0.2.4 installs before persisting stage/release entries.
       this.cache.sweepLegacyBloat(64);
       const album = this.loadAlbumForResolve(albumId, item);
+      if (this.albumLoadFailed) {
+        // The provider did not answer: that says nothing about the album. Try again shortly
+        // instead of resolving a one-track stand-in and remembering "nothing found".
+        this.env.log("debug", `resolve-album: metadata for ${albumId} could not be fetched; retrying`);
+        return this.inconclusive(albumId);
+      }
       if (!album) {
         this.env.log("warn", `resolve-album: could not load metadata for ${albumId}`);
         return { done: true, verifiedCount: 0 };
@@ -2306,18 +2312,26 @@ export class AlbumResolver {
     return { done: true, verifiedCount: finalReleases.length };
   }
 
+  /** Set by loadAlbumForResolve when the provider failed to answer (as opposed to "no such album"). */
+  private albumLoadFailed = false;
+
   private loadAlbumForResolve(albumId: string, item: KindItem): CanonicalAlbum | null {
+    this.albumLoadFailed = false;
     const cachedMeta = this.cache.get<CanonicalAlbum>(`album_v2:${albumId}`);
     if (cachedMeta && cachedMeta.tracks.length > 0) return cachedMeta;
 
     const hints = (item.hints || {}) as Record<string, unknown>;
     const dzAlbId = Number(hints.deezerAlbumId) || parseNumericId(albumId, "al-");
     if (dzAlbId > 0) {
-      const loaded = this.catalog.loadCanonicalAlbum(dzAlbId, {
+      const res = this.catalog.loadCanonicalAlbumResult(dzAlbId, {
         allowMusicBrainz: true,
         requireTrackDetails: true,
       });
-      if (loaded) return loaded;
+      if (res.album && !res.album.incomplete) return res.album;
+      if (res.status === "failed") {
+        this.albumLoadFailed = true;
+        return null;
+      }
     }
 
     // Minimal fallback when resolving a synthetic/single item without Deezer album ID.

@@ -186,11 +186,11 @@ export function kvKeyClass(key: string): number {
   ) return 1;
   if (
     key.startsWith("dz:") || key.startsWith("mb:") || key.startsWith("caa:") || key.startsWith("lrc:") ||
-    key.startsWith("artist_art_v1:") || key.startsWith("curated:") || key.startsWith("rec_plan_v1:")
+    key.startsWith("artist_art_v1:") || key.startsWith("curated:") || key.startsWith("rec_plan_v")
   ) return 2;
   if (
-    key.startsWith("alb_rel_v12:") || key.startsWith("concert_rel_v2:") ||
-    key.startsWith("alb_stage_v6:") || key.startsWith("concert_stage_v2:")
+    key.startsWith("alb_rel_v") || key.startsWith("concert_rel_v2:") ||
+    key.startsWith("alb_stage_v") || key.startsWith("concert_stage_v2:")
   ) return 4;
   return 3;
 }

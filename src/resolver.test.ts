@@ -3492,3 +3492,11 @@ test("an edition of the library album is tried by the single-track fallback, aft
   const picked = pickRecordingReleases(releases, "Kick 25");
   assert.deepEqual(picked.map((p) => p.title), ["Need You Tonight", "Kick"], "the single first; one edition last; the library's own title is not repeated");
 });
+
+test("a requested box set is not rejected for being a box set; dotted SACD.5.1 names are a surround mix", () => {
+  assert.equal(isRejectedReleaseForRequest("Chic - The Studio Album Collection 1977-1992 (2014) [FLAC]", "The Studio Album Collection 1977-1992", "album").rejected, false);
+  assert.equal(isRejectedReleaseForRequest("Chic - Discography 1977-1992 FLAC", "Risqué", "album").rejected, true);
+  assert.equal(isWrongVersionRelease("Pink.Floyd.-.The.Dark.Side.Of.The.Moon.(1973.Prog.Rock).[Flac.24-88.SACD.5.1]", "The Dark Side of the Moon", "Pink Floyd").rejected, true);
+  assert.equal(isWrongVersionRelease("Pink Floyd - The Dark Side Of The Moon [FLAC 24-44.1]", "The Dark Side of the Moon", "Pink Floyd").rejected, false);
+  assert.equal(isWrongVersionRelease("Artist - Album v4.1", "Album", "Artist").rejected, false);
+});
