@@ -4314,3 +4314,46 @@ test("fix 2: in a box set (many more files than the album) a member in a folder 
   ], "flac_preferred");
   assert.deepEqual(Object.keys(live.tracks), [album.tracks[1].id]);
 });
+
+test("fix 5: on the recording path catalogue labels are optional, real version differences are not; featured artists are copied", () => {
+  const rec = (title: string, extra: Partial<CanonicalAlbum["tracks"][number]> = {}): CanonicalAlbum => {
+    const a = albumOf("al-9506", "The Band", "The Last Waltz", 2002, [title], { recordingTarget: { releaseTrackCount: 54 } });
+    a.tracks[0] = { ...a.tracks[0], artistName: "The Band", ...extra };
+    return a;
+  };
+  const filler = filesOf(trackTitles("Filler", 12).map((t, i) => `${pad2(i + 2)} ${t}.flac`)).map((f, i) => ({ ...f, index: i + 1 }));
+  const serves = (album: CanonicalAlbum, name: string, release = "The Band - The Last Waltz (40th Anniversary) [FLAC]") =>
+    Object.keys(matchTracksInRelease(album, release, [{ index: 0, path: name, size: 30_000_000 }, ...filler], "flac_preferred").tracks).includes(album.tracks[0].id);
+  const wanted = rec("Caravan (feat. Van Morrison) (Concert Version)", { featuredArtists: ["Van Morrison"] });
+  for (const ok of ["01 Caravan.flac", "Caravan (Live).flac", "01 Caravan (feat. Van Morrison).flac", "Caravan (Concert Version).flac", "The Band - Caravan.flac", "Van Morrison - Caravan.flac"]) {
+    assert.equal(serves(wanted, ok), true, ok);
+  }
+  for (const bad of ["Caravan (Remix).flac", "Caravan (Acoustic).flac", "Caravan (Instrumental).flac", "Caravan (Demo).flac", "Caravan (Karaoke Version).flac", "Caravan (Cover).flac", "Caravan (Radio Edit).flac", "Somebody Else - Caravan.flac"]) {
+    assert.equal(serves(wanted, bad), false, bad);
+  }
+  // Without the featured artist known, the featured artist's own lead is a foreign one.
+  assert.equal(serves(rec("Caravan (feat. Van Morrison) (Concert Version)"), "Van Morrison - Caravan.flac"), false);
+  // A studio wanted title: live and the other versions are still refused; the album label is optional.
+  const studio = rec("Caravan (Album Version)");
+  assert.equal(serves(studio, "Caravan.flac"), true);
+  assert.equal(serves(studio, "Caravan (Live).flac"), false, "live is not studio");
+  assert.equal(serves(studio, "Caravan (Remix).flac"), false);
+  assert.equal(serves(rec("Caravan (Single Version)"), "Caravan.flac"), true);
+  assert.equal(serves(rec("Caravan"), "Caravan (Live).flac"), false);
+  // The same labels are strict for a whole album (not the recording path).
+  const album = albumOf("al-9507", "The Band", "The Last Waltz", 2002, ["Caravan (Concert Version)", "Other One", "Third One", "Fourth One"]);
+  assert.equal(Object.keys(matchTracksInRelease(album, "The Band - The Last Waltz [FLAC]", filesOf(["Caravan.flac", "Other One.flac", "Third One.flac", "Fourth One.flac"]), "flac_preferred").tracks).includes(album.tracks[0].id), false);
+
+  // recordingAlbum copies the featured artists from the item.
+  const base = albumOf("al-9508", "Hozier", "Some Album", 2020, ["Caravan (feat. Van Morrison) (Concert Version)", "Two", "Three"]);
+  const h = harness(base, () => ({ candidates: [] }), { mbBody: JSON.stringify({ recordings: [{ "artist-credit": [{ name: "The Band" }], releases: [
+    { title: "The Last Waltz", status: "Official", "track-count": 54, "artist-credit": [{ name: "The Band" }], "release-group": { "primary-type": "Album", "secondary-types": ["Live"] } },
+  ] }] }) });
+  const item = trackItemFor(base, 0);
+  item.hints = { ...(item.hints || {}), isrc: "USWB19903716", trackArtistName: "The Band" };
+  item.fields = { ...(item.fields || {}), featuredArtists: ["Van Morrison"] };
+  h.cache.set(albumCacheKey(base.id), { albumId: base.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases: [], negative: true }, 3_600_000);
+  h.play(item);
+  const synth = h.cache.get<CanonicalAlbum>("album_v2:rec-USWB19903716-0");
+  assert.deepEqual(synth?.tracks[0].featuredArtists, ["Van Morrison"]);
+});

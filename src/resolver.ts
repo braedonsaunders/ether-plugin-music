@@ -28,6 +28,7 @@ import { getCuratedConcertById, type CuratedConcert } from "./concerts.ts";
 import {
   audioFormatOfPath,
   coreReleaseTitle,
+  extractFeaturedFromTitle,
   fileTitleCandidates,
   classifyLead,
   hasVersionWord,
@@ -1249,6 +1250,8 @@ export function matchAlbumReleaseFiles(
  * ratio.
  */
 // Lossless up to 4.5x: a 24-bit/96 kHz FLAC is about 3.4x of CD-quality FLAC and is often not labelled.
+/** Notes of a catalogue title that name where the song comes from, not which recording it is. */
+const CATALOGUE_LABEL_RE = /^(?:concert|album|single|studio|original|standard|lp) version$/;
 const SIZE_RATIO_LOSSLESS = { min: 0.25, max: 4.5 };
 /** A title of this many words or more is taken as specific enough to tolerate an unknown lead. */
 const LONG_TITLE_WORDS = 6;
@@ -1381,8 +1384,13 @@ export function matchTracksInRelease(
   }
   const relPhrases = ` ${normalizeTitleKey(releaseTitle)} `;
   const albumPhrases = ` ${normalizeTitleKey(album.title)} `;
+  // For one song looked for on a release, a label of the catalogue ("Concert Version", "Album
+  // Version", "Single Version") is no mark the file must carry: the catalogue names the song's
+  // source, files and releases rarely repeat it. Real differences (live, remix, acoustic, demo,
+  // instrumental...) stay.
+  const catalogueLabel = (q: string): boolean => Boolean(album.recordingTarget) && CATALOGUE_LABEL_RE.test(q);
   const ignoreQual = (q: string): boolean =>
-    albumLevel.has(q) || (relPhrases.includes(` ${q} `) && (Boolean(album.recordingTarget) || albumPhrases.includes(` ${q} `)));
+    albumLevel.has(q) || catalogueLabel(q) || (relPhrases.includes(` ${q} `) && (Boolean(album.recordingTarget) || albumPhrases.includes(` ${q} `)));
 
   // Titles of the album's tracks, indexed by exact text and by signature: a lookup per file title.
   const byFull = new Map<string, number[]>();
@@ -1406,6 +1414,8 @@ export function matchTracksInRelease(
     push(bySig, sig.sig, ti);
     const asIs = titleSignature(tr.title);
     if (asIs && asIs.sig !== sig.sig) push(bySig, asIs.sig, ti);
+    // A "Concert Version" is a live recording: a file that says "(Live)" is it too.
+    if (album.recordingTarget && asIs?.quals.some((q) => /^concert version$/.test(q))) push(bySig, `${sig.base}|live`, ti);
     if (isGenericTrackTitle(sig.base)) genericTrack.add(ti);
   });
 
@@ -2210,6 +2220,11 @@ export class AlbumResolver {
   private recordingAlbum(id: string, item: KindItem, cand: RecordingPlan["candidates"][number]): CanonicalAlbum {
     const hints = (item.hints || {}) as Record<string, unknown>;
     const artistName = cand.artistName || String(hints.trackArtistName || hints.artistName || "");
+    const fieldFeatured = item.fields?.featuredArtists;
+    const featured = Array.from(new Set([
+      ...(Array.isArray(fieldFeatured) ? fieldFeatured.map((a) => String(a).trim()) : []),
+      ...extractFeaturedFromTitle(item.title),
+    ].filter(Boolean)));
     return {
       id,
       deezerAlbumId: 0,
@@ -2240,6 +2255,8 @@ export class AlbumResolver {
         isrc: String(hints.isrc || "") || undefined,
         // The song's own artist (the library's), not the compilation's or the single's credit.
         artistName: String(hints.trackArtistName || hints.artistName || artistName),
+        // A file credited to a featured artist ("Van Morrison - Caravan") is the song's too.
+        ...(featured.length > 0 ? { featuredArtists: featured } : {}),
       }],
       recordingTarget: { releaseTrackCount: cand.trackCount },
     };
