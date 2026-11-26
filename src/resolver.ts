@@ -97,7 +97,9 @@ const MAX_USENET_PROBES = 10;
 const MAX_PLUGIN_PROBES = 4;
 // Room for every kind the shortlist can hold: 6 Debrid, the Usenet ones, 4 unconfirmed, the plugin ones.
 const MAX_MAYBE_PROBES = 4;
-const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES + MAX_MAYBE_PROBES;
+/** Releases refused for another volume that are still listed, last: the request names no volume and the file list decides. */
+const MAX_VOLUME_PROBES = 2;
+const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES + MAX_MAYBE_PROBES + MAX_VOLUME_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 /** Probing for a second source beside a lone partial or archive-member one stops after this long. */
 const MORE_PROBING_MAX_MS = 20_000;
@@ -472,7 +474,7 @@ interface ResolveStage {
   skipRefs?: string[];
   /** Searches already continued for tracks the cached releases did not serve. */
   resumes?: number;
-  preRanked: Array<{ cand: SourceCandidate; score: number }>;
+  preRanked: Array<{ cand: SourceCandidate; score: number; volume?: boolean }>;
   nextIdx: number;
   verified: VerifiedAlbumRelease[];
   archiveFallbacks: VerifiedAlbumRelease[];
@@ -764,8 +766,8 @@ export function preScoreAlbumCandidate(
     otherArtists?: string[];
   },
   pref: QualityPreference,
-  options?: { allowUnconfirmedTorrent?: boolean }
-): { accepted: boolean; score: number; reasons: string[]; maybe?: boolean; artistRatio?: number } {
+  options?: { allowUnconfirmedTorrent?: boolean; allowVolume?: boolean }
+): { accepted: boolean; score: number; reasons: string[]; maybe?: boolean; artistRatio?: number; volumeOnly?: boolean } {
   const relTitle = String(candidate.title || "").trim();
   if (!relTitle) return { accepted: false, score: 0, reasons: ["empty candidate title"] };
 
@@ -778,8 +780,10 @@ export function preScoreAlbumCandidate(
   }
 
   const ver = isWrongVersionRelease(relTitle, album.title, album.artistName);
-  if (ver.rejected) {
-    return { accepted: false, score: 0, reasons: [ver.reason || "different version"] };
+  // "Volume 1" of a series when the request names no volume: refused by name, unless asked to let
+  // it through (the last-resort probe: its file list must hold the track by an exact title).
+  if (ver.rejected && !(ver.softVolume && options?.allowVolume)) {
+    return { accepted: false, score: 0, reasons: [ver.reason || "different version"], ...(ver.softVolume ? { volumeOnly: true } : {}) };
   }
 
   const qual = classifyReleaseQuality(relTitle, undefined, pref);
@@ -2714,7 +2718,7 @@ export class AlbumResolver {
         return { done: false, verifiedCount: 0 };
       }
 
-      const { cand, score: preScore } = stage.preRanked[stage.nextIdx];
+      const { cand, score: preScore, volume } = stage.preRanked[stage.nextIdx];
       // Usenet release_files fetches an NZB over HTTP (1-3s), and unconfirmed Debrid probes
       // (Real-Debrid / AllDebrid / Debrid-Link) may invoke acquireOn (~0.5-1.5s); yield
       // cleanly if we already consumed part of the 5s route budget.
@@ -2729,7 +2733,7 @@ export class AlbumResolver {
         return { done: false, verifiedCount: 0 };
       }
       stage.nextIdx++;
-      if (this.probeSingleCandidate(stage, cand, preScore, allowUsenetCheck, startMs)) {
+      if (this.probeSingleCandidate(stage, cand, preScore, allowUsenetCheck, startMs, Boolean(volume))) {
         // Its usenet_check did not fit this slice: it runs first in the next one.
         if (this.enoughServing(stage, serving)) break;
         this.cache.set(albumStageKey(albumId), stage, STAGE_CACHE_TTL_MS);
@@ -2939,7 +2943,7 @@ export class AlbumResolver {
     /** The song query phase: only this query is sent, and names are judged leniently. */
     trackQuery?: string
   ): {
-    ordered: Array<{ cand: SourceCandidate; score: number }>;
+    ordered: Array<{ cand: SourceCandidate; score: number; volume?: boolean }>;
     rawCount: number;
     deferredInFlight: boolean;
     incomplete?: boolean;
@@ -3028,7 +3032,7 @@ export class AlbumResolver {
 
     // A candidate is scored once per search, however often ranking asks: scoring a hundred
     // release names inside a sort is most of the 5 s a /resolve call is given.
-    const scored = new Map<string, { accepted: boolean; score: number; reasons: string[]; maybe?: boolean; artistRatio?: number }>();
+    const scored = new Map<string, { accepted: boolean; score: number; reasons: string[]; maybe?: boolean; artistRatio?: number; volumeOnly?: boolean }>();
     // Scoring stops when the slice has used its time: a /resolve call cut off at 5 s keeps
     // nothing, so the names not reached are left out of this search rather than losing them all.
     const SCORING_DEADLINE_MS = 2600;
@@ -3176,6 +3180,7 @@ export class AlbumResolver {
     // Pre-rank candidates (rejecting compilations, discographies, live bootlegs, lossy if lossless_only).
     const preRanked: Array<{ cand: SourceCandidate; score: number }> = [];
     const maybes: Array<{ cand: SourceCandidate; score: number; shareArtist: boolean }> = [];
+    const volumeRanked: Array<{ cand: SourceCandidate; score: number; volume: true }> = [];
     const droppedAtNames: DroppedCandidate[] = [];
     for (const cand of rawCandidates) {
       if (skipRefs.size > 0 && skipRefs.has(candidateRefOf(cand))) continue;
@@ -3187,6 +3192,15 @@ export class AlbumResolver {
 
       const pre = scoreOf(cand, false);
       if (!pre.accepted) {
+        if (pre.volumeOnly) {
+          // Another volume of a series, and the request names none: listed last, if it is the
+          // right artist and title otherwise (see MAX_VOLUME_PROBES).
+          const soft = preScoreAlbumCandidate(cand, scoredAlbum, this.settings.qualityPreference, { allowVolume: true });
+          if (soft.accepted) {
+            volumeRanked.push({ cand, score: soft.score, volume: true });
+            continue;
+          }
+        }
         droppedAtNames.push({ name: cand.title || "", indexer: cand.indexer, reason: pre.reasons[0] || "no reason" });
         continue;
       }
@@ -3199,6 +3213,10 @@ export class AlbumResolver {
     // The few "maybe" releases that are listed: those whose name shares the artist first, then the
     // largest (the likeliest to be a compilation or an edition holding the song).
     maybes.sort((a, b) => Number(b.shareArtist) - Number(a.shareArtist) || (b.cand.size || 0) - (a.cand.size || 0) || b.score - a.score);
+    volumeRanked.sort((a, b) => b.score - a.score);
+    for (const v of volumeRanked.slice(MAX_VOLUME_PROBES)) {
+      droppedAtNames.push({ name: v.cand.title || "", indexer: v.cand.indexer, reason: "different volume" });
+    }
     const maybeRanked = maybes.slice(0, MAX_MAYBE_PROBES).map(({ cand, score }) => ({ cand, score }));
     for (const m of maybes.slice(MAX_MAYBE_PROBES)) {
       droppedAtNames.push({ name: m.cand.title || "", indexer: m.cand.indexer, reason: "name does not tie it to the song (beyond the few listed)" });
@@ -3248,10 +3266,11 @@ export class AlbumResolver {
       ...unconfirmedDebrid.slice(0, 4),
       ...pluginRanked.slice(0, MAX_PLUGIN_PROBES),
       ...maybeRanked,
+      ...volumeRanked.slice(0, MAX_VOLUME_PROBES),
     ];
     this.env.log(
       "info",
-      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)} plugin=${pluginRanked.length} maybe=${maybeRanked.length}/${maybes.length}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
+      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)} plugin=${pluginRanked.length} maybe=${maybeRanked.length}/${maybes.length} volume=${Math.min(volumeRanked.length, MAX_VOLUME_PROBES)}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
     );
     const droppedLine = formatDroppedAtNameRanking(album.id, droppedAtNames, rawCandidates.length);
     if (droppedLine) this.env.log("debug", droppedLine);
@@ -3353,7 +3372,9 @@ export class AlbumResolver {
     cand: SourceCandidate,
     preScore: number,
     allowUsenetCheck: boolean,
-    startMs: number
+    startMs: number,
+    /** Refused by name as another volume: only an exact title of the wanted track makes it a source. */
+    volumeLast = false
   ): boolean {
     const album = stage.album;
     const verified = stage.verified;
@@ -3407,6 +3428,12 @@ export class AlbumResolver {
       "debug",
       `resolve-album: probe ${album.id} "${(cand.title || "").slice(0, 60)}" files=${files.length} listed in ${listedMs}ms matched in ${this.env.now() - matchAt}ms at=${this.env.now() - startMs}ms`
     );
+    if (volumeLast) {
+      const wanted = stage.wantedId ? match.tracks[stage.wantedId] : undefined;
+      match = match.matched && wanted && wanted.confidence >= 0.95
+        ? { ...match, partial: true, tracks: { [stage.wantedId!]: wanted } }
+        : { ...match, matched: false, partial: false, tracks: {}, reason: "another volume: the wanted track is not there by an exact title" };
+    }
     const archiveFiles = files.filter((f) => isArchivePath(f.path));
     const expandedAudioFiles = files.flatMap((f) =>
       Array.isArray(f.members)
@@ -3512,6 +3539,7 @@ export class AlbumResolver {
       !expandedContradictsAlbum &&
       isUsenet &&
       archiveFiles.length > 0 &&
+      !volumeLast &&
       preScore >= 60
     ) {
       const qual = classifyReleaseQuality(cand.title || "", undefined, this.settings.qualityPreference);

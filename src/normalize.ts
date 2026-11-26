@@ -410,7 +410,7 @@ export function isWrongVersionRelease(
   releaseTitle: string,
   requestedAlbumTitle: string,
   artistName = ""
-): { rejected: boolean; reason?: string } {
+): { rejected: boolean; reason?: string; softVolume?: boolean } {
   const shown = String(releaseTitle || "").replace(VERSION_GROUP_RE, (g) =>
     VERSION_EDITION_NOTE_RE.test(g) || VERSION_BARE_LIVE_RE.test(g) ? " " : g
   );
@@ -477,7 +477,7 @@ export function isWrongVersionRelease(
         // The request has no marker of this kind. A request with the other kind (vol vs part)
         // counts as declared, and so does one that carries the number itself ("Now 5" / "Vol 5").
         if (reqVol.size === 0 && ![...nums].some((n) => reqWords.has(n))) {
-          return { rejected: true, reason: "different volume" };
+          return { rejected: true, reason: "different volume", softVolume: true };
         }
         continue;
       }

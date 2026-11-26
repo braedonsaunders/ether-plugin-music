@@ -4529,3 +4529,36 @@ test("fix 7: the recording path says why it stops; each served source has one li
   const line = h.logs.find((l) => l.startsWith("serve "));
   assert.ok(line && /"rel-a"/.test(line) && /file="01 Disc Song 1\.flac"/.test(line) && /dur=200s/.test(line) && /tol=7/.test(line), String(line));
 });
+
+test("fix 6: another volume is refused by name as before, but listed last when the request names no volume; only an exact title counts", () => {
+  const album = albumOf("al-9540", "Delaney Davidson", "Sad But True", 2020, ["Travelling Creature", "Song Two", "Song Three", "Song Four"], {}, 190);
+  const vol1: SourceCandidate = { title: "Delaney Davidson & Marlon Williams - Sad But True: Volume 1 (2012) MP3", indexer: "DrunkenSlug", nzbUrl: "https://nzb.test/vol1", size: 60_000_000 };
+  const other: SourceCandidate = { title: "Delaney Davidson - Sad But True [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/flac", size: 150_000_000 };
+  // The gate itself is unchanged.
+  assert.equal(preScoreAlbumCandidate(vol1, { artistName: "Delaney Davidson", title: "Sad But True", year: 2020, releaseType: "album", durationSec: 760 }, "flac_preferred").accepted, false);
+  assert.equal(isWrongVersionRelease(vol1.title!, "Sad But True: Volume 3", "Delaney Davidson").rejected, true, "a request with another volume number still refuses");
+  const listed: string[] = [];
+  const run = (volFiles: string[], others: SourceCandidate[]) => {
+    listed.length = 0;
+    const h = harness(album, (q) => {
+      if (q.kind === "indexer_search") return { candidates: [vol1, ...others] };
+      if (q.kind === "release_files") {
+        listed.push(q.candidate!.nzbUrl!);
+        return { candidates: [{ ...q.candidate!, files: filesOf(q.candidate!.nzbUrl === vol1.nzbUrl ? volFiles : ["01 - Unrelated One.flac", "02 - Unrelated Two.flac", "03 - Unrelated Three.flac"], 6_000_000) }] };
+      }
+      if (q.kind === "usenet_check") return usenetOk(q.candidate!);
+      return { candidates: [] };
+    });
+    return h.play(trackItemFor(album, 0));
+  };
+  // Exact title on the volume: served (last, as a partial source), after the other release was looked at.
+  const ok = run(["01 - Travelling Creature.mp3", "02 - Other A.mp3", "03 - Other B.mp3", "04 - Other C.mp3"], [other]);
+  assert.equal(ok.sources.length, 1);
+  assert.equal(ok.sources[0].release?.candidate?.nzbUrl, vol1.nzbUrl);
+  assert.equal(listed[listed.length - 1], vol1.nzbUrl, "listed last");
+  assert.ok(listed.indexOf(other.nzbUrl!) < listed.indexOf(vol1.nzbUrl!));
+  // A near title or another version is no exact title.
+  assert.equal(run(["01 - Travelling Creatures.mp3", "02 - Other A.mp3"], [other]).sources.length, 0);
+  assert.equal(run(["01 - Travelling Creature (Live).mp3", "02 - Other A.mp3"], [other]).sources.length, 0);
+  assert.equal(run(["01 - Other.mp3"], []).sources.length, 0);
+});
