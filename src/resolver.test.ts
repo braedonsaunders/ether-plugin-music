@@ -19,6 +19,8 @@ import {
   indexerQueryText,
   joinedArtistSpelling,
   coreReleaseTitle,
+  coreTrackTitle,
+  trackQueryVariants,
 } from "./normalize.ts";
 import {
   AlbumResolver,
@@ -2001,7 +2003,8 @@ test("0.2.6: negative results are cached per album for 30m (empty) / 60m (unmatc
     sources: {
       resolve: (q) => {
         if (q.kind === "indexer_search") {
-          emptySearches++;
+          // Only the album's own query counts here: the song queries that follow are another matter.
+          if (/discovery/i.test(q.query || "")) emptySearches++;
           return { candidates: [] };
         }
         return { candidates: [] };
@@ -2021,7 +2024,8 @@ test("0.2.6: negative results are cached per album for 30m (empty) / 60m (unmatc
   const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
   const resolver = new AlbumResolver(env, cache, catalog, settings);
 
-  const r1 = resolver.resolve({ item: trackItemFor(album, 0) });
+  let r1 = resolver.resolve({ item: trackItemFor(album, 0) });
+  for (let i = 0; i < 6 && r1.pending; i++) r1 = resolver.resolve({ item: trackItemFor(album, 0) });
   assert.equal(r1.sources.length, 0);
   assert.ok((r1.ttlSec || 0) >= 600, `expected negative ttlSec >= 600, got ${r1.ttlSec}`);
   assert.equal(emptySearches, 1);
@@ -2053,7 +2057,7 @@ test("0.2.6: negative results are cached per album for 30m (empty) / 60m (unmatc
     sources: {
       resolve: (q) => {
         if (q.kind === "indexer_search") {
-          unmatchedSearches++;
+          if (/discovery/i.test(q.query || "")) unmatchedSearches++;
           return {
             candidates: [
               { title: "Daft Punk - Greatest Hits (2010) [FLAC]", nzbUrl: "https://althub.test/gh.nzb", indexer: "altHUB", size: 200_000_000 },
@@ -2072,7 +2076,8 @@ test("0.2.6: negative results are cached per album for 30m (empty) / 60m (unmatc
     new MusicCatalog(env2, cache2, new DeezerClient(env2, cache2), new MusicBrainzClient(env2, cache2), settings),
     settings
   );
-  const u1 = resolver2.resolve({ item: trackItemFor(album, 0) });
+  let u1 = resolver2.resolve({ item: trackItemFor(album, 0) });
+  for (let i = 0; i < 6 && u1.pending; i++) u1 = resolver2.resolve({ item: trackItemFor(album, 0) });
   assert.equal(u1.sources.length, 0);
   assert.ok((u1.ttlSec || 0) >= 900, `expected unmatched negative ttlSec >= 900, got ${u1.ttlSec}`);
   const initialCount = unmatchedSearches;
@@ -2179,7 +2184,7 @@ test("0.2.6: never repeats the same (album, query) within the short dedup window
     sources: {
       resolve: (q) => {
         if (q.kind === "indexer_search") {
-          inflSearches++;
+          if (/discovery/i.test(q.query || "")) inflSearches++;
           return { candidates: [nzb1] };
         }
         return { candidates: [] };
@@ -2821,7 +2826,7 @@ test("a complete search answer is not searched again within 5 minutes", () => {
   let searches = 0;
   const { resolver, advance } = clockedResolverFor(album, (q) => {
     if (q.kind === "indexer_search") {
-      searches++;
+      if (/discovery/i.test(q.query || "")) searches++;
       return { candidates: [], indexers: [{ status: "answered" }, { status: "answered" }] };
     }
     return { candidates: [] };
@@ -3203,11 +3208,13 @@ test("Kick 25 (Deluxe Edition): the 12-track standard release serves the tracks 
   const bonus = h.play(trackItemFor(album, 20));
   assert.equal(bonus.sources.length, 0, "a bonus track the release does not hold");
   assert.ok(h.logs.some((l) => /resolve-album: partial al-9025 \[usenet\] "INXS - Kick 25 \(2012\) FLAC" serves=12\/25 tracks requested=yes/.test(l)), h.logs.join("\n"));
-  // Asking again for the bonus track does not search again and again.
+  // Asking again for the bonus track does not search again and again; another bonus track gets its
+  // own song query, the album's query is not repeated.
   const searches = h.calls.filter((q) => q.kind === "indexer_search").length;
   h.play(trackItemFor(album, 20));
-  h.play(trackItemFor(album, 21));
   assert.equal(h.calls.filter((q) => q.kind === "indexer_search").length, searches);
+  h.play(trackItemFor(album, 21));
+  assert.equal(h.calls.filter((q) => q.kind === "indexer_search" && /kick 25$/i.test(q.query || "")).length, 1, "the album's query once");
 });
 
 test("B'Day (14 tracks): a 19-track deluxe release serves every standard track", () => {
@@ -3475,9 +3482,9 @@ test("a later play of another track re-uses the listed releases and goes on only
   assert.deepEqual(listed, ["https://nzb.test/r1", "https://nzb.test/r2", "https://nzb.test/r3", "https://nzb.test/r4"], "nothing listed twice");
   // The earlier releases still answer for their tracks.
   assert.equal(h.play(trackItemFor(album, 1)).sources.length, 3);
-  // A track nothing holds ends: the shortlist is used up, no further searching or listing.
-  const searches = h.calls.length;
+  // A track nothing holds ends: the shortlist is used up, no further listing; its song query is sent once.
   assert.equal(h.play(trackItemFor(album, 4)).sources.length, 0);
+  const searches = h.calls.length;
   assert.equal(h.play(trackItemFor(album, 4)).sources.length, 0);
   assert.equal(h.calls.length, searches, "no loop");
 });
@@ -3557,6 +3564,8 @@ test("defect 7: a MusicBrainz failure is not remembered as 'no such recording'",
     item.hints = { ...(item.hints || {}), isrc: "GBDUW0000053" };
     // The album itself is known not to hold the song: straight to the recording path.
     cache.set(albumCacheKey("al-302127"), { albumId: "al-302127", resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases: [], negative: true }, 3_600_000);
+    // The song's own query was tried already (it would find the single by itself): this is about MusicBrainz.
+    cache.set("trk_q_v1:al-302127:tr-1", { tried: ["Daft Punk One More Time"], attempts: {} }, 600_000);
 
     const first = resolver.resolve({ item });
     assert.equal(first.sources.length, 0);
@@ -4356,4 +4365,150 @@ test("fix 5: on the recording path catalogue labels are optional, real version d
   h.play(item);
   const synth = h.cache.get<CanonicalAlbum>("album_v2:rec-USWB19903716-0");
   assert.deepEqual(synth?.tracks[0].featuredArtists, ["Van Morrison"]);
+});
+
+test("fix 3: the song is searched for after the album gave nothing for it: labels stripped, a short form for a long title, one search per call, remembered across calls", () => {
+  const title = "Fade To Black (Metallica Tribute Live with Symphony Orchestra)";
+  const album = albumOf("al-9510", "SaD - Symphony and Metallica", "Live Tribute Night", 2024, [title, "Master of Puppets", "One"], {}, 300);
+  const single: SourceCandidate = { title: "SaD - Fade To Black (2024) [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/sad", size: 60_000_000 };
+  const sent: string[] = [];
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") { sent.push(q.query || ""); return { candidates: q.query === "SaD Fade To Black" ? [single] : [] }; }
+    if (q.kind === "release_files") return { candidates: [{ ...single, files: filesOf([`SaD - ${title}.flac`], 50_000_000) }] };
+    if (q.kind === "usenet_check") return usenetOk(single);
+    return { candidates: [] };
+  });
+  const item = trackItemFor(album, 0);
+  let perCall: number[] = [];
+  let r = h.resolver.resolve({ item });
+  for (let i = 0; i < 20; i++) {
+    const before = sent.length;
+    perCall.push(0);
+    if (!r.pending) break;
+    r = h.resolver.resolve({ item });
+    perCall[perCall.length - 1] = sent.length - before;
+  }
+  assert.equal(r.sources.length, 1, `${sent.join(" | ")}\n${h.logs.join("\n")}`);
+  assert.equal(r.sources[0].release?.candidate?.nzbUrl, "https://nzb.test/sad");
+  const album0 = sent.findIndex((q) => /Live Tribute Night/.test(q));
+  const long = sent.indexOf("SaD Symphony and Metallica Fade To Black");
+  const short = sent.indexOf("SaD Fade To Black");
+  assert.ok(album0 === 0 && long > 0 && short > long, `order: ${sent.join(" | ")}`);
+  assert.ok(perCall.every((n) => n <= 1), `at most one search per call: ${perCall.join(",")}`);
+  assert.equal(sent.filter((q) => q === "SaD Fade To Black").length, 1, "each query once");
+  // Remembered for a few minutes: the state lists what was tried.
+  const state = h.cache.get<{ tried: string[] }>(`trk_q_v1:${album.id}:${album.tracks[0].id}`);
+  assert.ok(state?.tried.includes("SaD Symphony and Metallica Fade To Black"), JSON.stringify(state));
+});
+
+test("fix 3: a multi-track album whose own release does not hold the song: the song query is sent, with labels stripped", () => {
+  const titles = ["Caravan (feat. Van Morrison) (Album Version)", ...trackTitles("Waltz Song", 5)];
+  const album = albumOf("al-9511", "The Band", "The Last Waltz", 2002, titles, {}, 240);
+  const own: SourceCandidate = { title: "The Band - The Last Waltz (2002) [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/waltz", size: 200_000_000 };
+  const lone: SourceCandidate = { title: "The Band - Caravan [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/caravan", size: 30_000_000 };
+  const sent: string[] = [];
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") { sent.push(q.query || ""); return { candidates: /caravan/i.test(q.query || "") ? [lone] : [own] }; }
+    if (q.kind === "release_files") {
+      const files = q.candidate!.nzbUrl === "https://nzb.test/waltz"
+        ? filesOf(titles.slice(1).map((t, i) => `${pad2(i + 2)} ${t}.flac`))
+        : filesOf(["The Band - Caravan.flac"], 25_000_000);
+      return { candidates: [{ ...q.candidate!, files }] };
+    }
+    if (q.kind === "usenet_check") return usenetOk(q.candidate!);
+    return { candidates: [] };
+  });
+  const r = h.play(trackItemFor(album, 0));
+  assert.equal(r.sources.length, 1, `${sent.join(" | ")}\n${h.logs.join("\n")}`);
+  assert.equal(r.sources[0].release?.candidate?.nzbUrl, "https://nzb.test/caravan");
+  assert.ok(sent.includes("The Band Caravan"), sent.join(" | "));
+  assert.ok(!sent.some((q) => /concert|version|feat/i.test(q)), "no catalogue labels in a query");
+  // The album's other tracks are still served by the album's own release.
+  assert.equal(h.play(trackItemFor(album, 2)).sources[0].release?.candidate?.nzbUrl, "https://nzb.test/waltz");
+});
+
+test("fix 3: a title with a part tail is also searched without it", () => {
+  const album = albumOf("al-9512", "Silent Hill", "Этот город, часть 1", 2022, ["Этот город", "Другая песня", "Третья песня"]);
+  const sent: string[] = [];
+  const h = harness(album, (q) => { if (q.kind === "indexer_search") sent.push(q.query || ""); return { candidates: [] }; });
+  h.play(trackItemFor(album, 0));
+  assert.ok(sent.includes("Silent Hill Этот город часть 1"), sent.join(" | "));
+  assert.ok(sent.includes("Silent Hill Этот город"), `without the tail: ${sent.join(" | ")}`);
+});
+
+test("fix 3: song query variants drop credits and catalogue labels, shorten long titles, drop part tails", () => {
+  const v = (a: string, t: string) => trackQueryVariants(a, t);
+  assert.deepEqual(v("The Band", "Caravan (feat. Van Morrison) (Concert Version)"), ["The Band Caravan"]);
+  assert.deepEqual(v("Nirvana", "Come As You Are - Live"), ["Nirvana Come As You Are"]);
+  assert.deepEqual(v("X", "Song (From \"The Movie\") - 2011 Remaster"), ["X Song"]);
+  assert.deepEqual(v("SaD - Symphony and Metallica", "Fade To Black (Metallica Tribute Live with Symphony Orchestra)"), ["SaD Symphony and Metallica Fade To Black", "SaD Fade To Black"]);
+  assert.deepEqual(v("Silent Hill", "Этот город, часть 1"), ["Silent Hill Этот город часть 1", "Silent Hill Этот город"]);
+  assert.deepEqual(v("Y", "Hits Vol. 2"), ["Y Hits Vol 2", "Y Hits"]);
+  assert.deepEqual(v("Bestia Metálica", "Solo Vivire"), ["Bestia Metalica Solo Vivire"]);
+  assert.equal(coreTrackTitle("(I Can't Get No) Satisfaction"), "(I Can't Get No) Satisfaction", "a leading bracket is part of the title");
+  assert.equal(coreTrackTitle("(Live)"), "(Live)", "never empty");
+});
+
+test("fix 4: a single is looked for on a release named for the artist or a compilation, not dropped by its name; at most 4 are listed", () => {
+  const accidental = albumOf("al-9520", "k.d. lang", "Accidental Tattoo", 2026, ["Accidental Tattoo"], {}, 230);
+  const tenth: SourceCandidate = { title: "2016 - case_lang_veirs (10th Anniversary Edition) [MP3]", indexer: "SlskSource", size: 220_000_000, pluginRelease: { plugin: "community.slsksource", id: "tenth" } };
+  const noise: SourceCandidate = { title: "Somebody Else - Another Record [FLAC]", indexer: "SlskSource", size: 220_000_000, pluginRelease: { plugin: "community.slsksource", id: "noise" } };
+  const tenthFiles = [...trackTitles("Case Song", 26).map((t, i) => `${pad2(i + 1)} - ${t}.mp3`), "27 - Accidental Tattoo.mp3"];
+  const h = harness(accidental, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [tenth, noise] };
+    if (q.kind === "release_files") return { candidates: [{ ...q.candidate!, files: filesOf(q.candidate!.pluginRelease!.id === "tenth" ? tenthFiles : ["01 - Unrelated.mp3"], 8_000_000) }] };
+    return { candidates: [] };
+  });
+  const r = h.play(trackItemFor(accidental, 0));
+  assert.equal(r.sources.length, 1, h.logs.join("\n"));
+  assert.equal(r.sources[0].release?.candidate?.pluginRelease?.id, "tenth");
+  assert.equal(r.sources[0].release?.fileIndex, 26);
+  assert.match(r.sources[0].label || "", /partial/);
+
+  // MØ on a compilation named for another band: a "presents" release is listed.
+  const mo = albumOf("al-9521", "MØ", "Attack of the Ghost Riders", 2023, ["Attack of the Ghost Riders"], {}, 200);
+  const rip: SourceCandidate = { title: "Raveonettes Presents - Rip It Off (320)", indexer: "SlskSource", size: 120_000_000, pluginRelease: { plugin: "community.slsksource", id: "rip" } };
+  const h2 = harness(mo, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [rip] };
+    if (q.kind === "release_files") return { candidates: [{ ...rip, files: filesOf([...trackTitles("Cover", 11).map((t, i) => `${pad2(i + 1)} - ${t}.mp3`), "12 - MØ - Attack of the Ghost Riders.mp3"], 8_000_000) }] };
+    return { candidates: [] };
+  });
+  const r2 = h2.play(trackItemFor(mo, 0));
+  assert.equal(r2.sources.length, 1, h2.logs.join("\n"));
+  assert.equal(r2.sources[0].release?.fileIndex, 11);
+
+  // At most 4 such releases are listed per search, those sharing the artist first.
+  const many: SourceCandidate[] = [
+    ...Array.from({ length: 6 }, (_, i) => ({ title: `Various Artists - Hits ${i} [MP3]`, indexer: "SlskSource", size: 100_000_000 + i, pluginRelease: { plugin: "community.slsksource", id: `va${i}` } })),
+    { title: "k.d. lang - Ingenue [MP3]", indexer: "SlskSource", size: 90_000_000, pluginRelease: { plugin: "community.slsksource", id: "own" } },
+  ];
+  const listed: string[] = [];
+  const h3 = harness(accidental, (q) => {
+    if (q.kind === "indexer_search") return { candidates: many };
+    if (q.kind === "release_files") { listed.push(q.candidate!.pluginRelease!.id); return { candidates: [{ ...q.candidate!, files: filesOf(["01 - Nothing.mp3"], 8_000_000) }] }; }
+    return { candidates: [] };
+  });
+  h3.play(trackItemFor(accidental, 0));
+  const firstSearch = listed.slice(0, listed.length);
+  assert.ok(firstSearch.includes("own"), "the release naming the artist is listed");
+  assert.ok(listed.filter((id) => id.startsWith("va")).length <= 3, `at most 4 maybes in all: ${listed.join(",")}`);
+  assert.ok(listed.length <= 4, `at most 4 listed: ${listed.join(",")}`);
+
+  // An album of many tracks is not looked at this way in its own search: such a name is still dropped.
+  const five = albumOf("al-9522", "k.d. lang", "Some Long Album", 2020, trackTitles("Long Song", 6));
+  const h4 = harness(five, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [tenth] };
+    if (q.kind === "release_files") return { candidates: [{ ...tenth, files: filesOf(["01 - Long Song 1.mp3"], 8_000_000) }] };
+    return { candidates: [] };
+  });
+  h4.play(trackItemFor(five, 0));
+  assert.ok(h4.logs.some((l) => /dropped 1 of 1 at name ranking: album title mismatch/.test(l)), h4.logs.join("\n"));
+
+  // Safety: a remix of the song on such a release is no match.
+  const h5 = harness(accidental, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [tenth] };
+    if (q.kind === "release_files") return { candidates: [{ ...tenth, files: filesOf(["01 - Case Song 1.mp3", "27 - Accidental Tattoo (Remix).mp3", "28 - Accidental Tattoo (Live).mp3"], 8_000_000) }] };
+    return { candidates: [] };
+  });
+  assert.equal(h5.play(trackItemFor(accidental, 0)).sources.length, 0);
 });

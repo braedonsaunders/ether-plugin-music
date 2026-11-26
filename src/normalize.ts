@@ -742,6 +742,68 @@ export function coreReleaseTitle(title: string): string {
 }
 
 /**
+ * A track title as a song query wants it: credits ("(feat. X)"), catalogue labels ("(Concert
+ * Version)", "(Album Version)", "(From ...)"), remaster notes and a trailing "- Live" or
+ * "- 2011 Remaster" clause dropped, every trailing bracketed note too. Never empty.
+ */
+export function coreTrackTitle(title: string): string {
+  const original = String(title || "").trim();
+  let out = coreReleaseTitle(original);
+  let prev = "";
+  while (out !== prev) {
+    prev = out;
+    out = out
+      .replace(/\s*[\(\[\{][^()\[\]{}]*[\)\]\}]\s*$/, "")
+      .replace(/\s+[-\u2013\u2014]\s+[^-\u2013\u2014]*\b(?:live|remaster(?:ed)?|version|mix|edit|mono|stereo|demo|acoustic|session|single|radio)\b[^-\u2013\u2014]*$/i, "")
+      .trim();
+  }
+  return out || coreReleaseTitle(original) || original;
+}
+
+const PART_TAIL_RE =
+  /[\s,:;\-\u2013\u2014]*(?<![\p{L}\p{N}])(?:part|pt|vol|volume|\u0447\u0430\u0441\u0442\u044c|\u0447|\u2116|no)\.?\s*(?:\d{1,3}|[ivx]{1,4})\s*$/iu;
+
+/** A title without a trailing "part 2" / "Vol. 3" / "\u0447\u0430\u0441\u0442\u044c 1" counter; the title itself when it has none. */
+export function stripPartTail(title: string): string {
+  const t = String(title || "").trim();
+  const out = t.replace(PART_TAIL_RE, "").trim();
+  return out && out !== t ? out : t;
+}
+
+const QUERY_STOP_WORDS = new Set(["the", "a", "an", "and", "of", "&", "und", "le", "la", "el", "los", "las"]);
+
+/**
+ * The song queries tried for one track, best first, each "artist title" as an indexer or
+ * Soulseek wants it: (1) the artist and the core title (credits, catalogue labels, remaster
+ * notes dropped); (2) for a long title (more than 6 words, or a query of more than 7), the artist's
+ * first significant word and the first 5 words of the title without brackets ("SaD Fade To
+ * Black"); (3) the same without a trailing "part N" counter. Duplicates (by words) are left out.
+ */
+export function trackQueryVariants(artist: string, title: string): string[] {
+  const artistText = indexerQueryText(artist);
+  const rawTitle = String(title || "");
+  const coreTitle = indexerQueryText(coreTrackTitle(rawTitle));
+  if (!coreTitle) return [];
+  const out: string[] = [];
+  const add = (q: string) => {
+    const t = q.replace(/\s{2,}/g, " ").trim();
+    if (t && !out.some((o) => normalizeTitleKey(o) === normalizeTitleKey(t))) out.push(t);
+  };
+  add(`${artistText} ${coreTitle}`);
+  const words = (t: string) => t.split(/\s+/).filter(Boolean);
+  const bracketless = indexerQueryText(rawTitle.replace(/[\(\[\{][^()\[\]{}]*[\)\]\}]/g, " "));
+  if (words(indexerQueryText(rawTitle)).length > 6 || words(`${artistText} ${coreTitle}`).length > 7) {
+    const sig = words(artistText).filter((w) => !QUERY_STOP_WORDS.has(w.toLowerCase()));
+    const lead = sig.length === 0 ? [] : sig[0].length <= 2 && sig.length > 1 ? sig.slice(0, 2) : sig.slice(0, 1);
+    const shortTitle = words(bracketless || coreTitle).slice(0, 5).join(" ");
+    add(`${lead.join(" ")} ${shortTitle}`);
+  }
+  const noTail = stripPartTail(coreTitle);
+  if (noTail !== coreTitle) add(`${artistText} ${noTail}`);
+  return out;
+}
+
+/**
  * normalizeText for titles in any script: accents folded and punctuation dropped like
  * normalizeText, but letters and digits of other scripts (Japanese, Korean, Cyrillic...) are kept,
  * so such titles still compare. normalizeText turns them into nothing.

@@ -28,6 +28,7 @@ import { getCuratedConcertById, type CuratedConcert } from "./concerts.ts";
 import {
   audioFormatOfPath,
   coreReleaseTitle,
+  coreTrackTitle,
   extractFeaturedFromTitle,
   fileTitleCandidates,
   classifyLead,
@@ -51,9 +52,11 @@ import {
   similarityOfNormalized,
   stripEditionSuffix,
   stripFeaturing,
+  stripPartTail,
   textSimilarity,
   titleSignature,
   tokenSetOfNormalized,
+  trackQueryVariants,
   versionWordsOf,
   videoFormatOfPath,
 } from "./normalize.ts";
@@ -93,7 +96,8 @@ const MAX_AUDIO_FILES_PER_RELEASE = 400;
 const MAX_USENET_PROBES = 10;
 const MAX_PLUGIN_PROBES = 4;
 // Room for every kind the shortlist can hold: 6 Debrid, the Usenet ones, 4 unconfirmed, the plugin ones.
-const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
+const MAX_MAYBE_PROBES = 4;
+const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES + MAX_MAYBE_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 /** Probing for a second source beside a lone partial or archive-member one stops after this long. */
 const MORE_PROBING_MAX_MS = 20_000;
@@ -101,6 +105,14 @@ const MORE_PROBING_MAX_MS = 20_000;
 const REPEAT_MIN_GAP_MS = 2000;
 const REPEAT_WINDOW_MS = 90_000;
 const SERVED_TTL_MS = 5 * 60 * 1000;
+interface TrackQueryState {
+  tried: string[];
+  attempts: Record<string, number>;
+}
+const TRACK_QUERY_TTL_MS = 5 * 60 * 1000;
+function trackQueryKey(albumId: string, itemId: string): string {
+  return `trk_q_v1:${albumId}:${itemId}`;
+}
 function servedKey(itemId: string): string {
   return `served_v1:${itemId}`;
 }
@@ -475,6 +487,10 @@ interface ResolveStage {
   searchIncomplete?: boolean;
   /** When the stage's probing began: lone partial sources are only waited past for so long. */
   startedAt?: number;
+  /** A song-query stage: it adds to the album's record without ending the album's own search. */
+  trackPhase?: boolean;
+  /** The album record's `exhausted` as the song query found it (that search says nothing of the album's shortlist). */
+  priorExhausted?: boolean;
 }
 
 /** A release a source plugin answered the search with: Ether lists and opens it through that plugin. */
@@ -719,6 +735,9 @@ export function archiveMembersContradictAlbum(
   return !opts?.duplicatesOnly && members.length >= 3 && named * 2 < members.length;
 }
 
+/** A release name that is a compilation, a various-artists pack or somebody's "presents": it may hold many artists' songs. */
+const COMPILATION_NAME_RE = /\b(?:various|presents?|compilation|va|tribute|soundtrack|ost|sampler|mixtape)\b/i;
+
 export function preScoreAlbumCandidate(
   candidate: SourceCandidate,
   album: {
@@ -735,16 +754,24 @@ export function preScoreAlbumCandidate(
     altTitle?: string;
     /** Tracks the library lists on the album. */
     trackCount?: number;
+    /**
+     * A single or a 1-3 track release, or a song query: a release that names the artist (or a
+     * credited or featured one, or is a compilation) but not this title is not dropped by its
+     * name ("maybe"): its file list decides.
+     */
+    lenient?: boolean;
+    /** Other artists credited on the wanted song (featured, track artist). */
+    otherArtists?: string[];
   },
   pref: QualityPreference,
   options?: { allowUnconfirmedTorrent?: boolean }
-): { accepted: boolean; score: number; reasons: string[] } {
+): { accepted: boolean; score: number; reasons: string[]; maybe?: boolean; artistRatio?: number } {
   const relTitle = String(candidate.title || "").trim();
   if (!relTitle) return { accepted: false, score: 0, reasons: ["empty candidate title"] };
 
   const variousArtists = isVariousArtistsName(album.artistName);
   const rej = isRejectedReleaseForRequest(relTitle, album.title, album.releaseType, {
-    allowCompilations: Boolean(album.recording) || variousArtists,
+    allowCompilations: Boolean(album.recording) || Boolean(album.lenient) || variousArtists,
   });
   if (rej.rejected) {
     return { accepted: false, score: 0, reasons: [rej.reason || "rejected release type"] };
@@ -812,7 +839,7 @@ export function preScoreAlbumCandidate(
   albumRatio = Math.max(albumRatio, own.ratio);
   if (album.altTitle) {
     // The recording path: a single is named after the song, not after the album being tried.
-    albumRatio = Math.max(albumRatio, tokenRatioOf(coreReleaseTitle(album.altTitle)).ratio);
+    albumRatio = Math.max(albumRatio, tokenRatioOf(coreReleaseTitle(album.altTitle)).ratio, tokenRatioOf(coreTrackTitle(album.altTitle)).ratio);
   }
   // A box set lists the albums it holds: a release of one of them cannot carry its title.
   const isCollection =
@@ -820,13 +847,26 @@ export function preScoreAlbumCandidate(
     (album.trackCount || 0) >= 60;
   let namePenalty = 0;
 
+  // "maybe": the name alone does not tie the release to the song, but a release of this kind may
+  // still hold it; the file listing decides (a few such releases only are listed: see MAX_MAYBE_PROBES).
+  let maybe = false;
   if (artistRatio < 0.6) {
     // A source plugin's folder is often named after the album alone ("Discovery [FLAC]",
     // a soundtrack's own title): with the whole title in it that is name enough.
     const strongTitle = own.ratio >= 1 && (own.tokens >= 3 || own.length >= 12) && !isGenericAlbumTitle(cleanAlbum);
+    // One distinctive word of the artist's name in the release's ("SaD - Fade To Black" for "SaD - Symphony and Metallica").
+    const artistWordInName = artistTokens.some((t) => t.length >= 3 && !["and", "the", "der", "die", "das", "les", "los", "feat"].includes(t) && relWords.has(t));
+    const namesOtherArtist = (album.otherArtists || []).some((a) => {
+      const toks = normalizeText(a).split(/\s+/).filter((t) => t.length >= 2 && t !== "the");
+      return toks.length > 0 && toks.every((t) => normRel.includes(t));
+    });
     if (isPluginCandidate(candidate) && strongTitle) {
       namePenalty += 8;
       reasons.push("no artist in name");
+    } else if (album.lenient && (namesOtherArtist || artistWordInName || COMPILATION_NAME_RE.test(relTitle))) {
+      maybe = true;
+      namePenalty += 30;
+      reasons.push(namesOtherArtist ? "names a credited artist" : artistWordInName ? "names part of the artist" : "compilation or presents: file listing decides");
     } else {
       return { accepted: false, score: 0.1, reasons: ["artist name mismatch"] };
     }
@@ -835,6 +875,10 @@ export function preScoreAlbumCandidate(
     if (isCollection && artistRatio >= 0.6) {
       namePenalty += 25;
       reasons.push("release of one album of a collection");
+    } else if (album.lenient && (artistRatio >= 0.6 || maybe)) {
+      maybe = true;
+      namePenalty += 30;
+      reasons.push("title not in name: file listing decides");
     } else {
       return { accepted: false, score: 0.2, reasons: ["album title mismatch"] };
     }
@@ -931,7 +975,7 @@ export function preScoreAlbumCandidate(
     }
   }
 
-  return { accepted: true, score, reasons };
+  return { accepted: true, score, reasons, ...(maybe ? { maybe: true } : {}), artistRatio };
 }
 
 export interface ExpandedReleaseFile {
@@ -1989,7 +2033,7 @@ export class AlbumResolver {
     const cached = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (cached) {
       if (cached.negative) {
-        return this.resolveRecording(item, excluded, this.negativeResponseTtlSec(cached));
+        return this.missOnAlbum(item, excluded, albumId, this.negativeResponseTtlSec(cached), false);
       }
       const sources = this.buildTrackSources(item, cached.releases, excluded);
       if (sources.length > 0) {
@@ -2015,9 +2059,10 @@ export class AlbumResolver {
       } else {
         // The album was found but not this song on it: look for the song on its other releases.
         // A search that never finished is no verdict: a short answer, and nothing remembered.
-        return this.resolveRecording(
+        return this.missOnAlbum(
           item,
           excluded,
+          albumId,
           cached.searchIncomplete ? INCOMPLETE_EMPTY_TTL_SEC : NEGATIVE_RESPONSE_EMPTY_TTL_SEC,
           Boolean(cached.searchIncomplete)
         );
@@ -2044,18 +2089,76 @@ export class AlbumResolver {
 
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (!fresh || fresh.releases.length === 0) {
-      return this.resolveRecording(item, excluded, fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC);
+      return this.missOnAlbum(item, excluded, albumId, fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC, false, true);
     }
     const sources = this.buildTrackSources(item, fresh.releases, excluded);
     if (sources.length === 0) {
-      return this.resolveRecording(
+      // A fresh album search ran in this call (and a resumed one has more to list): the song's
+      // own search follows on the next call.
+      return this.missOnAlbum(
         item,
         excluded,
+        albumId,
         fresh.searchIncomplete ? INCOMPLETE_EMPTY_TTL_SEC : NEGATIVE_RESPONSE_EMPTY_TTL_SEC,
-        Boolean(fresh.searchIncomplete)
+        Boolean(fresh.searchIncomplete),
+        true
       );
     }
     return this.offerSources(item, sources, fresh.releases, this.repeatOf(item, excluded), albumId);
+  }
+
+  /**
+   * The song queries of a track not yet tried, in order: "artist title" with the catalogue's labels
+   * dropped, a short form for a long title, the form without a "part N" tail (see
+   * trackQueryVariants), the album's credit beside the track's. What the album search sent is left out.
+   */
+  private pendingTrackQueries(item: KindItem, albumId: string): string[] {
+    const hints = (item.hints || {}) as Record<string, unknown>;
+    const trackArtist = String(hints.trackArtistName || item.fields?.artistName || hints.artistName || "").trim();
+    const albumArtist = String(hints.artistName || item.fields?.artistName || "").trim();
+    const all: string[] = [];
+    for (const q of [
+      ...trackQueryVariants(trackArtist, item.title),
+      ...(albumArtist && normalizeText(albumArtist) !== normalizeText(trackArtist) ? trackQueryVariants(albumArtist, item.title).slice(0, 1) : []),
+    ]) {
+      if (!all.some((a) => normalizeText(a) === normalizeText(q))) all.push(q);
+    }
+    const albumTitle = String(hints.albumTitle || item.fields?.albumTitle || "");
+    const sentByAlbum = new Set(
+      [trackArtist, albumArtist].filter(Boolean).map((a) => normalizeText(`${indexerQueryText(a)} ${indexerQueryText(coreReleaseTitle(albumTitle))}`))
+    );
+    const state = this.cache.get<TrackQueryState>(trackQueryKey(albumId, item.id));
+    return all
+      .filter((q) => !sentByAlbum.has(normalizeText(q)) && !(state?.tried || []).includes(q))
+      .slice(0, 4);
+  }
+
+  private markTrackQuery(albumId: string, itemId: string, query: string, final: boolean): void {
+    const key = trackQueryKey(albumId, itemId);
+    const state = this.cache.get<TrackQueryState>(key) || { tried: [], attempts: {} };
+    state.attempts[query] = (state.attempts[query] || 0) + 1;
+    if ((final || state.attempts[query] >= 2) && !state.tried.includes(query)) state.tried.push(query);
+    this.cache.set(key, state, TRACK_QUERY_TTL_MS);
+  }
+
+  /**
+   * The album's own search gave nothing that serves this song: the song itself is searched for
+   * ("artist title"), one query per call and each on its own call (a call is killed at 5 s). What
+   * is found is listed like any release and added to the album's record. When every query has
+   * been tried (they are remembered for a few minutes) the song's other releases are looked at.
+   */
+  private missOnAlbum(item: KindItem, excluded: Set<string>, albumId: string, emptyTtlSec: number, noMemory: boolean, ranSearchThisCall = false): KindResolveResponse {
+    const inFlight = this.cache.get<ResolveStage>(albumStageKey(albumId));
+    const next = inFlight?.trackPhase ? "" : this.pendingTrackQueries(item, albumId)[0];
+    if (!inFlight?.trackPhase && !next) return this.resolveRecording(item, excluded, emptyTtlSec, noMemory);
+    // The album search ran in this very call: the song query waits for the next one.
+    if (ranSearchThisCall) return { pending: true, retryInMs: 250, sources: [] };
+    const step = this.stepResolveAlbum(albumId, item, excluded, RESOLVE_STEP_BUDGET_MS, true, next || undefined);
+    if (!step.done) return { pending: true, retryInMs: step.retryInMs ?? 250, sources: [] };
+    const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
+    const sources = fresh && !fresh.negative ? this.buildTrackSources(item, fresh.releases, excluded) : [];
+    if (sources.length > 0 && fresh) return this.offerSources(item, sources, fresh.releases, this.repeatOf(item, excluded), albumId);
+    return this.missOnAlbum(item, excluded, albumId, emptyTtlSec, noMemory, true);
   }
 
   /**
@@ -2472,7 +2575,9 @@ export class AlbumResolver {
     item: KindItem,
     excluded: Set<string>,
     budgetMs: number,
-    allowUsenetCheck: boolean
+    allowUsenetCheck: boolean,
+    /** The song query phase: only this query is sent; releases found are added to the album's. */
+    trackQuery?: string
   ): { done: boolean; verifiedCount: number; retryInMs?: number; inconclusive?: boolean } {
     const startMs = this.env.now();
     const excludedSig = excludedSigOf(excluded);
@@ -2499,15 +2604,23 @@ export class AlbumResolver {
 
       // A search that goes on for another track of an album already listed starts from what the
       // earlier one found and leaves out the candidates it listed.
-      const prior = excluded.size === 0 ? this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId)) : null;
+      const priorRec = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
+      const prior = excluded.size === 0 || trackQuery ? priorRec : null;
       const earlier = prior && !prior.negative && prior.releases.length > 0 ? prior : null;
-      const skipRefs = earlier?.probedRefs || [];
-      const searched = this.searchAndRankCandidates(album, excluded, startMs, budgetMs, new Set(skipRefs), item.id);
+      const skipRefs = (trackQuery ? priorRec?.probedRefs : earlier?.probedRefs) || [];
+      const searched = this.searchAndRankCandidates(album, excluded, startMs, budgetMs, new Set(skipRefs), item.id, trackQuery);
       if (searched.deferredInFlight) {
         // Another worker is currently running the same album search; yield briefly without
         // firing a duplicate parallel search or caching a premature negative result.
         return { done: false, verifiedCount: 0, retryInMs: 350 };
       }
+      if (trackQuery) {
+        // The song query found nothing to list: the album's record stands as it was. One that
+        // came back unfinished and empty is asked once more, then counts as tried.
+        this.env.log("info", `resolve-album: song query ${album.id} "${trackQuery}" listed ${searched.ordered.length} of ${searched.rawCount}`);
+        this.markTrackQuery(albumId, item.id, trackQuery, !(searched.incomplete && searched.ordered.length === 0));
+        if (searched.ordered.length === 0) return { done: true, verifiedCount: 0 };
+      } else {
       // Logged for a search that ran, not for each poll that waited on one.
       this.env.log(
         "info",
@@ -2518,11 +2631,13 @@ export class AlbumResolver {
       if (searched.incomplete && searched.ordered.length === 0) {
         return this.inconclusive(albumId);
       }
+      }
       stage = {
         album,
         wantedId: item.id,
         skipRefs,
-        resumes: earlier ? (earlier.resumes || 0) + 1 : 0,
+        resumes: trackQuery ? (priorRec?.resumes || 0) : earlier ? (earlier.resumes || 0) + 1 : 0,
+        ...(trackQuery ? { trackPhase: true, priorExhausted: Boolean(priorRec?.exhausted) } : {}),
         preRanked: searched.ordered.slice(0, MAX_FILE_LIST_PROBES),
         nextIdx: 0,
         verified: earlier ? earlier.releases.filter((r) => !r.isArchiveFallback && !r.isUnconfirmedDebridFallback).map((r) => ({ ...r })) : [],
@@ -2671,6 +2786,11 @@ export class AlbumResolver {
     } else {
       finalReleases = fallbacks();
     }
+    if (stage.trackPhase && finalReleases.length === 0) {
+      // The song query led to nothing playable: the album's record stands as it was.
+      this.cache.delete(albumStageKey(albumId));
+      return { done: true, verifiedCount: 0 };
+    }
     if (finalReleases.length === 0 && stage.searchIncomplete) {
       // Nothing playable among what the indexers had answered so far: no verdict yet.
       this.cache.delete(albumStageKey(albumId));
@@ -2688,7 +2808,9 @@ export class AlbumResolver {
     const listedRefs = stage.preRanked.slice(0, stage.nextIdx).map((x) => candidateRefOf(x.cand));
     const probedRefs = [...(stage.skipRefs || []), ...listedRefs].slice(-80);
     // An unfinished search says nothing about what else exists: never "exhausted".
-    const exhausted = !stage.searchIncomplete && (stage.nextIdx >= stage.preRanked.length || (stage.resumes || 0) >= MAX_ALBUM_RESUMES);
+    const exhausted = stage.trackPhase
+      ? Boolean(stage.priorExhausted)
+      : !stage.searchIncomplete && (stage.nextIdx >= stage.preRanked.length || (stage.resumes || 0) >= MAX_ALBUM_RESUMES);
     const record: CachedAlbumResolution = {
       albumId,
       resolvedAt: now,
@@ -2778,7 +2900,9 @@ export class AlbumResolver {
     startMs: number,
     budgetMs: number,
     skipRefs: Set<string> = new Set(),
-    wantedId?: string
+    wantedId?: string,
+    /** The song query phase: only this query is sent, and names are judged leniently. */
+    trackQuery?: string
   ): {
     ordered: Array<{ cand: SourceCandidate; score: number }>;
     rawCount: number;
@@ -2829,19 +2953,34 @@ export class AlbumResolver {
     const looksLikeCollection =
       /\b(?:collection|box|complete|anthology|studio albums?|discography)\b/i.test(album.title) || album.tracks.length >= 60;
     if (wantedTrack && (recording || looksLikeCollection)) {
-      const trackArtist = indexerQueryText(wantedTrack.artistName || album.artistName) || cleanArtist;
-      const trackTitle = indexerQueryText(coreReleaseTitle(wantedTrack.title));
-      const trackQuery = trackTitle ? `${trackArtist} ${trackTitle}`.trim() : "";
-      if (trackQuery && !queries.some((q) => normalizeText(q) === normalizeText(trackQuery))) {
-        queries.splice(1, 0, trackQuery);
+      const trackQuery0 = trackQueryVariants(wantedTrack.artistName || album.artistName, wantedTrack.title)[0] || "";
+      if (trackQuery0 && !queries.some((q) => normalizeText(q) === normalizeText(trackQuery0))) {
+        queries.splice(1, 0, trackQuery0);
         queries.length = Math.min(queries.length, 4);
       }
     }
+    // A title with a "part 2" / "часть 1" tail is also asked without it.
+    const albumNoTail = indexerQueryText(coreReleaseTitle(stripPartTail(album.title)));
+    if (albumNoTail && albumNoTail !== cleanAlbum) {
+      queries.splice(1, 0, `${cleanArtist} ${albumNoTail}`);
+      queries.length = Math.min(queries.length, 4);
+    }
+    if (trackQuery) {
+      queries.length = 0;
+      queries.push(trackQuery);
+    }
+    // A single, a short release or a song query: a name that carries the artist, or is a
+    // compilation, but not this title is looked into, not dropped (a few of them: MAX_MAYBE_PROBES).
+    const lenient = Boolean(trackQuery) || album.tracks.length <= 3;
+    const otherArtists = wantedTrack
+      ? Array.from(new Set([...(wantedTrack.featuredArtists || []), ...extractFeaturedFromTitle(wantedTrack.title), wantedTrack.artistName || ""].map((a) => a.trim()).filter((a) => a && normalizeText(a) !== normalizeText(album.artistName))))
+      : [];
     const scoredAlbum = {
       ...album,
       ...(altArtistName ? { altArtistName } : {}),
       trackCount: album.tracks.length,
-      ...(recording ? { recording: true, altTitle: wantedTrack?.title || album.tracks[0]?.title } : {}),
+      ...(recording || trackQuery ? { recording: true, altTitle: wantedTrack?.title || album.tracks[0]?.title } : {}),
+      ...(lenient ? { lenient: true, otherArtists } : {}),
     };
 
     const interactive = budgetMs <= RESOLVE_STEP_BUDGET_MS;
@@ -2854,7 +2993,7 @@ export class AlbumResolver {
 
     // A candidate is scored once per search, however often ranking asks: scoring a hundred
     // release names inside a sort is most of the 5 s a /resolve call is given.
-    const scored = new Map<string, { accepted: boolean; score: number; reasons: string[] }>();
+    const scored = new Map<string, { accepted: boolean; score: number; reasons: string[]; maybe?: boolean; artistRatio?: number }>();
     // Scoring stops when the slice has used its time: a /resolve call cut off at 5 s keeps
     // nothing, so the names not reached are left out of this search rather than losing them all.
     const SCORING_DEADLINE_MS = 2600;
@@ -2891,7 +3030,7 @@ export class AlbumResolver {
     const isWellMatched = (cand: SourceCandidate): boolean => {
       if (!isUsenetCandidate(cand) && !isPluginCandidate(cand) && !cand.cached && !cand.infoHash && !cand.magnet) return false;
       const pre = scoreOf(cand, true);
-      return pre.accepted && pre.score >= 55;
+      return pre.accepted && !pre.maybe && pre.score >= 55;
     };
 
     const prioritizeForMemo = (cands: SourceCandidate[]): SourceCandidate[] => {
@@ -3001,6 +3140,7 @@ export class AlbumResolver {
 
     // Pre-rank candidates (rejecting compilations, discographies, live bootlegs, lossy if lossless_only).
     const preRanked: Array<{ cand: SourceCandidate; score: number }> = [];
+    const maybes: Array<{ cand: SourceCandidate; score: number; shareArtist: boolean }> = [];
     const droppedAtNames: DroppedCandidate[] = [];
     for (const cand of rawCandidates) {
       if (skipRefs.size > 0 && skipRefs.has(candidateRefOf(cand))) continue;
@@ -3015,7 +3155,18 @@ export class AlbumResolver {
         droppedAtNames.push({ name: cand.title || "", indexer: cand.indexer, reason: pre.reasons[0] || "no reason" });
         continue;
       }
+      if (pre.maybe) {
+        maybes.push({ cand, score: pre.score, shareArtist: (pre.artistRatio ?? 0) >= 0.6 });
+        continue;
+      }
       preRanked.push({ cand, score: pre.score });
+    }
+    // The few "maybe" releases that are listed: those whose name shares the artist first, then the
+    // largest (the likeliest to be a compilation or an edition holding the song).
+    maybes.sort((a, b) => Number(b.shareArtist) - Number(a.shareArtist) || (b.cand.size || 0) - (a.cand.size || 0) || b.score - a.score);
+    const maybeRanked = maybes.slice(0, MAX_MAYBE_PROBES).map(({ cand, score }) => ({ cand, score }));
+    for (const m of maybes.slice(MAX_MAYBE_PROBES)) {
+      droppedAtNames.push({ name: m.cand.title || "", indexer: m.cand.indexer, reason: "name does not tie it to the song (beyond the few listed)" });
     }
 
     preRanked.sort((a, b) => b.score - a.score);
@@ -3047,7 +3198,7 @@ export class AlbumResolver {
         if (!cand.infoHash && !cand.magnet) continue;
         if (skipRefs.size > 0 && skipRefs.has(candidateRefOf(cand))) continue;
         const pre = scoreOf(cand, true);
-        if (!pre.accepted || pre.score < 45) continue;
+        if (!pre.accepted || pre.maybe || pre.score < 45) continue;
         unconfirmedDebrid.push({ cand, score: pre.score });
       }
       unconfirmedDebrid.sort((a, b) => {
@@ -3061,10 +3212,11 @@ export class AlbumResolver {
       ...usenetDedup.slice(0, MAX_USENET_PROBES),
       ...unconfirmedDebrid.slice(0, 4),
       ...pluginRanked.slice(0, MAX_PLUGIN_PROBES),
+      ...maybeRanked,
     ];
     this.env.log(
       "info",
-      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)} plugin=${pluginRanked.length}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
+      `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)} plugin=${pluginRanked.length} maybe=${maybeRanked.length}/${maybes.length}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
     );
     const droppedLine = formatDroppedAtNameRanking(album.id, droppedAtNames, rawCandidates.length);
     if (droppedLine) this.env.log("debug", droppedLine);
