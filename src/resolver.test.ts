@@ -4512,3 +4512,20 @@ test("fix 4: a single is looked for on a release named for the artist or a compi
   });
   assert.equal(h5.play(trackItemFor(accidental, 0)).sources.length, 0);
 });
+
+test("fix 7: the recording path says why it stops; each served source has one line with file, length and tolerance", () => {
+  const album = albumOf("al-9530", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 3), {}, 200);
+  const h = harness(album, () => ({ candidates: [] }));
+  const item = trackItemFor(album, 0);
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases: [], negative: true }, 3_600_000);
+  const r = h.play(item);
+  assert.equal(r.sources.length, 0);
+  assert.ok(h.logs.some((l) => /resolve-recording: tr-953001 "Disc Song 1" stops: no valid ISRC/.test(l)), h.logs.join("\n"));
+  assert.ok(h.logs.every((l) => !l.includes("\n") && l.length < 400), "single-line, compact");
+  // A served source.
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, releases: [verifiedFor(album, "rel-a", { all: true })] }, 3_600_000);
+  h.logs.length = 0;
+  assert.equal(h.play(item).sources.length, 1);
+  const line = h.logs.find((l) => l.startsWith("serve "));
+  assert.ok(line && /"rel-a"/.test(line) && /file="01 Disc Song 1\.flac"/.test(line) && /dur=200s/.test(line) && /tol=7/.test(line), String(line));
+});

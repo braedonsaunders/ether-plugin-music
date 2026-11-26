@@ -2024,7 +2024,10 @@ export class AlbumResolver {
 
     const hints = (item.hints || {}) as Record<string, unknown>;
     const albumId = String(item.parentId || hints.albumId || "");
-    if (!albumId) return { sources: [] };
+    if (!albumId) {
+      this.env.log("debug", `resolve: ${item.id} no album id on the item; nothing to search`);
+      return { sources: [] };
+    }
 
     const excluded = new Set(
       (Array.isArray(req.client?.exclude) ? req.client!.exclude : []).map((s) => String(s))
@@ -2084,6 +2087,7 @@ export class AlbumResolver {
       if (excluded.size === 0 && cached && !cached.negative && cached.releases.length > 0) {
         return this.resolveRecording(item, excluded, INCOMPLETE_EMPTY_TTL_SEC, true);
       }
+      this.env.log("debug", `resolve: ${item.id} album search stayed unfinished; answering nothing for now`);
       return { sources: [], ttlSec: INCOMPLETE_EMPTY_TTL_SEC };
     }
 
@@ -2150,7 +2154,10 @@ export class AlbumResolver {
   private missOnAlbum(item: KindItem, excluded: Set<string>, albumId: string, emptyTtlSec: number, noMemory: boolean, ranSearchThisCall = false): KindResolveResponse {
     const inFlight = this.cache.get<ResolveStage>(albumStageKey(albumId));
     const next = inFlight?.trackPhase ? "" : this.pendingTrackQueries(item, albumId)[0];
-    if (!inFlight?.trackPhase && !next) return this.resolveRecording(item, excluded, emptyTtlSec, noMemory);
+    if (!inFlight?.trackPhase && !next) {
+      this.env.log("debug", `resolve: ${item.id} "${item.title}" not on the album's releases and every song query was tried; looking at the song's other releases`);
+      return this.resolveRecording(item, excluded, emptyTtlSec, noMemory);
+    }
     // The album search ran in this very call: the song query waits for the next one.
     if (ranSearchThisCall) return { pending: true, retryInMs: 250, sources: [] };
     const step = this.stepResolveAlbum(albumId, item, excluded, RESOLVE_STEP_BUDGET_MS, true, next || undefined);
@@ -2257,27 +2264,43 @@ export class AlbumResolver {
   private resolveRecording(item: KindItem, excluded: Set<string>, emptyTtlSec: number, noMemory = false): KindResolveResponse {
     const hints = (item.hints || {}) as Record<string, unknown>;
     const recording = recordingOf(String(hints.isrc || ""));
-    if (!recording) return { sources: [], ttlSec: emptyTtlSec };
+    if (!recording) {
+      this.env.log("debug", `resolve-recording: ${item.id} "${item.title}" stops: no valid ISRC (${String(hints.isrc || "none").slice(0, 16)})`);
+      return { sources: [], ttlSec: emptyTtlSec };
+    }
     const isrc = recording.slice("isrc:".length);
     const recId = `rec-${isrc}`;
     const done = this.cache.get<CachedAlbumResolution>(albumCacheKey(recId));
     if (done) {
-      if (done.negative) return { sources: [], ttlSec: Math.min(emptyTtlSec, this.negativeResponseTtlSec(done)) };
+      if (done.negative) {
+        this.env.log("debug", `resolve-recording: ${recording} stops: remembered as having no other release with a copy`);
+        return { sources: [], ttlSec: Math.min(emptyTtlSec, this.negativeResponseTtlSec(done)) };
+      }
       const doneReleases = releasesForItem(done.releases, item.id);
       const sources = this.buildTrackSources(item, doneReleases, excluded);
       if (sources.length > 0) return this.offerSources(item, sources, doneReleases, this.repeatOf(item, excluded), String(item.parentId || ""));
-      if (excluded.size === 0 || done.excludedSig === excludedSigOf(excluded)) return { sources: [], ttlSec: emptyTtlSec };
+      if (excluded.size === 0 || done.excludedSig === excludedSigOf(excluded)) {
+        this.env.log("debug", `resolve-recording: ${recording} stops: the releases found do not serve ${item.id}${excluded.size > 0 ? " outside the exclusions" : ""}`);
+        return { sources: [], ttlSec: emptyTtlSec };
+      }
       this.cache.delete(albumCacheKey(recId));
     }
     let plan = this.cache.get<RecordingPlan>(recordingPlanKey(isrc));
     if (!plan) {
       const looked = this.catalog.recordingReleases(isrc);
-      if (looked.status === "busy") return { pending: true, retryInMs: 1200, sources: [] };
+      if (looked.status === "busy") {
+        this.logOnce(`rec_busy:${isrc}`, `resolve-recording: ${recording} waits: MusicBrainz is busy`);
+        return { pending: true, retryInMs: 1200, sources: [] };
+      }
       // MusicBrainz gave no answer (5xx, network, timeout, bad body): without its releases there
       // is nothing to search, but that is not "no such recording": nothing is remembered.
-      if (looked.status === "failed") return { sources: [], ttlSec: 30 };
+      if (looked.status === "failed") {
+        this.env.log("debug", `resolve-recording: ${recording} stops: MusicBrainz gave no answer (nothing remembered)`);
+        return { sources: [], ttlSec: 30 };
+      }
       const candidates = looked.status === "ok" ? pickRecordingReleases(looked.releases, String(hints.albumTitle || "")) : [];
       if (candidates.length === 0) {
+        this.env.log("debug", `resolve-recording: ${recording} stops: no other release of the recording to search (${looked.status === "ok" ? `${looked.releases.length} known, own title and duplicates left out` : looked.status})${noMemory ? "" : "; remembered"}`);
         if (!noMemory) this.rememberRecordingMiss(recId);
         return { sources: [], ttlSec: emptyTtlSec };
       }
@@ -2294,7 +2317,10 @@ export class AlbumResolver {
     }
     const step = this.stepResolveAlbum(synthId, item, excluded, RESOLVE_STEP_BUDGET_MS, true);
     if (!step.done) return { pending: true, retryInMs: step.retryInMs ?? 250, sources: [] };
-    if (step.inconclusive) return { sources: [], ttlSec: 30 };
+    if (step.inconclusive) {
+      this.env.log("debug", `resolve-recording: ${recording} stops: the search for release ${plan.idx + 1} stayed unfinished`);
+      return { sources: [], ttlSec: 30 };
+    }
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(synthId));
     if (fresh && !fresh.negative && fresh.releases.length > 0) {
       this.cache.set(albumCacheKey(recId), fresh, ALBUM_CACHE_TTL_MS);
@@ -2305,12 +2331,21 @@ export class AlbumResolver {
     }
     plan.idx++;
     if (plan.idx >= plan.candidates.length) {
+      this.env.log("debug", `resolve-recording: ${recording} stops: none of ${plan.candidates.length} releases serves "${item.title}"${noMemory ? "" : "; remembered"}`);
       this.cache.delete(recordingPlanKey(isrc));
       if (!noMemory) this.rememberRecordingMiss(recId);
       return { sources: [], ttlSec: emptyTtlSec };
     }
     this.cache.set(recordingPlanKey(isrc), plan, ALBUM_CACHE_TTL_MS);
     return { pending: true, retryInMs: 250, sources: [] };
+  }
+
+  /** A debug line said once within a short while (a waiting app polls several times a second). */
+  private logOnce(key: string, message: string, ttlMs = 15_000): void {
+    const k = `logged:${key}`;
+    if (this.cache.get<number>(k)) return;
+    this.cache.set(k, 1, ttlMs);
+    this.env.log("debug", message);
   }
 
   private rememberRecordingMiss(recId: string): void {
