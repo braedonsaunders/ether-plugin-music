@@ -1470,7 +1470,11 @@ export function matchTracksInRelease(
   // Version", "Single Version") is no mark the file must carry: the catalogue names the song's
   // source, files and releases rarely repeat it. Real differences (live, remix, acoustic, demo,
   // instrumental...) stay.
-  const catalogueLabel = (q: string): boolean => Boolean(album.recordingTarget) && CATALOGUE_LABEL_RE.test(q);
+  // The same holds on the album path for a release that is this album (its name carries the
+  // album's core title, any edition): "Caravan.flac" serves "Caravan (Concert Version)".
+  const coreAlbumKey = normalizeTitleKey(coreReleaseTitle(album.title));
+  const releaseIsThisAlbum = !album.recordingTarget && coreAlbumKey.length >= 4 && !isGenericAlbumTitle(coreAlbumKey) && relPhrases.includes(` ${coreAlbumKey} `);
+  const catalogueLabel = (q: string): boolean => (Boolean(album.recordingTarget) || releaseIsThisAlbum) && CATALOGUE_LABEL_RE.test(q);
   const ignoreQual = (q: string): boolean =>
     albumLevel.has(q) || catalogueLabel(q) || (relPhrases.includes(` ${q} `) && (Boolean(album.recordingTarget) || albumPhrases.includes(` ${q} `)));
 

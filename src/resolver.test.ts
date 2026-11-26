@@ -4353,7 +4353,9 @@ test("fix 5: on the recording path catalogue labels are optional, real version d
   assert.equal(serves(rec("Caravan"), "Caravan (Live).flac"), false);
   // The same labels are strict for a whole album (not the recording path).
   const album = albumOf("al-9507", "The Band", "The Last Waltz", 2002, ["Caravan (Concert Version)", "Other One", "Third One", "Fourth One"]);
-  assert.equal(Object.keys(matchTracksInRelease(album, "The Band - The Last Waltz [FLAC]", filesOf(["Caravan.flac", "Other One.flac", "Third One.flac", "Fourth One.flac"]), "flac_preferred").tracks).includes(album.tracks[0].id), false);
+  // (Changed in build 19: a release of this very album forgives the catalogue label; another release does not.)
+  assert.equal(Object.keys(matchTracksInRelease(album, "The Band - The Last Waltz [FLAC]", filesOf(["Caravan.flac", "Other One.flac", "Third One.flac", "Fourth One.flac"]), "flac_preferred").tracks).includes(album.tracks[0].id), true);
+  assert.equal(Object.keys(matchTracksInRelease(album, "The Band - Big Band Greats [FLAC]", filesOf(["Caravan.flac", "Other One.flac", "Third One.flac", "Fourth One.flac"]), "flac_preferred").tracks).includes(album.tracks[0].id), false);
 
   // recordingAlbum copies the featured artists from the item.
   const base = albumOf("al-9508", "Hozier", "Some Album", 2020, ["Caravan (feat. Van Morrison) (Concert Version)", "Two", "Three"]);
@@ -4639,4 +4641,19 @@ test("build 19 / 1: an exhausted record with one source the host keeps coming ba
   advance(b.h, 10_000);
   b.h.resolver.resolve({ item });
   assert.equal(albumSearches(), 2, b.sent.join(" | "));
+});
+
+test("build 19 / 2: on the album path a release of this album serves a title with catalogue labels from a plain file", () => {
+  const titles = ["Caravan (feat. Van Morrison) (Concert Version)", ...trackTitles("Waltz Song", 53)];
+  const album = albumOf("al-9560", "The Band", "The Last Waltz (Deluxe Version)", 2002, titles);
+  const files = (first: string) => [first, ...titles.slice(1, 30).map((t, i) => `${pad2(i + 2)} ${t}.flac`)];
+  const serves = (release: string, name: string) =>
+    Object.keys(matchTracksInRelease(album, release, filesOf(files(name), 40_000_000), "flac_preferred").tracks).includes(album.tracks[0].id);
+  const rel = "The Band - The Last Waltz [FLAC]";
+  for (const ok of ["01 Caravan.flac", "14 Caravan.flac", "Caravan (feat. Van Morrison).flac", "01 Caravan (Concert Version).flac"]) assert.equal(serves(rel, ok), true, ok);
+  for (const bad of ["01 Caravan (Remix).flac", "01 Caravan (Acoustic).flac", "01 Caravan (Demo).flac", "01 Caravan (Instrumental).flac", "01 Caravan (Karaoke).flac", "01 Caravan (Radio Edit).flac", "01 Caravan (Studio Version).flac"]) {
+    assert.equal(serves(rel, bad), false, bad);
+  }
+  // A release that is not this album keeps the strict rule.
+  assert.equal(serves("The Band - Big Band Classics [FLAC]", "01 Caravan.flac"), false);
 });
