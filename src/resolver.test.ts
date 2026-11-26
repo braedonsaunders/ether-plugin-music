@@ -4562,3 +4562,12 @@ test("fix 6: another volume is refused by name as before, but listed last when t
   assert.equal(run(["01 - Travelling Creature (Live).mp3", "02 - Other A.mp3"], [other]).sources.length, 0);
   assert.equal(run(["01 - Other.mp3"], []).sources.length, 0);
 });
+
+test("fix 8 (partly): a numbered part of a Usenet post is probed after the same name without one", () => {
+  const album = { artistName: "Gorillaz", title: "Gorillaz", year: 2001, releaseType: "album" as const, durationSec: 2400 };
+  const whole = preScoreAlbumCandidate({ title: "Gorillaz - Gorillaz (2001) [FLAC]", nzbUrl: "https://nzb.test/w", size: 300_000_000 }, album, "flac_preferred");
+  const part = preScoreAlbumCandidate({ title: "[3/17] Gorillaz - Gorillaz (2001) [FLAC]", nzbUrl: "https://nzb.test/p", size: 300_000_000 }, album, "flac_preferred");
+  assert.equal(whole.accepted, true);
+  assert.equal(part.accepted, true);
+  assert.ok(part.score < whole.score - 5, `${part.score} vs ${whole.score}`);
+});

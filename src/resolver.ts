@@ -937,6 +937,13 @@ export function preScoreAlbumCandidate(
       score -= 14;
       reasons.push("scene RAR likely");
     }
+    // A numbered part of a post ("[3/17] ...") is one piece of something: probed after whole-album
+    // names. (A bonus for a clean "Artist - Album" name was tried and left out: it overturns
+    // the order the quality ranking gives, which a test pins.)
+    if (/^\s*[\[(]\d+\s*\/\s*\d+[\])]|\bpart\s*\d+\s*of\s*\d+\b/i.test(candTitle)) {
+      score -= 8;
+      reasons.push("numbered part of a post");
+    }
   } else if (options?.allowUnconfirmedTorrent && (candidate.infoHash || candidate.magnet)) {
     // Providers without a bulk cache-check API (Real-Debrid, AllDebrid, Debrid-Link)
     // return cached=false on debrid_check and verify cache at acquire time.
