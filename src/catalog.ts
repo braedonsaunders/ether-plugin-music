@@ -79,6 +79,28 @@ interface CuratedSeedPlan {
   artists: ArtistSeedEntry[];
 }
 
+export interface AlbumLoadOptions {
+  artistGenres?: string[];
+  extraCuration?: string[];
+  isClassicArtist?: boolean;
+  allowMusicBrainz?: boolean;
+  requireTrackDetails?: boolean;
+  timeoutMs?: number;
+}
+
+/** A canonical album plus load markers (kept out of types.ts; both are optional). */
+export type LoadedAlbum = CanonicalAlbum & {
+  /** Built from a partial answer (track list not fetched); never cached. Treat as inconclusive. */
+  incomplete?: boolean;
+  /** An expired cached copy served because the refresh failed. */
+  stale?: boolean;
+};
+
+export interface AlbumLoadResult {
+  album: LoadedAlbum | null;
+  status: "ok" | "stale" | "not_found" | "failed";
+}
+
 export function artistExternalId(deezerId: number): string {
   return `ar-${deezerId}`;
 }
@@ -612,17 +634,26 @@ export class MusicCatalog {
     return this.mb.lookupRecordingReleases(isrc);
   }
 
-  loadCanonicalAlbum(
-    deezerAlbumId: number,
-    extra: {
-      artistGenres?: string[];
-      extraCuration?: string[];
-      isClassicArtist?: boolean;
-      allowMusicBrainz?: boolean;
-      requireTrackDetails?: boolean;
-      timeoutMs?: number;
-    } = {}
-  ): CanonicalAlbum | null {
+  /**
+   * The album for browse/hydrate callers: null unless a complete album (fresh, or a stale copy
+   * served because the fetch failed) is available. Use loadCanonicalAlbumResult to tell "no such
+   * album" from "could not be fetched".
+   */
+  loadCanonicalAlbum(deezerAlbumId: number, extra: AlbumLoadOptions = {}): CanonicalAlbum | null {
+    const res = this.loadCanonicalAlbumResult(deezerAlbumId, extra);
+    return res.album && !res.album.incomplete ? res.album : null;
+  }
+
+  /**
+   * Load an album and say how it went. `status`:
+   *  - "ok": complete album (cache hit or fresh fetch, now cached)
+   *  - "stale": the fetch failed and an expired but complete cached copy is returned
+   *  - "not_found": Deezer says there is no such album (or it has no tracks); safe to treat as negative
+   *  - "failed": no answer (network error, timeout, 5xx, rate gate, quota answer). `album` is null,
+   *    or a partial album with `incomplete: true` built from the embedded tracklist. A failure
+   *    is never cached, and a resolver must treat its own outcome as inconclusive, not negative.
+   */
+  loadCanonicalAlbumResult(deezerAlbumId: number, extra: AlbumLoadOptions = {}): AlbumLoadResult {
     const albumId = albumExternalId(deezerAlbumId);
     const metaKey = `album_v2:${albumId}`;
     const existing = this.cache.get<CanonicalAlbum>(metaKey);
@@ -635,13 +666,27 @@ export class MusicCatalog {
           this.cache.set(metaKey, existing, 7 * DAY_MS);
         }
       }
-      return existing;
+      return { album: existing, status: "ok" };
     }
+
+    // A previously stored good copy (even expired, or lacking ISRCs) beats a stub when the fetch fails.
+    const fallbackCopy = (): AlbumLoadResult | null => {
+      const copy = existing && existing.tracks.length > 0
+        ? existing
+        : this.cache.getStale<CanonicalAlbum>(metaKey);
+      return copy && Array.isArray(copy.tracks) && copy.tracks.length > 0
+        ? { album: { ...copy, stale: true }, status: "stale" }
+        : null;
+    };
 
     const startMs = this.env.now();
     const albumTimeout = extra.timeoutMs && extra.timeoutMs > 0 ? extra.timeoutMs : 4000;
-    const detail = this.dz.getAlbum(deezerAlbumId, albumTimeout);
-    if (!detail || !detail.title || !detail.artist?.id) return null;
+    const detailRes = this.dz.getAlbumEx(deezerAlbumId, albumTimeout);
+    if (detailRes.outcome === "not_found") return { album: null, status: "not_found" };
+    const detail = detailRes.value;
+    if (!detail || !detail.title || !detail.artist?.id) {
+      return fallbackCopy() || { album: null, status: "failed" };
+    }
 
     // Embedded tracks.data avoids a 2nd API call for standard albums (Deezer embeds up to 25);
     // fetch /album/{id}/tracks for larger/multi-disc albums or when exact disc/ISRC is requested.
@@ -655,9 +700,20 @@ export class MusicCatalog {
     const trackTimeout = extra.timeoutMs && extra.timeoutMs > 0
       ? Math.max(350, extra.timeoutMs - elapsed)
       : 4000;
-    const detailedTracks = needTrackEndpoint ? this.dz.getAlbumTracks(deezerAlbumId, 100, trackTimeout) : [];
+    const trackRes = needTrackEndpoint
+      ? this.dz.getAlbumTracksEx(deezerAlbumId, 100, trackTimeout)
+      : { tracks: [] as DeezerTrack[], outcome: "ok" as const };
+    const detailedTracks = trackRes.tracks;
+    // The track list could not be fetched: the embedded part is not the whole album.
+    let incomplete = false;
+    if (needTrackEndpoint && detailedTracks.length === 0 && trackRes.outcome === "failed") {
+      const copy = fallbackCopy();
+      if (copy) return copy;
+      if (embedded.length === 0) return { album: null, status: "failed" };
+      incomplete = true;
+    }
     const rawTracks: DeezerTrack[] = detailedTracks.length > 0 ? detailedTracks : embedded;
-    if (rawTracks.length === 0) return null;
+    if (rawTracks.length === 0) return { album: null, status: "not_found" };
 
     const artistId = artistExternalId(detail.artist.id);
     const artistName = detail.artist.name || "Unknown Artist";
@@ -671,7 +727,8 @@ export class MusicCatalog {
     let coverXL = detail.cover_xl || detail.cover_big || "";
     let coverBig = detail.cover_big || detail.cover_medium || coverXL;
 
-    if (extra.allowMusicBrainz && this.settings.enrichMusicBrainz) {
+    // MusicBrainz is best effort: it only adds to the Deezer data and never invalidates it.
+    if (!incomplete && extra.allowMusicBrainz && this.settings.enrichMusicBrainz) {
       const mbInfo = this.mb.lookupReleaseGroup(artistName, detail.title);
       if (mbInfo) {
         releaseGroupMbid = mbInfo.releaseGroupMbid;
@@ -791,8 +848,12 @@ export class MusicCatalog {
       tracks,
     };
 
+    if (incomplete) {
+      // Never store a partial album: it would be served as the real one for 7 days.
+      return { album: { ...canonical, incomplete: true }, status: "failed" };
+    }
     this.cache.set(metaKey, canonical, 7 * DAY_MS);
-    return canonical;
+    return { album: canonical, status: "ok" };
   }
 
   buildAlbumItem(album: CanonicalAlbum, chartBonus = 0): KindItem {

@@ -151,66 +151,102 @@ export class DeezerClient {
     timeoutMs = 4000,
     options?: { persist?: boolean; compact?: (raw: T) => T }
   ): T | null {
+    return this.getJsonEx<T>(path, cacheKey, ttlMs, timeoutMs, options).value;
+  }
+
+  /**
+   * Like getJson, but says what the null means. outcome:
+   *  - "ok": answered (fresh fetch) or served from a fresh cache entry
+   *  - "stale": the fetch failed and an expired copy was served instead
+   *  - "not_found": Deezer answered that the object does not exist (HTTP 404 or error code 800)
+   *  - "failed": no answer: network error, timeout, HTTP 5xx, rate gate, quota answer, bad body
+   * A failure is never written to the cache. One immediate retry for a network error or 5xx
+   * (needs a free rate slot and time left in timeoutMs); none for rate-limit or quota answers.
+   */
+  getJsonEx<T>(
+    path: string,
+    cacheKey: string,
+    ttlMs: number,
+    timeoutMs = 4000,
+    options?: { persist?: boolean; compact?: (raw: T) => T }
+  ): { value: T | null; outcome: "ok" | "stale" | "not_found" | "failed" } {
     const memOnly = options?.persist === false;
     const cached = this.cache.get<T>(cacheKey, { memOnly });
-    if (cached !== null) return cached;
+    if (cached !== null) return { value: cached, outcome: "ok" };
 
-    // Respect Deezer's 50 req / 5s public rate limit (stay safely under at 38 / 5s).
-    if (!this.cache.tryAcquireRateSlot(RATE_BUCKET, 38, 5000)) {
+    const failed = (): { value: T | null; outcome: "stale" | "failed" } => {
       const stale = this.cache.getStale<T>(cacheKey, { memOnly });
-      if (stale !== null) return stale;
-      if (this.strictRateLimit) {
-        throw new RateLimitError(5, "Deezer rate window reached; retry shortly");
-      }
-      return null;
-    }
+      return stale !== null ? { value: stale, outcome: "stale" } : { value: null, outcome: "failed" };
+    };
 
-    try {
-      const resp = this.env.http.fetch({
-        method: "GET",
-        url: `${DEEZER_BASE}${path}`,
-        headers: {
-          "Accept": "application/json",
-          "User-Agent": USER_AGENT,
-        },
-        timeoutMs,
-      });
-
-      if (resp.status === 403 || resp.status === 429) {
-        this.cache.setCooldown(RATE_BUCKET, 12_000);
-        const stale = this.cache.getStale<T>(cacheKey, { memOnly });
-        if (stale !== null) return stale;
-        if (this.strictRateLimit) {
-          throw new RateLimitError(12, `Deezer returned HTTP ${resp.status}`);
+    const startMs = this.env.now();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Respect Deezer's 50 req / 5s public rate limit (stay safely under at 38 / 5s).
+      if (!this.cache.tryAcquireRateSlot(RATE_BUCKET, 38, 5000)) {
+        const res = failed();
+        if (res.value === null && this.strictRateLimit) {
+          throw new RateLimitError(5, "Deezer rate window reached; retry shortly");
         }
-        return null;
+        return res;
       }
-      if (resp.status < 200 || resp.status >= 300 || !resp.body) {
-        return this.cache.getStale<T>(cacheKey, { memOnly });
-      }
+      const remaining = attempt === 0 ? timeoutMs : Math.max(350, timeoutMs - (this.env.now() - startMs));
+      if (attempt > 0 && this.env.now() - startMs >= timeoutMs) return failed();
 
-      const parsed = JSON.parse(resp.body) as any;
-      if (parsed && parsed.error) {
-        // Deezer quota error code 4 -> cool down cleanly.
-        if (parsed.error.code === 4) {
-          this.cache.setCooldown(RATE_BUCKET, 8_000);
-          const stale = this.cache.getStale<T>(cacheKey, { memOnly });
-          if (stale !== null) return stale;
-          if (this.strictRateLimit) {
-            throw new RateLimitError(8, "Deezer quota limit reached");
+      let retryable = false;
+      try {
+        const resp = this.env.http.fetch({
+          method: "GET",
+          url: `${DEEZER_BASE}${path}`,
+          headers: {
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+          },
+          timeoutMs: remaining,
+        });
+
+        if (resp.status === 403 || resp.status === 429) {
+          this.cache.setCooldown(RATE_BUCKET, 12_000);
+          const res = failed();
+          if (res.value === null && this.strictRateLimit) {
+            throw new RateLimitError(12, `Deezer returned HTTP ${resp.status}`);
           }
+          return res;
         }
-        return this.cache.getStale<T>(cacheKey, { memOnly });
-      }
+        if (resp.status === 404) return { value: null, outcome: "not_found" };
+        if (resp.status >= 500) {
+          retryable = true;
+        } else if (resp.status < 200 || resp.status >= 300 || !resp.body) {
+          return failed();
+        } else {
+          const parsed = JSON.parse(resp.body) as any;
+          if (parsed && parsed.error) {
+            const code = Number(parsed.error.code);
+            // Deezer quota error code 4 -> cool down cleanly.
+            if (code === 4) {
+              this.cache.setCooldown(RATE_BUCKET, 8_000);
+              const res = failed();
+              if (res.value === null && this.strictRateLimit) {
+                throw new RateLimitError(8, "Deezer quota limit reached");
+              }
+              return res;
+            }
+            // 800 = DataException: the object does not exist. Anything else is an upstream fault.
+            if (code === 800 || parsed.error.type === "DataException") return { value: null, outcome: "not_found" };
+            return failed();
+          }
 
-      const value = options?.compact ? options.compact(parsed as T) : (parsed as T);
-      this.cache.set(cacheKey, value, ttlMs, { persist: options?.persist });
-      return value;
-    } catch (err) {
-      rethrowHostFault(err);
-      if (err instanceof RateLimitError) throw err;
-      return this.cache.getStale<T>(cacheKey, { memOnly });
+          const value = options?.compact ? options.compact(parsed as T) : (parsed as T);
+          this.cache.set(cacheKey, value, ttlMs, { persist: options?.persist });
+          return { value, outcome: "ok" };
+        }
+      } catch (err) {
+        rethrowHostFault(err);
+        if (err instanceof RateLimitError) throw err;
+        retryable = true;
+      }
+      if (!retryable) break;
     }
+    return failed();
   }
 
   getGlobalChartArtists(limit = 30): DeezerArtist[] {
@@ -390,6 +426,29 @@ export class DeezerClient {
       timeoutMs,
       { persist: false }
     );
+  }
+
+  /** getAlbum, with the outcome (see getJsonEx) so callers can tell "no such album" from "no answer". */
+  getAlbumEx(albumId: number, timeoutMs = 4000) {
+    return this.getJsonEx<DeezerAlbumDetail>(
+      `/album/${albumId}`,
+      `dz:album:${albumId}`,
+      30 * 60 * 1000,
+      timeoutMs,
+      { persist: false }
+    );
+  }
+
+  /** getAlbumTracks, with the outcome (see getJsonEx). */
+  getAlbumTracksEx(albumId: number, limit = 100, timeoutMs = 4000): { tracks: DeezerTrack[]; outcome: "ok" | "stale" | "not_found" | "failed" } {
+    const res = this.getJsonEx<{ data?: DeezerTrack[] }>(
+      `/album/${albumId}/tracks?limit=${limit}`,
+      `dz:album:${albumId}:tracks:${limit}`,
+      30 * 60 * 1000,
+      timeoutMs,
+      { persist: false }
+    );
+    return { tracks: Array.isArray(res.value?.data) ? res.value!.data! : [], outcome: res.outcome };
   }
 
   /**

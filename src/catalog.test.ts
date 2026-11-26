@@ -1236,3 +1236,158 @@ test("an artist whose discography Deezer did not answer is not expanded as compl
   const res = handle({ method: "POST", path: "/ether/v1/kinds/music/expand", body: { parentId: "ar-27", level: "artist", cursor: "" } });
   assert.equal(res.status, 503);
 });
+
+// ---- Transient provider failures must not become stub albums or cached negatives ----
+
+function makeFlakyCatalog(handler: (url: string, n: number) => HttpFetchResponse) {
+  const kvMap = new Map<string, string>();
+  const httpCalls: string[] = [];
+  let now = 1_760_000_000_000;
+  const env: HostEnv = {
+    now: () => now,
+    log: () => {},
+    kv: {
+      get: (k) => kvMap.get(k) ?? null,
+      put: (k, v) => { kvMap.set(k, v); },
+      delete: (k) => { kvMap.delete(k); },
+      list: (prefix = "") => Array.from(kvMap.keys()).filter((k) => k.startsWith(prefix)),
+    },
+    http: {
+      fetch: (req) => {
+        httpCalls.push(req.url);
+        return handler(req.url, httpCalls.length);
+      },
+    },
+    settings: { get: () => ({ enrichMusicBrainz: false }) },
+    sources: { resolve: () => ({ candidates: [] }) },
+  };
+  const settings = {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "compact" as const,
+    enrichMusicBrainz: false,
+  };
+  // One KVCache per "request", as the plugin does, so the in-memory layer never hides a failure.
+  const fresh = () => {
+    const cache = new KVCache(env);
+    return new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  };
+  return { fresh, kvMap, httpCalls, advance: (ms: number) => { now += ms; } };
+}
+
+const FLAKY_ALBUM = JSON.stringify({
+  id: 555, title: "Flaky", release_date: "2010-01-01", record_type: "album", nb_tracks: 2, duration: 400, fans: 10,
+  artist: { id: 9, name: "Some Band" }, genres: { data: [] },
+  tracks: { data: [
+    { id: 1, title: "One", duration: 200, artist: { id: 9, name: "Some Band" } },
+    { id: 2, title: "Two", duration: 200, artist: { id: 9, name: "Some Band" } },
+  ] },
+});
+const FLAKY_TRACKS = JSON.stringify({ data: [
+  { id: 1, title: "One", duration: 200, isrc: "GBAAA1000001", track_position: 1, artist: { id: 9, name: "Some Band" } },
+  { id: 2, title: "Two", duration: 200, isrc: "GBAAA1000002", track_position: 2, artist: { id: 9, name: "Some Band" } },
+] });
+const isTracksUrl = (u: string) => u.includes("/album/555/tracks");
+const isAlbumUrl = (u: string) => u.endsWith("/album/555");
+
+test("defect A: one failed album fetch is retried once and the album loads; no stub is cached", () => {
+  const h = makeFlakyCatalog((url, n) => {
+    if (isAlbumUrl(url)) {
+      if (n === 1) throw new Error("network down");
+      return { status: 200, body: FLAKY_ALBUM };
+    }
+    return { status: 200, body: FLAKY_TRACKS };
+  });
+  const res = h.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true });
+  assert.equal(res.status, "ok");
+  assert.equal(res.album?.tracks.length, 2);
+  assert.equal(res.album?.incomplete, undefined);
+  assert.equal(h.httpCalls.filter(isAlbumUrl).length, 2, "exactly one retry");
+  const stored = JSON.parse(h.kvMap.get("album_v2:al-555")!);
+  assert.equal(stored.v.tracks.length, 2);
+});
+
+test("defect A: 5xx on the album with no cached copy reports failed and stores nothing under the album key", () => {
+  const h = makeFlakyCatalog(() => ({ status: 503, body: "" }));
+  const cat = h.fresh();
+  const res = cat.loadCanonicalAlbumResult(555, { requireTrackDetails: true });
+  assert.equal(res.status, "failed");
+  assert.equal(res.album, null);
+  assert.equal(h.httpCalls.filter(isAlbumUrl).length, 2, "one retry, no more");
+  assert.equal(h.kvMap.has("album_v2:al-555"), false);
+  assert.equal([...h.kvMap.keys()].some((k) => k.startsWith("dz:album:")), false, "failure is not cached either");
+  assert.equal(cat.loadCanonicalAlbum(555, { requireTrackDetails: true }), null);
+});
+
+test("defect A: failing track list is marked incomplete and never cached as the album", () => {
+  const h = makeFlakyCatalog((url) => isTracksUrl(url) ? { status: 500, body: "" } : { status: 200, body: FLAKY_ALBUM });
+  const res = h.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true });
+  assert.equal(res.status, "failed");
+  assert.equal(res.album?.incomplete, true);
+  assert.equal(h.kvMap.has("album_v2:al-555"), false);
+  // The browse-style entry point refuses the partial album.
+  assert.equal(h.fresh().loadCanonicalAlbum(555, { requireTrackDetails: true }), null);
+});
+
+test("defect A: a failed refresh serves the expired good copy instead of a stub", () => {
+  let broken = false;
+  const h = makeFlakyCatalog((url) => {
+    if (broken) return { status: 502, body: "" };
+    return isTracksUrl(url) ? { status: 200, body: FLAKY_TRACKS } : { status: 200, body: FLAKY_ALBUM };
+  });
+  assert.equal(h.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true }).status, "ok");
+  const before = h.kvMap.get("album_v2:al-555");
+  h.advance(8 * 24 * 60 * 60 * 1000); // copy expired (TTL 7 days)
+  broken = true;
+  const res = h.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true });
+  assert.equal(res.status, "stale");
+  assert.equal(res.album?.tracks.length, 2);
+  assert.equal(res.album?.stale, true);
+  assert.equal(h.kvMap.get("album_v2:al-555"), before, "stored copy untouched");
+  assert.ok(h.fresh().loadCanonicalAlbum(555, { requireTrackDetails: true }), "compat entry point also serves it");
+});
+
+test("defect A: a quota answer is a failure (no retry), not an album without tracks", () => {
+  const quota = JSON.stringify({ error: { type: "Exception", message: "Quota limit exceeded", code: 4 } });
+  const h = makeFlakyCatalog(() => ({ status: 200, body: quota }));
+  const res = h.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true });
+  assert.equal(res.status, "failed");
+  assert.equal(res.album, null);
+  assert.equal(h.httpCalls.length, 1, "no retry on a quota answer");
+  assert.equal(h.kvMap.has("album_v2:al-555"), false);
+
+  // Quota on the track list only: the album is incomplete, not "empty".
+  const h2 = makeFlakyCatalog((url) => isTracksUrl(url) ? { status: 200, body: quota } : { status: 200, body: FLAKY_ALBUM });
+  const res2 = h2.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true });
+  assert.equal(res2.status, "failed");
+  assert.equal(res2.album?.incomplete, true);
+  assert.equal(h2.httpCalls.filter(isTracksUrl).length, 1);
+  assert.equal(h2.kvMap.has("album_v2:al-555"), false);
+});
+
+test("defect A: Deezer saying the album does not exist is not_found, a real negative", () => {
+  const gone = JSON.stringify({ error: { type: "DataException", message: "no data", code: 800 } });
+  const h = makeFlakyCatalog(() => ({ status: 200, body: gone }));
+  const res = h.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true });
+  assert.equal(res.status, "not_found");
+  assert.equal(res.album, null);
+  assert.equal(h.httpCalls.length, 1);
+});
+
+test("defect A: a MusicBrainz failure does not degrade the Deezer album", () => {
+  const h = makeFlakyCatalog((url) => {
+    if (url.includes("musicbrainz.org")) throw new Error("mb down");
+    return isTracksUrl(url) ? { status: 200, body: FLAKY_TRACKS } : { status: 200, body: FLAKY_ALBUM };
+  });
+  const res = h.fresh().loadCanonicalAlbumResult(555, { requireTrackDetails: true, allowMusicBrainz: true });
+  assert.equal(res.status, "ok");
+  assert.equal(res.album?.tracks.length, 2);
+});
+
+test("PLUGIN_VERSION matches manifest.json", async () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
+  const { PLUGIN_VERSION } = await import("./index.ts");
+  assert.equal(PLUGIN_VERSION, manifest.version);
+});
