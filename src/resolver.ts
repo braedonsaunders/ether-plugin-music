@@ -1219,9 +1219,11 @@ export function matchAlbumReleaseFiles(
  * track under 45 s gets 1.5 MB more on top of the upper bound (cover art, tags), not a wider
  * ratio.
  */
-const SIZE_RATIO_LOSSLESS = { min: 0.25, max: 3 };
+// Lossless up to 4.5x: a 24-bit/96 kHz FLAC is about 3.4x of CD-quality FLAC and is often not labelled.
+const SIZE_RATIO_LOSSLESS = { min: 0.25, max: 4.5 };
 const SIZE_RATIO_HIRES = { min: 0.25, max: 6 };
-const SIZE_RATIO_LOSSY = { min: 0.35, max: 2.5 };
+// Lossy down to 0.2x: a 64 kbps file against a 320 kbps yardstick is still that recording.
+const SIZE_RATIO_LOSSY = { min: 0.2, max: 2.5 };
 const SHORT_TRACK_SEC = 45;
 const SHORT_TRACK_EXTRA_BYTES = 1_500_000;
 

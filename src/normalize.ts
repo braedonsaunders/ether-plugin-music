@@ -986,6 +986,11 @@ function tokensCompatible(a: string[], b: string[]): boolean {
  * the album title, or a segment of the release name. Text that is none of these names someone
  * else: "foreign". With no artist known nothing is judged (never "foreign").
  */
+/** True when the text's letters are all Latin (or it has none). */
+function isLatinText(s: string): boolean {
+  return !/[^\p{Script=Latin}\P{L}]/u.test(String(s || ""));
+}
+
 export function classifyLead(lead: string[], exp: ExpectedLead): LeadVerdict {
   if (lead.length === 0) return "none";
   let named = false;
@@ -998,6 +1003,9 @@ export function classifyLead(lead: string[], exp: ExpectedLead): LeadVerdict {
     // A track or disc number, a year, or nothing: says nothing about who made the file.
     if (toks.every((w) => /^\d+$/.test(w)) || /^(?:cd|disc|disk|d|track|tr|trk|no|side)\s*\d{1,3}$/.test(key)) continue;
     if (artists.length === 0) continue; // no artist known: nothing to compare against
+    // An artist written in another script than the segment ("Мумий Тролль" against a file's
+    // "Mumiy Troll") cannot be compared by spelling: it says nothing either way.
+    if (exp.artists.length > 0 && exp.artists.every((a) => isLatinText(a) !== isLatinText(seg))) continue;
     const joined = toks.join("");
     const isArtist = artists.some((a) => a.joined === joined || tokensCompatible(toks, a.tokens));
     const isVa = Boolean(exp.variousArtists) && isVariousArtistsName(seg.trim());

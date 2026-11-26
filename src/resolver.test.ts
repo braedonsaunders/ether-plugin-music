@@ -3670,6 +3670,7 @@ test("defect 5: an incomplete resumed search with nothing to list answers pendin
 
 // ---- Review 3: file-name matching (defects 1-4, 8), exclusions (9, 10), folder guard (11) ----
 import { isPlausibleTrackSize, isGenericAlbumTitle } from "./resolver.ts";
+import { classifyLead } from "./normalize.ts";
 import { isBenignTitleNote, titleSignature, fileTitleRuns } from "./normalize.ts";
 
 const R3MB = 1_000_000;
@@ -3811,10 +3812,12 @@ test("defect 3: durations under 60 s are checked with a tight tolerance; short t
   assert.equal(durationToleranceFor(400), 12);
   assert.equal(durationToleranceFor(1000), 30);
 
-  // Size window: lossless 0.25x-3x of 920 kbps (4 min: 27.6 MB), lossy 0.35x-2.5x, hi-res up to 6x.
+  // Size window: lossless 0.25x-4.5x of 920 kbps (4 min: 27.6 MB), lossy 0.2x-2.5x, hi-res up to 6x.
   const flac = 920, mp3 = 320;
   assert.equal(isPlausibleTrackSize(80 * R3MB, 240, flac, { lossless: true }), true);
-  assert.equal(isPlausibleTrackSize(84 * R3MB, 240, flac, { lossless: true }), false);
+  // 4.5x of 27.6 MB is 124 MB: unlabelled 24/96 passes, a file past that does not.
+  assert.equal(isPlausibleTrackSize(84 * R3MB, 240, flac, { lossless: true }), true);
+  assert.equal(isPlausibleTrackSize(130 * R3MB, 240, flac, { lossless: true }), false);
   assert.equal(isPlausibleTrackSize(84 * R3MB, 240, flac, { lossless: true, hiRes: true }), true);
   assert.equal(isPlausibleTrackSize(160 * R3MB, 240, flac, { lossless: true, hiRes: true }), true);
   assert.equal(isPlausibleTrackSize(170 * R3MB, 240, flac, { lossless: true, hiRes: true }), false);
@@ -3822,24 +3825,26 @@ test("defect 3: durations under 60 s are checked with a tight tolerance; short t
   assert.equal(isPlausibleTrackSize(6 * R3MB, 240, flac, { lossless: true }), false);
   assert.equal(isPlausibleTrackSize(23 * R3MB, 240, mp3, { lossless: false }), true);
   assert.equal(isPlausibleTrackSize(25 * R3MB, 240, mp3, { lossless: false }), false);
-  assert.equal(isPlausibleTrackSize(3.3 * R3MB, 240, mp3, { lossless: false }), false);
+  assert.equal(isPlausibleTrackSize(1.8 * R3MB, 240, mp3, { lossless: false }), false);
   assert.equal(isPlausibleTrackSize(3.5 * R3MB, 240, mp3, { lossless: false }), true);
   // Under 45 s: 1.5 MB on the upper bound, the ratio is the same. A 20 s FLAC is 2.3 MB typical.
   assert.equal(isPlausibleTrackSize(8 * R3MB, 20, flac, { lossless: true }), true);
-  assert.equal(isPlausibleTrackSize(9 * R3MB, 20, flac, { lossless: true }), false);
+  assert.equal(isPlausibleTrackSize(11 * R3MB, 20, flac, { lossless: true }), true);
+  assert.equal(isPlausibleTrackSize(13 * R3MB, 20, flac, { lossless: true }), false);
   assert.equal(isPlausibleTrackSize(0.5 * R3MB, 20, flac, { lossless: true }), false, "the lower bound has no allowance");
   assert.equal(isPlausibleTrackSize(0, 20, flac), true, "unknown size passes");
   assert.equal(isPlausibleTrackSize(9 * R3MB, 0, flac), true, "unknown length passes");
 
-  // A 20 s "Intro" does not take a 9 MB "Intro.flac" out of a 300-file dump.
+  // A 20 s "Intro" does not take a 14 MB "Intro.flac" out of a 300-file dump (a bare 9 MB one is
+  // refused by the generic-title rule and, on open, by the running-time check).
   const album = r3Album(["Intro", "Other"], { dur: 240 });
   album.tracks[0].durationSec = 20;
   const dump = (introSize: number, name = "Dump/Intro.flac") =>
     Array.from({ length: 300 }, (_, i) => ({ index: i, path: i === 150 ? name : `Dump/Filler ${i}.flac`, size: i === 150 ? introSize : 30 * R3MB }));
-  assert.equal(Boolean(matchTracksInRelease(album, "Dump", dump(9 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), false, "oversized");
+  assert.equal(Boolean(matchTracksInRelease(album, "Dump", dump(14 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), false, "oversized");
   assert.equal(Boolean(matchTracksInRelease(album, "Dump", dump(2.5 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), true, "right size, artist named");
   // Hi-res release: the same file is possible.
-  assert.equal(Boolean(matchTracksInRelease(album, "Coldplay - Dump [FLAC 24-96]", dump(9 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), true, "a release labelled hi-res may hold up to 6x");
+  assert.equal(Boolean(matchTracksInRelease(album, "Coldplay - Dump [FLAC 24-96]", dump(14 * R3MB, "Coldplay - Intro.flac"), "flac_preferred").tracks["t0"]), true, "a release labelled hi-res may hold up to 6x");
 });
 
 test("defect 3: a generic title matches in a partial release only with its number or a named artist/album", () => {
@@ -4047,4 +4052,13 @@ test("defect 11: a source plugin's folder without the artist needs a title that 
   assert.equal(isGenericAlbumTitle("Discovery"), false);
   // With the artist in the name nothing changes.
   assert.equal(score("Greatest Hits", "Daft Punk - Greatest Hits [FLAC]"), true);
+});
+
+test("an artist in another script, small lossy files and unlabelled hi-res FLAC are not refused", () => {
+  assert.notEqual(classifyLead(["Mumiy Troll"], { artists: ["Мумий Тролль"], albums: [], releaseSegments: [] }), "foreign");
+  assert.equal(classifyLead(["Other Artist"], { artists: ["Coldplay"], albums: [], releaseSegments: [] }), "foreign");
+  // 240 s at 64 kbps MP3 is about 1.9 MB; at 24/96 FLAC about 85 MB.
+  assert.equal(isPlausibleTrackSize(2_100_000, 240, 320), true);
+  assert.equal(isPlausibleTrackSize(85_000_000, 240, 950, { lossless: true }), true);
+  assert.equal(isPlausibleTrackSize(200_000, 240, 320), false);
 });
