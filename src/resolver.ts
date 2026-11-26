@@ -519,6 +519,8 @@ interface ResolveStage {
   searchIncomplete?: boolean;
   /** When the stage's probing began: lone partial sources are only waited past for so long. */
   startedAt?: number;
+  /** The releases the record had when this search began: the new record never lacks one of them. */
+  earlierReleases?: VerifiedAlbumRelease[];
   /** Candidates were left unscored for want of time: the album is not exhausted. */
   hadUnscored?: boolean;
   /** A song-query stage: it adds to the album's record without ending the album's own search. */
@@ -1337,6 +1339,15 @@ export function matchAlbumReleaseFiles(
  * ratio.
  */
 // Lossless up to 4.5x: a 24-bit/96 kHz FLAC is about 3.4x of CD-quality FLAC and is often not labelled.
+/** An album title that starts with a generic phrase names no one album: no label forgiveness. */
+const GENERIC_START_RE = /^(?:the )?(?:very )?(?:best of|best|greatest hits|essentials?|essential|collection|hits|anthology|gold|platinum|icon|classics|favou?rites|ultimate|complete)\b/;
+const ALBUM_SUFFIX_WORD_RE = /^(?:\d+(?:st|nd|rd|th)?|cd|disc|disk|deluxe|edition|expanded|remaster(?:ed)?|anniversary|special|bonus|tracks?|flac|mp3|lossless|web|version|standard|limited|collectors?|and|the|of)$/;
+/** Whether a release's album part is this album: equal to its core title, or that title followed by an edition, disc, year or format suffix only. */
+function isAlbumPartOf(partKey: string, coreKey: string): boolean {
+  if (partKey === coreKey) return true;
+  if (!partKey.startsWith(`${coreKey} `)) return false;
+  return partKey.slice(coreKey.length + 1).split(" ").every((w) => ALBUM_SUFFIX_WORD_RE.test(w));
+}
 /** Notes of a catalogue title that name where the song comes from, not which recording it is. */
 const CATALOGUE_LABEL_RE = /^(?:concert|album|single|studio|original|standard|lp) version$/;
 const SIZE_RATIO_LOSSLESS = { min: 0.25, max: 4.5 };
@@ -1478,7 +1489,15 @@ export function matchTracksInRelease(
   // The same holds on the album path for a release that is this album (its name carries the
   // album's core title, any edition): "Caravan.flac" serves "Caravan (Concert Version)".
   const coreAlbumKey = normalizeTitleKey(coreReleaseTitle(album.title));
-  const releaseIsThisAlbum = !album.recordingTarget && coreAlbumKey.length >= 4 && !isGenericAlbumTitle(coreAlbumKey) && relPhrases.includes(` ${coreAlbumKey} `);
+  const releaseIsThisAlbum =
+    !album.recordingTarget && coreAlbumKey.length >= 4 && !isGenericAlbumTitle(coreAlbumKey) && !GENERIC_START_RE.test(coreAlbumKey) &&
+    releaseAlbumParts(releaseTitle).some((part) => isAlbumPartOf(normalizeTitleKey(part), coreAlbumKey));
+  // The wanted title's label is optional only on a file with none or the same one.
+  const labelOf = (title: string): string => {
+    const m = String(title || "").match(/[\(\[]\s*((?:concert|album|single|studio|original|standard|lp)\s+version)\s*[\)\]]|\s[-\u2013\u2014]\s*((?:concert|album|single|studio|original|standard|lp)\s+version)\s*$/i);
+    return m ? normalizeTitleKey(m[1] || m[2]) : "";
+  };
+  const forgiving = Boolean(album.recordingTarget) || releaseIsThisAlbum;
   const catalogueLabel = (q: string): boolean => (Boolean(album.recordingTarget) || releaseIsThisAlbum) && CATALOGUE_LABEL_RE.test(q);
   const ignoreQual = (q: string): boolean =>
     albumLevel.has(q) || catalogueLabel(q) || (relPhrases.includes(` ${q} `) && (Boolean(album.recordingTarget) || albumPhrases.includes(` ${q} `)));
@@ -1532,7 +1551,7 @@ export function matchTracksInRelease(
   const hiRes = HI_RES_TITLE_RE.test(releaseTitle) || quality.tier === "flac24";
 
   const sameEdition = audioFiles.length === canonicalCount;
-  type Hit = { ti: number; fi: number; exact: boolean; numberAgrees: boolean; named: boolean; disc: number };
+  type Hit = { ti: number; fi: number; exact: boolean; numberAgrees: boolean; named: boolean; disc: number; lr: number };
   const hits: Hit[] = [];
   const single = audioFiles.length === 1;
   for (let fi = 0; fi < audioFiles.length; fi++) {
@@ -1554,18 +1573,23 @@ export function matchTracksInRelease(
         for (const c of releaseTitleRuns()) cands.push(c);
       }
     }
-    const found = new Map<number, { exact: boolean; named: boolean }>();
+    const found = new Map<number, { exact: boolean; named: boolean; lr: number }>();
     for (const c of cands) {
       const sig = titleSignature(c.run);
       if (!sig) continue;
+      const fileLabel = labelOf(c.run);
       const take = (ti: number, exact: boolean) => {
+        // The wanted title's catalogue label, forgiven: a file with another label is another version.
+        const wanted = forgiving ? labelOf(album.tracks[ti].title) : "";
+        if (wanted && fileLabel && fileLabel !== wanted) return;
+        const lr = wanted && !fileLabel ? 1 : 0;
         const verdict = classifyLead(c.lead, expectedFor(ti));
         // Text in front of the title that is neither the artist nor the album means another
         // artist's song, unless the title is long enough to be nobody else's: classical files
         // lead with the composer ("Beethoven - Symphony No. 5 in C minor, Op. 67 - I. Allegro").
         if (verdict === "foreign" && !(exact && sig.full.split(" ").length >= LONG_TITLE_WORDS)) return;
         const cur = found.get(ti);
-        found.set(ti, { exact: exact || Boolean(cur?.exact), named: verdict === "named" || Boolean(cur?.named) });
+        found.set(ti, { exact: exact || Boolean(cur?.exact), named: verdict === "named" || Boolean(cur?.named), lr: Math.min(lr, cur?.lr ?? 9) });
       };
       const exactTracks = byFull.get(sig.full);
       if (exactTracks) for (const ti of exactTracks) take(ti, true);
@@ -1584,13 +1608,14 @@ export function matchTracksInRelease(
         if (sameEdition && !numberAgrees) continue;
       }
       if (!isPlausibleTrackSize(af.file.size, tr.durationSec, af.fmt.typicalKbps, { lossless: af.fmt.lossless, hiRes })) continue;
-      hits.push({ ti, fi, exact: f.exact, numberAgrees, named: f.named, disc: fileDisc });
+      hits.push({ ti, fi, exact: f.exact, numberAgrees, named: f.named, disc: fileDisc, lr: f.lr });
     }
   }
 
   hits.sort(
     (a, b) =>
       Number(b.exact) - Number(a.exact) ||
+      a.lr - b.lr ||
       a.disc - b.disc ||
       a.fi - b.fi ||
       Number(b.numberAgrees) - Number(a.numberAgrees) ||
@@ -2320,6 +2345,8 @@ export class AlbumResolver {
       const before = sources.filter((s) => again.refused.has(s.id)).sort((x, y) => (rank(x.id) < 0 ? 1e9 : rank(x.id)) - (rank(y.id) < 0 ? 1e9 : rank(y.id)));
       out = [...fresh, ...before];
     }
+    // The same cut on every call: what was not offered before first, then the earlier answer in its order.
+    out = out.slice(0, MAX_SOURCES_PER_TRACK);
     this.cache.set<ServedRecord>(servedKey(item.id), {
       at: this.env.now(),
       offered: out.map((s) => s.id),
@@ -2764,6 +2791,7 @@ export class AlbumResolver {
         rawCandidateCount: searched.rawCount,
         searchIncomplete: searched.incomplete || undefined,
         ...(searched.unscored ? { hadUnscored: true } : {}),
+        ...(earlier ? { earlierReleases: earlier.releases.map((r) => ({ ...r })) } : {}),
         usenetChecksUsed: 0,
         usenetCheckDisabled: false,
         startedAt: this.env.now(),
@@ -2903,6 +2931,11 @@ export class AlbumResolver {
       if (!stage.verified.some(servesWanted)) finalReleases = [...finalReleases, ...fallbacks()];
     } else {
       finalReleases = fallbacks();
+    }
+    // A search that began from a record never writes one that lacks a release the record had
+    // (fallback releases are not carried by the stage's own lists).
+    for (const r of stage.earlierReleases || []) {
+      if (!finalReleases.some((f) => f.releaseId === r.releaseId)) finalReleases = [...finalReleases, r];
     }
     if (stage.trackPhase && finalReleases.length === 0) {
       // The song query led to nothing playable: the album's record stands as it was.
@@ -3222,7 +3255,7 @@ export class AlbumResolver {
     }
 
     // Candidates an earlier call ran out of time to score join this one's.
-    const carried = this.cache.get<SourceCandidate[]>(unscoredKey(album.id));
+    const carried = trackQuery ? null : this.cache.get<SourceCandidate[]>(unscoredKey(album.id));
     if (carried && carried.length > 0) {
       this.cache.delete(unscoredKey(album.id));
       for (const c of carried) {
@@ -3392,7 +3425,8 @@ export class AlbumResolver {
     );
     const droppedLine = formatDroppedAtNameRanking(album.id, droppedAtNames, rawCandidates.length);
     if (droppedLine) this.env.log("debug", droppedLine);
-    if (leftover.length > 0) this.cache.set(unscoredKey(album.id), leftover.slice(0, 60).map(compactCandidateForMemo), STAGE_CACHE_TTL_MS * 2);
+    // Only the album's own search carries leftovers (a song query's candidates are another list).
+    if (leftover.length > 0 && !trackQuery) this.cache.set(unscoredKey(album.id), leftover.slice(0, 60).map(compactCandidateForMemo), STAGE_CACHE_TTL_MS);
     return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete, unscored: leftover.length };
   }
 
@@ -3747,7 +3781,6 @@ export class AlbumResolver {
       .map((rel, i) => ({ rel, i }))
       .sort((a, b) => Number(Boolean(a.rel.partial)) - Number(Boolean(b.rel.partial)) || memberOf(a.rel) - memberOf(b.rel) || a.i - b.i);
     for (const { rel, i } of order) {
-      if (sources.length >= MAX_SOURCES_PER_TRACK) break;
       if (isReleaseExcluded(excluded, rel.releaseId, rel.candidate, i)) continue;
       const trackMap = rel.tracks[item.id];
       if (!trackMap) continue;

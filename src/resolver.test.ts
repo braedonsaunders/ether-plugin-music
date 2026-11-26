@@ -4702,3 +4702,132 @@ test("build 19 / 4: in a requested box set, the folder of the sub-album the trac
   for (let i = 0; i < 4; i++) { advance(h, 10_000); assert.equal(h.play(item).sources.length, 1); }
   assert.ok(sent.some((q) => /^Chic Telling Lies$/.test(q)), sent.join(" | "));
 });
+
+test("review b20 / 1: a known fallback source survives a fresh search and the song phase, on every call", () => {
+  const album = albumOf("al-9650", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 5), {}, 240);
+  const item = trackItemFor(album, 1);
+  const fb = { ...verifiedFor(album, "fb", { all: true }), isArchiveFallback: true, sourceKind: "usenet" as const };
+  const check = (h: ReturnType<typeof harness>, upTo = 8) => {
+    const first = h.play(item);
+    assert.deepEqual(first.sources.map((s) => s.id), [fb.releaseId]);
+    for (let i = 0; i <= upTo; i++) {
+      advance(h, 10_000);
+      const r = h.resolver.resolve({ item });
+      assert.ok(!r.pending, `call ${i} is not pending`);
+      assert.ok(r.sources.some((s) => s.id === fb.releaseId), `call ${i} keeps the fallback source`);
+      assertAllChecked(r.sources, `call ${i}`);
+    }
+  };
+  const put = (h: ReturnType<typeof harness>) =>
+    h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, resumes: 3, probedRefs: [], releases: [fb] }, 3_600_000);
+  // The fresh search and the song queries find nothing.
+  const h = harness(album, () => ({ candidates: [] }));
+  put(h);
+  check(h);
+  // A song query verifies another release (holding other tracks only): the fallback is still in the record.
+  const other: SourceCandidate = { title: "Test Band - Disc Song 2 (2001) [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/other", size: 100_000_000 };
+  const h2 = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: /Disc Song 2$/.test(q.query || "") ? [other] : [] };
+    if (q.kind === "release_files") return { candidates: [{ ...(q.candidate as SourceCandidate), files: filesOf(["03 Disc Song 3.flac", "04 Disc Song 4.flac"]) }] };
+    if (q.kind === "usenet_check") return usenetOk(q.candidate as SourceCandidate);
+    return { candidates: [] };
+  });
+  put(h2);
+  check(h2);
+  const rec = h2.cache.get<{ releases: VerifiedAlbumRelease[]; negative?: boolean }>(albumCacheKey(album.id));
+  assert.ok(!rec?.negative);
+  assert.ok(rec?.releases.some((r) => r.releaseId === fb.releaseId), "the record keeps the fallback release");
+});
+
+test("review b20 / 2: the answer is capped and the same on every call; new sources first, then the earlier answer in its order", () => {
+  const album = albumOf("al-9651", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 5), {}, 240);
+  const item = trackItemFor(album, 1);
+  const nw: SourceCandidate = { title: "Test Band - Test Album (2001) FLAC", indexer: "NZBgeek", nzbUrl: "https://nzb.test/new", size: 150_000_000 };
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: /Test Album$/.test(q.query || "") ? [nw] : [] };
+    if (q.kind === "release_files") return { candidates: [{ ...(q.candidate as SourceCandidate), files: filesOf(album.tracks.map((t, i) => `${pad2(i + 1)} ${t.title}.flac`)) }] };
+    if (q.kind === "usenet_check") return usenetOk(q.candidate as SourceCandidate);
+    return { candidates: [] };
+  });
+  const olds = ["a", "b", "c", "d", "e"].map((n) => ({ ...verifiedFor(album, n, { all: true, score: 1 }), partial: true, releaseId: `nzb:https://nzb.test/${n}`, qualityTier: "lossy" as const }));
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, resumes: 3, probedRefs: olds.map((o) => o.releaseId), releases: olds }, 3_600_000);
+  const ids = (r: { sources: Array<{ id: string }> }) => r.sources.map((s) => s.id.split("/").pop());
+  assert.deepEqual(ids(h.play(item)), ["a", "b", "c", "d", "e"]);
+  advance(h, 10_000);
+  const searched = ids(h.resolver.resolve({ item }));
+  assert.equal(searched.length, MAX_SOURCES_FOR_TEST);
+  assert.equal(searched[0], "new", h.logs.join("\n"));
+  for (let i = 0; i < 4; i++) {
+    advance(h, 10_000);
+    const r = h.resolver.resolve({ item });
+    assert.deepEqual(ids(r), searched, `call ${i} answers what the searching call answered`);
+    assertAllChecked(r.sources);
+  }
+});
+const MAX_SOURCES_FOR_TEST = 5;
+
+test("review b20 / 3: a catalogue label is optional only on a file with none or the same one", () => {
+  const run = (wanted: string, files: string[], release = "Some Artist - Test Album [FLAC]") => {
+    const album = albumOf("al-9660", "Some Artist", "Test Album", 2002, [wanted, ...trackTitles("Other Song", 5)]);
+    const oth = trackTitles("Other Song", 5).map((t, i) => `${pad2(i + 8)} ${t}.flac`);
+    const r = matchTracksInRelease(album, release, filesOf([...files, ...oth], 40_000_000), "flac_preferred");
+    return r.tracks[album.tracks[0].id]?.file;
+  };
+  assert.equal(run("Song (Single Version)", ["01 Song.flac"]), "01 Song.flac");
+  assert.equal(run("Song (Single Version)", ["01 Song (Single Version).flac"]), "01 Song (Single Version).flac");
+  assert.equal(run("Song (Single Version)", ["01 Song (Album Version).flac"]), undefined, "another label");
+  assert.equal(run("Song (Concert Version)", ["01 Song (Studio Version).flac"]), undefined, "another label");
+  assert.equal(run("Song (Single Version)", ["01 Song.flac", "07 Song (Single Version).flac"]), "07 Song (Single Version).flac", "the same label wins");
+  assert.equal(run("Song (Single Version)", ["01 Song (Album Version).flac", "07 Song.flac"]), "07 Song.flac", "unlabelled beats another label");
+  assert.equal(run("Song (Single Version)", ["01 Song (Album Version).flac", "07 Song (Single Version).flac"]), "07 Song (Single Version).flac");
+  // The recording path holds the same rule.
+  const rec = albumOf("al-9661", "Some Artist", "Test Album", 2002, ["Song (Concert Version)"], { recordingTarget: { releaseTrackCount: 12 } });
+  const recRun = (f: string) => matchTracksInRelease(rec, "Some Artist - Test Album [FLAC]", filesOf([f, ...trackTitles("Other Song", 5).map((t, i) => `${pad2(i + 8)} ${t}.flac`)], 40_000_000), "flac_preferred").tracks[rec.tracks[0].id]?.file;
+  assert.equal(recRun("01 Song.flac"), "01 Song.flac");
+  assert.equal(recRun("01 Song (Studio Version).flac"), undefined);
+});
+
+test("review b20 / 4: label forgiveness needs the release's album part to be the album, or the album plus an edition/disc/format suffix", () => {
+  const run = (albumTitle: string, rel: string) => {
+    const album = albumOf("al-9670", "Some Artist", albumTitle, 2002, ["Song (Single Version)", ...trackTitles("Other Song", 5)]);
+    const files = ["01 Song.flac", ...trackTitles("Other Song", 5).map((t, i) => `${pad2(i + 2)} ${t}.flac`)];
+    return Object.keys(matchTracksInRelease(album, rel, filesOf(files, 40_000_000), "flac_preferred").tracks).includes(album.tracks[0].id);
+  };
+  assert.equal(run("Love", "Elvis Presley - Love Me Tender [FLAC]"), false);
+  assert.equal(run("Love", "Elvis Presley - Love Songs [FLAC]"), false);
+  assert.equal(run("Love", "Elvis Presley - Love (1985) [FLAC]"), true);
+  assert.equal(run("The Last Waltz", "Band, The - The Last Waltz, Disc 2 [FLAC]"), true);
+  assert.equal(run("The Last Waltz", "The Band - The Last Waltz (Deluxe) [FLAC]"), true);
+  assert.equal(run("The Last Waltz", "The Band - The Last Waltz 1978 [FLAC]"), true);
+  assert.equal(run("The Last Waltz", "The Band - The Last Waltz Rehearsals [FLAC]"), false);
+  assert.equal(run("Greatest Hits Live", "Artist - Greatest Hits Live [FLAC]"), false);
+  assert.equal(run("The Very Best of Sting", "Sting - The Very Best of Sting [FLAC]"), false);
+  assert.equal(run("Best of Queen", "Queen - Best of Queen [FLAC]"), false);
+});
+
+test("review b20 / 5: carried unscored candidates live 2 minutes and never enter a song query's call", () => {
+  const album = albumOf("al-9680", "The Band", "The Last Waltz", 2002, trackTitles("Waltz Song", 5), {}, 240);
+  const noise = Array.from({ length: 12 }, (_, i): SourceCandidate => ({ title: `Protest Hero ${i} - Pacific Myth ${i} [FLAC]`, indexer: "NZBgeek", nzbUrl: `https://nzb.test/n${i}`, size: 150_000_000 }));
+  let slow = true;
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") { if (slow) { slow = false; advance(h, 3000); } return { candidates: noise }; }
+    return { candidates: [] };
+  });
+  h.resolver.resolve({ item: trackItemFor(album, 0) });
+  const key = `unscored_v1:${album.id}`;
+  assert.ok(h.cache.get(key), "leftovers were carried");
+  advance(h, 119_000);
+  assert.ok(h.cache.get(key), "still there before 2 minutes");
+  advance(h, 2_000);
+  assert.equal(h.cache.get(key), null, "gone after 2 minutes");
+  // A song query call neither reads nor writes them.
+  const listed: string[] = [];
+  const h3 = harness(album, (q) => { if (q.kind === "release_files") listed.push(q.candidate?.title || ""); return { candidates: q.kind === "indexer_search" ? [noise[0]] : [] }; });
+  const marker = { title: "The Band - The Last Waltz [FLAC]", nzbUrl: "https://nzb.test/marker", size: 150_000_000 };
+  h3.cache.set(key, [marker], 120_000);
+  h3.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, resumes: 3, probedRefs: [], releases: [verifiedFor(album, "x", { trackIdx: 3, partial: true })] }, 3_600_000);
+  h3.play(trackItemFor(album, 0));
+  assert.ok(h3.logs.some((l) => /song query/.test(l)), h3.logs.join("\n"));
+  assert.ok(!listed.some((t) => /Last Waltz/.test(t)), "the album's carried candidate is not listed by the song query");
+  assert.deepEqual(h3.cache.get(key), [marker], "and stays for the album's own search");
+});
