@@ -115,6 +115,11 @@ const TRACK_QUERY_TTL_MS = 5 * 60 * 1000;
 function trackQueryKey(albumId: string, itemId: string): string {
   return `trk_q_v1:${albumId}:${itemId}`;
 }
+/** A search that starts afresh for an album the host keeps asking about: at most once per this long. */
+const FRESH_SEARCH_TTL_MS = 10 * 60 * 1000;
+function freshSearchKey(albumId: string): string {
+  return `fresh_search_v1:${albumId}`;
+}
 function servedKey(itemId: string): string {
   return `served_v1:${itemId}`;
 }
@@ -164,7 +169,7 @@ export function formatDroppedAtNameRanking(
 }
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v14:${albumId}`;
+  return `alb_rel_v15:${albumId}`;
 }
 
 /**
@@ -370,7 +375,7 @@ export function pickRecordingReleases(releases: MBRecordingRelease[], ownAlbumTi
 }
 
 function albumStageKey(albumId: string): string {
-  return `alb_stage_v7:${albumId}`;
+  return `alb_stage_v8:${albumId}`;
 }
 
 export function concertCacheKey(concertId: string): string {
@@ -2070,7 +2075,7 @@ export class AlbumResolver {
     // that search is still running, stays unfinished or finds nothing. Looking for more never
     // costs the listener a source that plays.
     let known: { sources: PlayableSource[]; releases: VerifiedAlbumRelease[]; again: { refused: Set<string>; offered: string[] } | null } | null = null;
-    const cached = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
+    let cached = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (cached) {
       if (cached.negative) {
         return this.missOnAlbum(item, excluded, albumId, this.negativeResponseTtlSec(cached), false);
@@ -2080,10 +2085,25 @@ export class AlbumResolver {
         // The host asks again with no exclusion when it refused every source it was given (it
         // reports a failed source only on a failover inside a stream): then more is looked for
         // while the search can go on, else the sources are offered again (see offerSources).
-        const resumable = excluded.size === 0 && !cached.exhausted && cached.releases.length > 0 && (cached.resumes || 0) < MAX_ALBUM_RESUMES;
+        let resumable = excluded.size === 0 && !cached.exhausted && cached.releases.length > 0 && (cached.resumes || 0) < MAX_ALBUM_RESUMES;
         const again = this.repeatOf(item, excluded);
-        if (!again || !resumable || sources.some((s) => !again.refused.has(s.id))) {
+        if (!again || sources.some((s) => !again.refused.has(s.id))) {
           return this.offerSources(item, sources, cached.releases, again, albumId);
+        }
+        // Asked again and nothing new to offer. If the search cannot go on, it starts afresh, once
+        // per album per FRESH_SEARCH_TTL_MS: the record keeps its releases (they are listed already)
+        // and forgets what else it had looked at.
+        if (!resumable && !this.cache.get<number>(freshSearchKey(albumId))) {
+          this.cache.set(freshSearchKey(albumId), 1, FRESH_SEARCH_TTL_MS);
+          cached = { ...cached, exhausted: false, resumes: 0, searchIncomplete: undefined, probedRefs: cached.releases.map((r) => r.releaseId) };
+          this.cache.set(albumCacheKey(albumId), cached, Math.max(60_000, cached.expiresAt - this.env.now()));
+          this.cache.delete(albumStageKey(albumId));
+          resumable = true;
+          this.env.log("debug", `resolve: ${item.id} asked again, nothing new and the search was used up; searching afresh`);
+        }
+        if (!resumable) {
+          // The album's search is done; the song's own queries get their turn, the known sources answer meanwhile.
+          return this.songPhaseKeepingKnown(item, excluded, albumId, { sources, releases: cached.releases, again });
         }
         this.env.log("debug", `resolve: ${item.id} asked again for sources already offered; searching on (resume ${(cached.resumes || 0) + 1})`);
         known = { sources, releases: cached.releases, again };
@@ -2136,7 +2156,9 @@ export class AlbumResolver {
       if (known) return this.offerSources(item, known.sources, known.releases, known.again, albumId);
       return this.missOnAlbum(item, excluded, albumId, fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC, false, true);
     }
-    const sources = this.buildTrackSources(item, fresh.releases, excluded);
+    const built = this.buildTrackSources(item, fresh.releases, excluded);
+    // The sources known before stay, even when this search did not find them again.
+    const sources = known ? [...built, ...known.sources.filter((k) => !built.some((b) => b.id === k.id))] : built;
     if (sources.length === 0) {
       if (known) return this.offerSources(item, known.sources, known.releases, known.again, albumId);
       // A fresh album search ran in this call (and a resumed one has more to list): the song's
@@ -2185,6 +2207,31 @@ export class AlbumResolver {
     state.attempts[query] = (state.attempts[query] || 0) + 1;
     if ((final || state.attempts[query] >= 2) && !state.tried.includes(query)) state.tried.push(query);
     this.cache.set(key, state, TRACK_QUERY_TTL_MS);
+  }
+
+  /**
+   * A repeat with nothing new and the album's search used up: the song's queries run (one per call,
+   * see missOnAlbum) and what they list joins the album's record; the sources known before are in
+   * the answer whatever happens, new ones first.
+   */
+  private songPhaseKeepingKnown(
+    item: KindItem,
+    excluded: Set<string>,
+    albumId: string,
+    known: { sources: PlayableSource[]; releases: VerifiedAlbumRelease[]; again: { refused: Set<string>; offered: string[] } | null }
+  ): KindResolveResponse {
+    const answer = (sources: PlayableSource[], releases: VerifiedAlbumRelease[]) => {
+      const all = [...sources, ...known.sources.filter((k) => !sources.some((b) => b.id === k.id))];
+      return this.offerSources(item, all, releases, known.again, albumId);
+    };
+    const inFlight = this.cache.get<ResolveStage>(albumStageKey(albumId));
+    const next = inFlight?.trackPhase ? "" : this.pendingTrackQueries(item, albumId)[0];
+    if (!inFlight?.trackPhase && !next) return answer([], known.releases);
+    const step = this.stepResolveAlbum(albumId, item, excluded, RESOLVE_STEP_BUDGET_MS, true, next || undefined);
+    if (!step.done) return answer([], known.releases);
+    const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
+    if (!fresh || fresh.negative) return answer([], known.releases);
+    return answer(this.buildTrackSources(item, fresh.releases, excluded), fresh.releases);
   }
 
   /**

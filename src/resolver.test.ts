@@ -4592,3 +4592,51 @@ test("fix 1b: a repeat whose resumed search stays unfinished still answers with 
     assertAllChecked(r.sources, `ask ${i + 1}`);
   }
 });
+
+test("build 19 / 1: an exhausted record with one source the host keeps coming back to: one fresh search, [new, old]; nothing new keeps [old], never pending", () => {
+  const album = albumOf("al-9550", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 5), {}, 240);
+  const item = trackItemFor(album, 1);
+  const one: SourceCandidate = { title: "Test Band - Test Album (2001) [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/one", size: 150_000_000 };
+  const two: SourceCandidate = { title: "Test Band - Test Album (2001) FLAC", indexer: "NZBgeek", nzbUrl: "https://nzb.test/two", size: 150_000_000 };
+  const setup = (found: SourceCandidate[]) => {
+    const sent: string[] = [];
+    const h = harness(album, (q) => {
+      if (q.kind === "indexer_search") { sent.push(q.query || ""); return { candidates: /Test Album$/.test(q.query || "") ? found : [] }; }
+      if (q.kind === "release_files") return { candidates: [{ ...(q.candidate as SourceCandidate), files: filesOf(album.tracks.map((t, i) => `${pad2(i + 1)} ${t.title}.flac`)) }] };
+      if (q.kind === "usenet_check") return usenetOk(q.candidate as SourceCandidate);
+      return { candidates: [] };
+    });
+    h.cache.set(albumCacheKey(album.id), {
+      albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, resumes: 3, probedRefs: ["nzb:https://nzb.test/one"],
+      releases: [{ ...verifiedFor(album, "one", { all: true }), releaseId: "nzb:https://nzb.test/one", candidate: one }],
+    }, 3_600_000);
+    return { h, sent };
+  };
+  // A second release exists: found by the fresh search, new first, old kept.
+  const a = setup([one, two]);
+  assert.equal(a.h.play(item).sources.length, 1);
+  advance(a.h, 10_000);
+  const r = a.h.play(item);
+  assert.deepEqual(r.sources.map((s) => s.id), ["nzb:https://nzb.test/two", "nzb:https://nzb.test/one"], a.h.logs.join("\n"));
+  assertAllChecked(r.sources);
+  // Nothing new: the old source answers every time, no pending, one fresh album search in 10 minutes.
+  const b = setup([one]);
+  b.h.play(item);
+  for (let i = 0; i < 6; i++) {
+    advance(b.h, 10_000);
+    const x = b.h.resolver.resolve({ item });
+    assert.ok(!x.pending, `call ${i + 1} is not pending`);
+    assert.deepEqual(x.sources.map((s) => s.id), ["nzb:https://nzb.test/one"]);
+    assertAllChecked(x.sources);
+  }
+  const albumSearches = () => b.sent.filter((q) => /Test Album$/.test(q)).length;
+  assert.equal(albumSearches(), 1, b.sent.join(" | "));
+  // The song's own queries got their turn on the repeats.
+  assert.ok(b.sent.some((q) => /Disc Song 2/.test(q)), `song query sent: ${b.sent.join(" | ")}`);
+  // Ten minutes on, one more fresh search is allowed.
+  advance(b.h, 11 * 60_000);
+  b.h.play(item);
+  advance(b.h, 10_000);
+  b.h.resolver.resolve({ item });
+  assert.equal(albumSearches(), 2, b.sent.join(" | "));
+});
