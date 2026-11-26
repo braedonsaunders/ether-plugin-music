@@ -33,6 +33,7 @@ import {
   isConcertExtraOrSamplePath,
   isRejectedConcertVideoRelease,
   isRejectedReleaseForRequest,
+  isWrongVersionRelease,
   joinedArtistSpelling,
   normalizeText,
   parseTrackFilename,
@@ -541,6 +542,11 @@ export function preScoreAlbumCandidate(
   const rej = isRejectedReleaseForRequest(relTitle, album.title, album.releaseType);
   if (rej.rejected) {
     return { accepted: false, score: 0, reasons: [rej.reason || "rejected release type"] };
+  }
+
+  const ver = isWrongVersionRelease(relTitle, album.title, album.artistName);
+  if (ver.rejected) {
+    return { accepted: false, score: 0, reasons: [ver.reason || "different version"] };
   }
 
   const qual = classifyReleaseQuality(relTitle, undefined, pref);
