@@ -2763,6 +2763,7 @@ test("a partial folder serves only the tracks it names exactly", () => {
   assert.deepEqual(Object.keys(single.tracks), ["tr-1"]);
 });
 
+
 function clockedResolverFor(album: CanonicalAlbum, onResolve: (q: SourceQuery) => { candidates: SourceCandidate[]; indexers?: Array<{ status: string }> }) {
   const { env } = makeFakeHost({ onResolve });
   let now = 1_760_000_000_000;
@@ -2857,6 +2858,8 @@ test("a refresh that comes back empty or fails keeps the earlier incomplete answ
   assert(searches >= 3, `expected refreshes, got ${searches}`);
   // The first answer's candidate was still probed after the empty and the failed refresh.
   assert(seenLists.some((n) => n >= 2), `candidate lost after refresh: ${JSON.stringify(seenLists)}`);
+});
+
 
 test("dropped-at-name-ranking line: grouping, order, caps, source suffix, null case", () => {
   assert.equal(formatDroppedAtNameRanking("al-1", [], 5), null);
@@ -2909,6 +2912,8 @@ test("names dropped at ranking are logged once per shortlist build, not per poll
   const raws = logs.filter((l) => /raw=\d+/.test(l)).length;
   const drops = logs.filter((l) => /at name ranking/.test(l)).length;
   assert.ok(raws >= 1 && drops <= raws, `raw=${raws} dropped=${drops}`);
+});
+
 
 test("indexerQueryText keeps combining marks of non-Latin scripts and still folds Latin accents", () => {
   assert.equal(indexerQueryText("ทุกคืน"), "ทุกคืน");
@@ -2985,6 +2990,8 @@ test("an album whose tracks share the album artist sends the same queries as bef
   });
   resolver.resolve({ item: trackItemFor(album, 0) });
   assert.deepEqual(queries.slice(0, 2), ["AC DC Highway to Hell", "ACDC Highway to Hell"]);
+});
+
 
 type VersionAlbum = { artistName: string; title: string; year: number; releaseType: "album" | "single"; durationSec: number };
 const versionCheck = (release: string, album: VersionAlbum) =>
