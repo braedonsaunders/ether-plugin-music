@@ -104,8 +104,8 @@ const MAX_USENET_CHECKS_PER_ALBUM = 4;
 /** Probing for a second source beside a lone partial or archive-member one stops after this long. */
 const MORE_PROBING_MAX_MS = 20_000;
 /** A request for a track this soon after the last answer for it is the host asking again (not at once, not much later). */
-const REPEAT_MIN_GAP_MS = 2000;
-const REPEAT_WINDOW_MS = 90_000;
+const REPEAT_MIN_GAP_MS = 5000;
+const REPEAT_WINDOW_MS = 60_000;
 const SERVED_TTL_MS = 5 * 60 * 1000;
 interface TrackQueryState {
   tried: string[];
@@ -124,8 +124,6 @@ interface ServedRecord {
   offered: string[];
   /** Source ids the host came back from. */
   refused: string[];
-  /** The last answer was a whole-album source without a running-time check. */
-  lastResort?: boolean;
 }
 
 export interface DroppedCandidate {
@@ -214,16 +212,40 @@ function recordingPlanKey(isrc: string): string {
  */
 export function durationToleranceFor(durationSec: number, context?: { title?: string; albumTitle?: string }): number {
   if (durationSec < 60) return Math.max(3, Math.round(0.1 * durationSec));
-  // A live, concert, session or demo take, or a remaster-era edition: the catalogue's length is
-  // one performance or pressing of several, so the check allows max(15 s, 10 %).
-  if (context && (SOFT_LENGTH_RE.test(normalizeTitleKey(context.title || "")) || SOFT_LENGTH_RE.test(normalizeTitleKey(context.albumTitle || "")))) {
+  // A live, concert, session or demo recording: the catalogue's length is one performance of
+  // several, so the check allows max(15 s, 10 %).
+  if (context && (isSoftLengthTrackTitle(context.title || "") || isSoftLengthAlbumTitle(context.albumTitle || ""))) {
     return Math.max(15, Math.round(0.1 * durationSec));
   }
   return Math.max(7, Math.round(0.03 * durationSec));
 }
-/** Titles whose catalogue length is unreliable: live and concert takes, sessions, demos, remaster-era editions. */
-const SOFT_LENGTH_RE =
-  /\b(?:live|concert|in concert|unplugged|sessions?|demos?|acoustic|rehearsals?|bbc|mtv|bootleg|remaster(?:ed)?|anniversary|alternate|alternative|outtakes?)\b/;
+const SOFT_WORDS = "live|concert|demo|sessions?|acoustic|unplugged|rehearsal|alternate|alternative";
+/** A track title marked as another take at its END: "(Live at ...)", "[Demo]", "- Live", "(Concert Version)". A bare word does not count. */
+const SOFT_TRACK_RES = [
+  new RegExp(`[\\(\\[]\\s*(?:${SOFT_WORDS})\\b[^\\)\\]]*[\\)\\]]\\s*$`, "i"),
+  new RegExp(`[\\(\\[][^\\)\\]]*\\b(?:live|concert|demo|session|acoustic|unplugged|rehearsal|alternate|alternative)\\s+version\\s*[\\)\\]]\\s*$`, "i"),
+  new RegExp(`\\s[-\\u2013\\u2014]\\s*(?:${SOFT_WORDS})\\b[^-\\u2013\\u2014]*$`, "i"),
+];
+function isSoftLengthTrackTitle(title: string): boolean {
+  const t = String(title || "");
+  // A "(feat. X)" credit after the note does not hide it.
+  const bare = t.replace(/\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]]+[\)\]]\s*$/i, "");
+  return SOFT_TRACK_RES.some((re) => re.test(t) || re.test(bare));
+}
+/** An album title that says it is a live, concert or session recording. Not "anniversary", "remaster", "mtv" alone, a bare "sessions" or "alternative". */
+function isSoftLengthAlbumTitle(title: string): boolean {
+  const t = String(title || "");
+  return (
+    /\blive\s+(?:at|in|from)\b/i.test(t) ||
+    /[\(\[]\s*live\b[^\)\]]*[\)\]]/i.test(t) ||
+    /\s[-\u2013\u2014]\s*live\s*$/i.test(t) ||
+    /\bin\s+concert\b/i.test(t) ||
+    /\bunplugged\b/i.test(t) ||
+    /\b(?:bbc|peel|radio)\s+sessions?\b/i.test(t) ||
+    /[\(\[][^\)\]]*\bsessions?\b[^\)\]]*[\)\]]/i.test(t) ||
+    /[\(\[][^\)\]]*\b(?:live|concert|demo|acoustic|unplugged)\s+version\b[^\)\]]*[\)\]]/i.test(t)
+  );
+}
 /** Below this a running time says too little about the version to be checked. */
 const MIN_VERIFIED_DURATION_SEC = 10;
 
@@ -2180,62 +2202,49 @@ export class AlbumResolver {
   }
 
   /**
-   * The host's failure of a source reaches the plugin only as `client.exclude` on a failover inside
-   * a stream. After a source is refused at open (its real running time is off, it cannot be read)
-   * the host asks again with nothing excluded, which would get the same sources back for ever. So
-   * what was offered is remembered per track for a few minutes: a request that follows within
-   * REPEAT_WINDOW_MS of the last answer (and not at once) is a repeat, and the sources offered
-   * before count as refused.
+   * The host opens every source of an answer in order within one call and saves the resolution only
+   * when all of them succeed; when one is refused (length off) and a later one plays, it asks again
+   * on the next play with nothing excluded. So a request that follows within
+   * REPEAT_MIN_GAP_MS..REPEAT_WINDOW_MS of the last answer is a "repeat": it changes only the order
+   * (sources not offered before first) and lets the search go on for more. It never removes a source
+   * (only `client.exclude` does) and never touches a tolerance.
    */
-  private repeatOf(item: KindItem, excluded: Set<string>): { refused: Set<string>; lastResortDone: boolean } | null {
+  private repeatOf(item: KindItem, excluded: Set<string>): { refused: Set<string>; offered: string[] } | null {
     if (excluded.size > 0) return null;
     const rec = this.cache.get<ServedRecord>(servedKey(item.id));
     if (!rec) return null;
     const age = this.env.now() - rec.at;
     if (age < REPEAT_MIN_GAP_MS || age > REPEAT_WINDOW_MS) return null;
-    return { refused: new Set([...rec.refused, ...rec.offered]), lastResortDone: Boolean(rec.lastResort) };
+    return { refused: new Set([...rec.refused, ...rec.offered]), offered: rec.offered };
   }
 
   /**
-   * The answer for a track that has sources: on a repeat the sources not yet offered come first;
-   * when every one was refused already, the best whole-album one is offered once more without a
-   * running-time check (an edition's real length beats the catalogue's number), the others as they
-   * were. One debug line per source says what was offered.
+   * The answer for a track that has sources: all of them, always with their tolerance. On a repeat
+   * the ones not offered before come first, then the earlier ones in the order they were offered in.
+   * One debug line per source says what was offered.
    */
   private offerSources(
     item: KindItem,
     sources: PlayableSource[],
-    releases: VerifiedAlbumRelease[],
-    again: { refused: Set<string>; lastResortDone: boolean } | null,
-    albumId: string
+    _releases: VerifiedAlbumRelease[],
+    again: { refused: Set<string>; offered: string[] } | null,
+    _albumId: string
   ): KindResolveResponse {
     let out = sources;
-    let lastResort = false;
     let refused: string[] = [];
     if (again) {
       refused = [...again.refused];
+      const rank = (id: string) => again.offered.indexOf(id);
       const fresh = sources.filter((s) => !again.refused.has(s.id));
-      if (fresh.length > 0) {
-        out = [...fresh, ...sources.filter((s) => again.refused.has(s.id))];
-      } else if (!again.lastResortDone) {
-        const pick = sources.find((s) => {
-          const r = releases.find((x) => x.releaseId === s.id);
-          return Boolean(r) && this.isWholeAlbumMatch(item, r!, albumId);
-        });
-        if (pick) {
-          const { durationToleranceSec: _dropped, ...bare } = pick;
-          out = [bare];
-          lastResort = true;
-        }
-      }
+      const before = sources.filter((s) => again.refused.has(s.id)).sort((x, y) => (rank(x.id) < 0 ? 1e9 : rank(x.id)) - (rank(y.id) < 0 ? 1e9 : rank(y.id)));
+      out = [...fresh, ...before];
     }
     this.cache.set<ServedRecord>(servedKey(item.id), {
       at: this.env.now(),
       offered: out.map((s) => s.id),
       refused,
-      ...(lastResort || again?.lastResortDone ? { lastResort: true } : {}),
     }, SERVED_TTL_MS);
-    const tag = again ? (lastResort ? "repeat, last resort without a length check" : "repeat") : "first";
+    const tag = again ? "repeat" : "first";
     out.forEach((s, i) => {
       const rel = s.release;
       this.env.log(
@@ -2244,25 +2253,6 @@ export class AlbumResolver {
       );
     });
     return { sources: out, ttlSec: 3600 };
-  }
-
-  /**
-   * A release that is the whole album, not a loose file or a box-set member: every track (or all
-   * but one) of an album of 3 tracks or more is mapped, and the requested one sits where the
-   * album puts it (a file number that disagrees means another edition's order).
-   */
-  private isWholeAlbumMatch(item: KindItem, rel: VerifiedAlbumRelease, albumId: string): boolean {
-    if (rel.partial || rel.isArchiveFallback || rel.isUnconfirmedDebridFallback) return false;
-    const map = rel.tracks[item.id];
-    if (!map || map.isArchiveMember) return false;
-    const album = this.cache.get<CanonicalAlbum>(`album_v2:${albumId}`);
-    const count = album?.tracks.length || 0;
-    if (count < 3 || Object.keys(rel.tracks).length < count - 1) return false;
-    const hints = (item.hints || {}) as Record<string, unknown>;
-    const wantedNumber = Number(hints.trackNumber || item.index || 0);
-    const parsed = parseTrackFilename(String(map.file || map.fileHint || ""), album?.discCount || 1);
-    if (parsed.track !== null && wantedNumber > 0 && parsed.track !== wantedNumber) return false;
-    return true;
   }
 
   /**

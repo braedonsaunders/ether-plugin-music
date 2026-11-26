@@ -4150,7 +4150,19 @@ test("fix 1a: a live, concert, session or demo track gets max(15 s, 10 %); a pla
   assert.equal(durationToleranceFor(254, { title: "Come As You Are (Live)" }), 25, "10 % of 254 s");
   assert.equal(durationToleranceFor(120, { title: "Intro" , albumTitle: "MTV Unplugged in New York" }), 15, "the album marks it");
   assert.equal(durationToleranceFor(200, { title: "Song (Demo)" }), 20);
-  assert.equal(durationToleranceFor(200, { title: "Song", albumTitle: "Album (2011 Remastered)" }), 20);
+  assert.equal(durationToleranceFor(200, { title: "Song", albumTitle: "Album (2011 Remastered)" }), 7, "a remaster has the same length");
+  assert.equal(durationToleranceFor(240, { title: "Live Forever", albumTitle: "Definitely Maybe" }), 7, "a bare word in the title");
+  assert.equal(durationToleranceFor(240, { title: "Song", albumTitle: "Sessions" }), 7);
+  assert.equal(durationToleranceFor(240, { title: "Song", albumTitle: "Alternative Nation" }), 7);
+  assert.equal(durationToleranceFor(240, { title: "Song", albumTitle: "MTV Hits" }), 7);
+  assert.equal(durationToleranceFor(240, { title: "Live and Let Die" }), 7);
+  assert.equal(durationToleranceFor(240, { title: "Come As You Are (Live)", albumTitle: "MTV Unplugged In New York" }), 24);
+  assert.equal(durationToleranceFor(240, { title: "Caravan (feat. Van Morrison) (Concert Version)", albumTitle: "The Last Waltz (Deluxe Version)" }), 24);
+  assert.equal(durationToleranceFor(240, { title: "Blow Your House Down", albumTitle: "Achtung Baby (Deluxe Edition)" }), 7);
+  assert.equal(durationToleranceFor(240, { title: "Song - Live at Wembley" }), 24);
+  assert.equal(durationToleranceFor(240, { title: "Song", albumTitle: "Live at Wembley" }), 24);
+  assert.equal(durationToleranceFor(240, { title: "Song", albumTitle: "BBC Sessions" }), 24);
+  assert.equal(durationToleranceFor(240, { title: "Song [Demo]" }), 24);
   assert.equal(durationToleranceFor(254, { title: "Come As You Are", albumTitle: "Nevermind" }), 8);
   assert.equal(durationToleranceFor(30, { title: "Live Intro" }), 3, "under a minute the old rule stays");
   // End to end: the source carries the wide tolerance for a live track of an unplugged album.
@@ -4168,74 +4180,63 @@ function advance(h: { env: HostEnv }, ms: number): void {
   h.env.now = () => at;
 }
 
-test("fix 1b/1c: sources the host came back from are not offered first again; a whole album is offered once without a length check", () => {
+/** No answer ever lacks a tolerance: a source leaves the plugin checked or not at all. */
+function assertAllChecked(sources: Array<{ durationSec?: number; durationToleranceSec?: number }>, note = ""): void {
+  for (const s of sources) assert.ok((s.durationToleranceSec ?? 0) > 0, `a source without durationToleranceSec ${note}`);
+}
+
+test("fix 1b: a repeat never drops a source or its tolerance; sources not offered before lead, the rest keep their order", () => {
   const album = albumOf("al-9502", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 6), {}, 254);
   const item = trackItemFor(album, 1);
   const h = harness(album, () => ({ candidates: [] }));
-  const put = (releases: VerifiedAlbumRelease[], extra: Record<string, unknown> = { exhausted: true }) =>
-    h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases, ...extra }, 3_600_000);
+  const put = (releases: VerifiedAlbumRelease[]) =>
+    h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases, exhausted: true }, 3_600_000);
+  const labels = (r: { sources: Array<{ label?: string }> }) => r.sources.map((s) => s.label);
 
-  // Two whole albums: after the host came back, the one it was not given first leads.
   put([verifiedFor(album, "a", { all: true, score: 200 }), verifiedFor(album, "b", { all: true, score: 100 })]);
   const first = h.play(item);
-  assert.deepEqual(first.sources.map((s) => s.label), ["FLAC a", "FLAC b"]);
-  advance(h, 5000);
-  const again = h.play(item);
-  // Both were offered and both came back: the best whole album is tried once more without the length check.
-  assert.deepEqual(again.sources.map((s) => s.label), ["FLAC a"]);
-  assert.equal(again.sources[0].durationToleranceSec, undefined, "last resort: no tolerance");
-  assert.equal(again.sources[0].durationSec, 254);
-  advance(h, 5000);
-  const third = h.play(item);
-  assert.ok(third.sources.length >= 1);
-  assert.ok(third.sources.every((s) => s.durationToleranceSec !== undefined), "the last resort is offered once only");
-  assert.ok(h.logs.some((l) => /serve tr-950202 #1 \(repeat, last resort without a length check\)/.test(l)), h.logs.join("\n"));
-
-  // One answer, one source: Nirvana's case. The host refused the only source, asks again.
+  assert.deepEqual(labels(first), ["FLAC a", "FLAC b"]);
+  assertAllChecked(first.sources);
+  // The host refused a and played b; it asks again later: both are still there, a before b, checked.
+  for (let i = 0; i < 3; i++) {
+    advance(h, 10_000);
+    const again = h.play(item);
+    assert.deepEqual(labels(again), ["FLAC a", "FLAC b"], `repeat ${i + 1}`);
+    assertAllChecked(again.sources, `repeat ${i + 1}`);
+    assert.equal(again.sources[0].durationToleranceSec, 8);
+  }
+  // A source found since is offered first; the earlier ones follow in their order.
+  put([verifiedFor(album, "a", { all: true, score: 200 }), verifiedFor(album, "b", { all: true, score: 100 }), verifiedFor(album, "c", { all: true, score: 50 })]);
+  advance(h, 10_000);
+  const withC = h.play(item);
+  assert.deepEqual(labels(withC), ["FLAC c", "FLAC a", "FLAC b"]);
+  assertAllChecked(withC.sources);
+  // One source alone (Nirvana): still checked on every repeat, never stripped.
   const solo = trackItemFor(album, 2);
   put([verifiedFor(album, "only", { all: true, trackIdx: 2 })]);
   assert.equal(h.play(solo).sources[0].durationToleranceSec, 8);
-  advance(h, 5000);
-  assert.equal(h.play(solo).sources[0].durationToleranceSec, undefined);
-
-  // A new source that appears is offered before the refused one (not a whole album: no last resort).
-  const item3 = trackItemFor(album, 3);
-  put([verifiedFor(album, "x", { all: true, trackIdx: 3 })]);
-  h.play(item3);
-  advance(h, 5000);
-  put([verifiedFor(album, "x", { all: true, trackIdx: 3 }), verifiedFor(album, "y", { all: true, trackIdx: 3, score: 50 })]);
-  assert.deepEqual(h.play(item3).sources.map((s) => s.label), ["FLAC y", "FLAC x"]);
-
-  // Never for a loose single file, a partial release or a box-set member.
-  for (const [name, rel] of [
-    ["loose", verifiedFor(album, "loose", { trackIdx: 4 })],
-    ["partial", verifiedFor(album, "part", { trackIdx: 4, partial: true })],
-    ["member", verifiedFor(album, "mem", { trackIdx: 4, member: true, partial: true })],
-  ] as Array<[string, VerifiedAlbumRelease]>) {
-    const it = trackItemFor(album, 4);
-    put([rel]);
-    h.play(it);
-    advance(h, 5000);
-    const r = h.play(it);
-    assert.equal(r.sources.length, 1, name);
-    assert.equal(r.sources[0].durationToleranceSec, 8, `${name}: the check stays`);
-    advance(h, 200_000);
+  for (let i = 0; i < 3; i++) {
+    advance(h, 10_000);
+    const r = h.play(solo);
+    assert.equal(r.sources.length, 1);
+    assertAllChecked(r.sources);
   }
+  assert.ok(h.logs.every((l) => !/last resort/.test(l)));
 
-  // Not a repeat: the same track asked again at once, or long after, is answered as before.
+  // Not a repeat: at once (under 5 s), long after (over 60 s), or with an exclusion.
   const it5 = trackItemFor(album, 5);
-  put([verifiedFor(album, "w", { all: true, trackIdx: 5 })]);
+  put([verifiedFor(album, "x", { all: true, trackIdx: 5 }), verifiedFor(album, "y", { all: true, trackIdx: 5, score: 50 })]);
   h.play(it5);
-  assert.equal(h.play(it5).sources[0].durationToleranceSec, 8, "at once");
+  assert.deepEqual(labels(h.play(it5)), ["FLAC x", "FLAC y"]);
   advance(h, 400_000);
-  assert.equal(h.play(it5).sources[0].durationToleranceSec, 8, "much later");
-  // A failover with an exclusion is never a repeat.
-  advance(h, 5000);
-  const ex = h.play(it5, ["nzb:https://nzb.test/other"]);
-  assert.equal(ex.sources[0].durationToleranceSec, 8);
+  assert.deepEqual(labels(h.play(it5)), ["FLAC x", "FLAC y"]);
+  advance(h, 10_000);
+  const ex = h.play(it5, ["nzb:https://nzb.test/x"]);
+  assert.deepEqual(labels(ex), ["FLAC y"], "only client.exclude removes a source");
+  assertAllChecked(ex.sources);
 });
 
-test("fix 1b: when every source came back and the search is not finished, it goes on and the new release leads", () => {
+test("fix 1b: when the album search is not finished, a repeat goes on searching and the new release leads, the old ones kept", () => {
   const album = albumOf("al-9503", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 5), {}, 240);
   const item = trackItemFor(album, 1);
   const one: SourceCandidate = { title: "Test Band - Test Album (2001) [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/one", size: 150_000_000 };
@@ -4255,11 +4256,12 @@ test("fix 1b: when every source came back and the search is not finished, it goe
   }, 3_600_000);
   const first = h.play(item);
   assert.equal(first.sources.length, 1);
-  advance(h, 5000);
+  advance(h, 10_000);
   const again = h.play(item);
   assert.equal(again.sources.length, 2, h.logs.join("\n"));
   assert.equal(again.sources[0].id, "nzb:https://nzb.test/two", "the release found now leads");
   assert.equal(again.sources[1].id, "nzb:https://nzb.test/one");
+  assertAllChecked(again.sources);
 });
 
 test("fix 2: probing does not stop at a lone archive member or partial release; whole plain files lead", () => {
