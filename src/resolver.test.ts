@@ -4110,3 +4110,45 @@ test("round 3: an album-level note is forgiven on the track's side only; hyphen-
   // A short title gets no such tolerance.
   assert.equal(serves(para, "Dump", dump("03 - Other Artist - Yellow.mp3")), false);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Build 18 fixes
+// ---------------------------------------------------------------------------------------------
+
+/** A verified release holding the first track of `album` (a stand-in for what the album stage cached). */
+function verifiedFor(album: CanonicalAlbum, id: string, opts: { partial?: boolean; kind?: "usenet" | "plugin"; member?: boolean; trackIdx?: number; all?: boolean; file?: string; score?: number } = {}): VerifiedAlbumRelease {
+  const kind = opts.kind || "usenet";
+  const tracks: VerifiedAlbumRelease["tracks"] = {};
+  const idxs = opts.all ? album.tracks.map((_, i) => i) : [opts.trackIdx ?? 0];
+  for (const i of idxs) {
+    const file = i === (opts.trackIdx ?? 0) && opts.file ? opts.file : `${pad2(i + 1)} ${album.tracks[i].title}.flac`;
+    tracks[album.tracks[i].id] = opts.member
+      ? { fileHint: file, isArchiveMember: true, size: 30_000_000, mime: "audio/flac", confidence: 0.95 }
+      : { fileIndex: i, file, fileHint: file, size: 30_000_000, mime: "audio/flac", confidence: 0.95 };
+  }
+  return {
+    releaseId: kind === "usenet" ? `nzb:https://nzb.test/${id}` : `plg:community.slsksource:${id}`,
+    sourceKind: kind,
+    qualityTier: "flac", codec: "FLAC", mime: "audio/flac", label: `FLAC ${id}`, score: opts.score ?? 100,
+    candidate: kind === "usenet" ? { title: id, nzbUrl: `https://nzb.test/${id}` } : { title: id, pluginRelease: { plugin: "community.slsksource", id } },
+    ...(opts.partial ? { partial: true } : {}),
+    tracks,
+  };
+}
+
+test("fix 1a: a live, concert, session or demo track gets max(15 s, 10 %); a plain one keeps max(7 s, 3 %)", () => {
+  assert.equal(durationToleranceFor(254), 8);
+  assert.equal(durationToleranceFor(254, { title: "Come As You Are (Live)" }), 25, "10 % of 254 s");
+  assert.equal(durationToleranceFor(120, { title: "Intro" , albumTitle: "MTV Unplugged in New York" }), 15, "the album marks it");
+  assert.equal(durationToleranceFor(200, { title: "Song (Demo)" }), 20);
+  assert.equal(durationToleranceFor(200, { title: "Song", albumTitle: "Album (2011 Remastered)" }), 20);
+  assert.equal(durationToleranceFor(254, { title: "Come As You Are", albumTitle: "Nevermind" }), 8);
+  assert.equal(durationToleranceFor(30, { title: "Live Intro" }), 3, "under a minute the old rule stays");
+  // End to end: the source carries the wide tolerance for a live track of an unplugged album.
+  const album = albumOf("al-9501", "Nirvana", "MTV Unplugged In New York", 1994, ["About a Girl", "Come As You Are (Live)", "Polly"], {}, 254);
+  const h = harness(album, () => ({ candidates: [] }));
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: true, releases: [verifiedFor(album, "one", { trackIdx: 1 })] }, 3_600_000);
+  const r = h.play(trackItemFor(album, 1));
+  assert.equal(r.sources[0].durationSec, 254);
+  assert.equal(r.sources[0].durationToleranceSec, 25);
+});

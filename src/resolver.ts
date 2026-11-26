@@ -178,10 +178,18 @@ function recordingPlanKey(isrc: string): string {
  * inside, a radio edit, a live take or an extended mix does not. Under 60 s: 10 %, at least 3 s
  * (a 20 s intro may be off by 3 s, not by 10). Tune here.
  */
-export function durationToleranceFor(durationSec: number): number {
+export function durationToleranceFor(durationSec: number, context?: { title?: string; albumTitle?: string }): number {
   if (durationSec < 60) return Math.max(3, Math.round(0.1 * durationSec));
+  // A live, concert, session or demo take, or a remaster-era edition: the catalogue's length is
+  // one performance or pressing of several, so the check allows max(15 s, 10 %).
+  if (context && (SOFT_LENGTH_RE.test(normalizeTitleKey(context.title || "")) || SOFT_LENGTH_RE.test(normalizeTitleKey(context.albumTitle || "")))) {
+    return Math.max(15, Math.round(0.1 * durationSec));
+  }
   return Math.max(7, Math.round(0.03 * durationSec));
 }
+/** Titles whose catalogue length is unreliable: live and concert takes, sessions, demos, remaster-era editions. */
+const SOFT_LENGTH_RE =
+  /\b(?:live|concert|in concert|unplugged|sessions?|demos?|acoustic|rehearsals?|bbc|mtv|bootleg|remaster(?:ed)?|anniversary|alternate|alternative|outtakes?)\b/;
 /** Below this a running time says too little about the version to be checked. */
 const MIN_VERIFIED_DURATION_SEC = 10;
 
@@ -3269,7 +3277,10 @@ export class AlbumResolver {
       // it is off: the one defence against a right-named file of another version. Not for a
       // single-file image of the whole album, whose running time is the album's.
       if (durationSec && durationSec >= MIN_VERIFIED_DURATION_SEC && !isWholeAlbumImage(rel, trackMap, durationSec)) {
-        source.durationToleranceSec = durationToleranceFor(durationSec);
+        source.durationToleranceSec = durationToleranceFor(durationSec, {
+          title: item.title,
+          albumTitle: String(hints.albumTitle || item.fields?.albumTitle || ""),
+        });
       }
       sources.push(source);
     }
