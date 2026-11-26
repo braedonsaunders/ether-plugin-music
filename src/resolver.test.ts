@@ -4573,3 +4573,22 @@ test("fix 8 (partly): a numbered part of a Usenet post is probed after the same 
   assert.equal(part.accepted, true);
   assert.ok(part.score < whole.score - 5, `${part.score} vs ${whole.score}`);
 });
+
+test("fix 1b: a repeat whose resumed search stays unfinished still answers with the sources it has, every time", () => {
+  const album = albumOf("al-9600", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 6), {}, 254);
+  const item = trackItemFor(album, 1);
+  const h = harness(album, (q) => q.kind === "indexer_search"
+    ? ({ candidates: [], pending: [{ indexerId: "slow", indexer: "S" }], indexers: [{ indexerId: "slow", status: "pending" }] } as never)
+    : { candidates: [] });
+  h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases: [verifiedFor(album, "a", { all: true, score: 200 }), verifiedFor(album, "b", { all: true, score: 100 })], exhausted: false, resumes: 0 }, 3_600_000);
+  const first = h.resolver.resolve({ item });
+  assert.deepEqual(first.sources.map((s) => s.label), ["FLAC a", "FLAC b"]);
+  // The host refused a, played b and asks again, many times, while the indexers never finish.
+  for (let i = 0; i < 40; i++) {
+    advance(h, i % 2 ? 1500 : 10_000);
+    const r = h.resolver.resolve({ item });
+    assert.ok(!r.pending, `ask ${i + 1} must not leave the listener waiting`);
+    assert.deepEqual(r.sources.map((s) => s.label), ["FLAC a", "FLAC b"], `ask ${i + 1}`);
+    assertAllChecked(r.sources, `ask ${i + 1}`);
+  }
+});

@@ -2066,6 +2066,10 @@ export class AlbumResolver {
       (Array.isArray(req.client?.exclude) ? req.client!.exclude : []).map((s) => String(s))
     );
 
+    // Sources already known when a repeat makes the search go on: they are the answer whenever
+    // that search is still running, stays unfinished or finds nothing. Looking for more never
+    // costs the listener a source that plays.
+    let known: { sources: PlayableSource[]; releases: VerifiedAlbumRelease[]; again: { refused: Set<string>; offered: string[] } | null } | null = null;
     const cached = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (cached) {
       if (cached.negative) {
@@ -2081,7 +2085,8 @@ export class AlbumResolver {
         if (!again || !resumable || sources.some((s) => !again.refused.has(s.id))) {
           return this.offerSources(item, sources, cached.releases, again, albumId);
         }
-        this.env.log("debug", `resolve: ${item.id} every source was refused by the host; searching on (resume ${(cached.resumes || 0) + 1})`);
+        this.env.log("debug", `resolve: ${item.id} asked again for sources already offered; searching on (resume ${(cached.resumes || 0) + 1})`);
+        known = { sources, releases: cached.releases, again };
       }
       // Every cached release was excluded on failover: the album is resolved again, once per
       // distinct exclude set (the record keeps the set it was resolved under; polls of the
@@ -2107,6 +2112,7 @@ export class AlbumResolver {
 
     const step = this.stepResolveAlbum(albumId, item, excluded, RESOLVE_STEP_BUDGET_MS, true);
     if (!step.done) {
+      if (known) return this.offerSources(item, known.sources, known.releases, known.again, albumId);
       return {
         pending: true,
         retryInMs: step.retryInMs ?? 250,
@@ -2114,6 +2120,7 @@ export class AlbumResolver {
       };
     }
     if (step.inconclusive) {
+      if (known) return this.offerSources(item, known.sources, known.releases, known.again, albumId);
       // The search stayed unfinished through its tries. Releases found earlier hold other tracks
       // but not this one: only now is the song looked for on its other releases, briefly and
       // without remembering a miss.
@@ -2126,10 +2133,12 @@ export class AlbumResolver {
 
     const fresh = this.cache.get<CachedAlbumResolution>(albumCacheKey(albumId));
     if (!fresh || fresh.releases.length === 0) {
+      if (known) return this.offerSources(item, known.sources, known.releases, known.again, albumId);
       return this.missOnAlbum(item, excluded, albumId, fresh ? this.negativeResponseTtlSec(fresh) : NEGATIVE_RESPONSE_EMPTY_TTL_SEC, false, true);
     }
     const sources = this.buildTrackSources(item, fresh.releases, excluded);
     if (sources.length === 0) {
+      if (known) return this.offerSources(item, known.sources, known.releases, known.again, albumId);
       // A fresh album search ran in this call (and a resumed one has more to list): the song's
       // own search follows on the next call.
       return this.missOnAlbum(
@@ -2212,7 +2221,7 @@ export class AlbumResolver {
   private repeatOf(item: KindItem, excluded: Set<string>): { refused: Set<string>; offered: string[] } | null {
     if (excluded.size > 0) return null;
     const rec = this.cache.get<ServedRecord>(servedKey(item.id));
-    if (!rec) return null;
+    if (!rec || typeof rec.at !== "number" || !Array.isArray(rec.offered) || !Array.isArray(rec.refused)) return null;
     const age = this.env.now() - rec.at;
     if (age < REPEAT_MIN_GAP_MS || age > REPEAT_WINDOW_MS) return null;
     return { refused: new Set([...rec.refused, ...rec.offered]), offered: rec.offered };
