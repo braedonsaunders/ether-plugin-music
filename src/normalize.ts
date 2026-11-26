@@ -369,6 +369,89 @@ export function isRejectedReleaseForRequest(
   return { rejected: false };
 }
 
+const VERSION_REMIX_RE =
+  /\b(?:remix(?:es|ed)?|rmx|mixed by|dj mix|club mix|extended mix|radio edit|radio mix|dub mix|vip mix)\b/;
+const VERSION_LIVE_RE = /\b(?:live|in concert|unplugged|bootleg|soundboard|broadcast)\b/;
+// Alternate mixes. "5.1"/"4.1" are matched on the raw text because normalizeText splits them.
+const VERSION_ALT_RE =
+  /\b(?:quad|quadraphonic|surround|atmos|instrumentals?|karaoke|a ?cappella|demos?|acoustic|drumless|mono mix|stereo mix)\b/g;
+const VERSION_SURROUND_RE = /(?<![\d.])[457]\.1(?:ch)?(?![\d])/g;
+const VERSION_VOLUME_RE = /\b(volume|vol|part|pt) (\d{1,2})\b/g;
+
+/**
+ * Name-level gate for a different VERSION of the requested recording: a release name that
+ * declares a remix, live recording, alternate mix, or another volume/part which the requested
+ * album title (full, with its edition suffix) does not declare. Markers in the artist name
+ * (the band "Live") are ignored. Cheap: a handful of precompiled regexes per call.
+ */
+export function isWrongVersionRelease(
+  releaseTitle: string,
+  requestedAlbumTitle: string,
+  artistName = ""
+): { rejected: boolean; reason?: string } {
+  const rawRel = String(releaseTitle || "").toLowerCase();
+  const rawReq = String(requestedAlbumTitle || "").toLowerCase();
+  let rel = normalizeText(releaseTitle);
+  const req = normalizeText(requestedAlbumTitle);
+
+  // Drop the artist's own name (first occurrence) so "Live", "Broadcast" etc. as artists don't count.
+  const artist = normalizeText(artistName);
+  if (artist) {
+    const padded = ` ${rel} `;
+    const at = padded.indexOf(` ${artist} `);
+    if (at >= 0) rel = (padded.slice(0, at) + " " + padded.slice(at + artist.length + 1)).trim();
+  }
+
+  if (VERSION_REMIX_RE.test(rel) && !VERSION_REMIX_RE.test(req)) {
+    return { rejected: true, reason: "remix, not requested" };
+  }
+
+  if (VERSION_LIVE_RE.test(rel) && !VERSION_LIVE_RE.test(req)) {
+    return { rejected: true, reason: "live recording, not requested" };
+  }
+
+  const altOf = (norm: string, raw: string): Set<string> => {
+    const out = new Set<string>();
+    for (const m of norm.matchAll(VERSION_ALT_RE)) out.add(m[0].replace(/s$/, "").replace(/ /g, ""));
+    for (const m of raw.matchAll(VERSION_SURROUND_RE)) out.add("surround");
+    return out;
+  };
+  const relAlt = altOf(rel, rawRel);
+  if (relAlt.size > 0) {
+    const reqAlt = altOf(req, rawReq);
+    for (const a of relAlt) {
+      if (!reqAlt.has(a)) {
+        return { rejected: true, reason: "alternate mix, not requested" };
+      }
+    }
+  }
+
+  const volOf = (norm: string): Map<string, Set<string>> => {
+    const out = new Map<string, Set<string>>();
+    for (const m of norm.matchAll(VERSION_VOLUME_RE)) {
+      const fam = m[1] === "part" || m[1] === "pt" ? "part" : "volume";
+      const n = String(Number(m[2]));
+      (out.get(fam) || out.set(fam, new Set()).get(fam)!).add(n);
+    }
+    return out;
+  };
+  const relVol = volOf(rel);
+  if (relVol.size > 0) {
+    const reqVol = volOf(req);
+    for (const [fam, nums] of relVol) {
+      const want = reqVol.get(fam);
+      if (!want) {
+        // The request has no marker of this kind; a request with the other kind (vol vs part) counts as declared.
+        if (reqVol.size === 0) return { rejected: true, reason: "different volume" };
+        continue;
+      }
+      if (![...nums].some((n) => want.has(n))) return { rejected: true, reason: "different volume" };
+    }
+  }
+
+  return { rejected: false };
+}
+
 export interface AudioFormatInfo {
   ext: string;
   mime: string;

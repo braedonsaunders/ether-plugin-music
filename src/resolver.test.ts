@@ -2761,3 +2761,48 @@ test("a partial folder serves only the tracks it names exactly", () => {
   assert.equal(single.matched, true);
   assert.deepEqual(Object.keys(single.tracks), ["tr-1"]);
 });
+
+type VersionAlbum = { artistName: string; title: string; year: number; releaseType: "album" | "single"; durationSec: number };
+const versionCheck = (release: string, album: VersionAlbum) =>
+  preScoreAlbumCandidate({ title: release, nzbUrl: "https://x.test/1", indexer: "x" } as never, album, "flac_preferred");
+const va = (artistName: string, title: string, year = 2000, releaseType: "album" | "single" = "album"): VersionAlbum =>
+  ({ artistName, title, year, releaseType, durationSec: 2400 });
+
+test("name gate rejects releases that declare a version the request does not", () => {
+  const cases: Array<[string, VersionAlbum, RegExp]> = [
+    ["U2.-.Atomic.City.(Tiësto.Remix).(2024).[24Bit-48kHz].FLAC", va("U2", "Atomic City", 2023, "single"), /remix/],
+    ["Buena.Vista.Social.Club-Buena.Vista.Social.Club.At.Carnegie.Hall.Live", va("Buena Vista Social Club", "Buena Vista Social Club", 1997), /live/],
+    ["Delaney Davidson & Marlon Williams - Sad But True: Volume 1 (2012) MP3", va("Delaney Davidson", "Sad But True", 2020), /volume/],
+    ["Pink Floyd-1974-Dark Side Of The Moon (Alan Parson's 4.1 Mix) (2496 FLAC)", va("Pink Floyd", "The Dark Side of the Moon", 1973), /alternate mix/],
+  ];
+  for (const [rel, album, re] of cases) {
+    const r = versionCheck(rel, album);
+    assert.equal(r.accepted, false, rel);
+    assert.match(r.reasons.join(","), re, rel);
+  }
+});
+
+test("name gate keeps the requested version and ordinary edition words", () => {
+  const cases: Array<[string, VersionAlbum]> = [
+    ["U2-Atomic_City-SINGLE-WEB-FLAC-2023-GRP", va("U2", "Atomic City", 2023, "single")],
+    ["Buena Vista Social Club - Buena Vista Social Club (1997) [FLAC]", va("Buena Vista Social Club", "Buena Vista Social Club", 1997)],
+    ["Pink Floyd - The Dark Side Of The Moon (1973) [2011 Remaster] [FLAC 24-96]", va("Pink Floyd", "The Dark Side of the Moon", 1973)],
+    ["Nirvana - MTV Unplugged in New York (1994) FLAC", va("Nirvana", "MTV Unplugged in New York", 1994)],
+    ["Hole - Live Through This (1994) [FLAC]", va("Hole", "Live Through This", 1994)],
+    ["Live - Throwing Copper (1994) FLAC", va("Live", "Throwing Copper", 1994)],
+    ["Daft Punk - Alive 2007 (2007) [FLAC]", va("Daft Punk", "Alive 2007", 2007)],
+    ["Linkin Park - Reanimation (2002) FLAC", va("Linkin Park", "Reanimation", 2002)],
+    ["Daft Punk - Random Access Memories (Drumless Edition) FLAC", va("Daft Punk", "Random Access Memories (Drumless Edition)", 2013)],
+    ["Nirvana - Nevermind (30th Anniversary Super Deluxe) (2021) [FLAC]", va("Nirvana", "Nevermind (Remastered)", 1991)],
+    ["Linkin Park - Hybrid Theory (Live Around The World) FLAC", va("Linkin Park", "Hybrid Theory (Live Around the World)", 2000)],
+    ["Artist - Album Remixes (2021) FLAC", va("Artist", "Album (Remixes)", 2021)],
+    ["Artist - Volume 2 (2005) FLAC", va("Artist", "Volume 2", 2005)],
+  ];
+  for (const [rel, album] of cases) {
+    const r = versionCheck(rel, album);
+    assert.equal(r.accepted, true, `${rel}: ${r.reasons.join(",")}`);
+  }
+  const v1 = versionCheck("Artist - Volume 1 (2004) FLAC", va("Artist", "Volume 2", 2005));
+  assert.equal(v1.accepted, false);
+  assert.match(v1.reasons.join(","), /volume/);
+});
