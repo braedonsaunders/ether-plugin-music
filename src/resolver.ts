@@ -67,6 +67,43 @@ const MAX_PLUGIN_PROBES = 4;
 const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
 
+export interface DroppedCandidate {
+  name: string;
+  indexer?: string;
+  reason: string;
+}
+
+/**
+ * One debug line saying what name ranking dropped and why, or null when nothing was dropped.
+ * Reasons are grouped by count (4 most frequent, ties in first-seen order), 3 example names each,
+ * names cut to 70 characters, the whole line capped near 900 characters.
+ */
+export function formatDroppedAtNameRanking(
+  albumId: string,
+  dropped: DroppedCandidate[],
+  total: number
+): string | null {
+  if (dropped.length === 0) return null;
+  const groups = new Map<string, { count: number; examples: string[] }>();
+  for (const d of dropped) {
+    const reason = d.reason || "no reason";
+    let g = groups.get(reason);
+    if (!g) {
+      g = { count: 0, examples: [] };
+      groups.set(reason, g);
+    }
+    g.count++;
+    if (g.examples.length < 3) {
+      const name = d.name.length > 70 ? `${d.name.slice(0, 70)}...` : d.name;
+      g.examples.push(`"${name}"${d.indexer ? ` (${d.indexer})` : ""}`);
+    }
+  }
+  const top = [...groups.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 4);
+  const body = top.map(([reason, g]) => `${reason} x${g.count} [${g.examples.join(", ")}]`).join("; ");
+  const line = `resolve-album: ${albumId} dropped ${dropped.length} of ${total} at name ranking: ${body}`;
+  return line.length > 900 ? `${line.slice(0, 897)}...` : line;
+}
+
 export function albumCacheKey(albumId: string): string {
   return `alb_rel_v11:${albumId}`;
 }
@@ -2062,12 +2099,19 @@ export class AlbumResolver {
 
     // Pre-rank candidates (rejecting compilations, discographies, live bootlegs, lossy if lossless_only).
     const preRanked: Array<{ cand: SourceCandidate; score: number }> = [];
+    const droppedAtNames: DroppedCandidate[] = [];
     for (const cand of rawCandidates) {
       const isUsenet = isUsenetCandidate(cand);
-      if (!isUsenet && !cand.cached && !isPluginCandidate(cand)) continue;
+      if (!isUsenet && !cand.cached && !isPluginCandidate(cand)) {
+        droppedAtNames.push({ name: cand.title || "", indexer: cand.indexer, reason: "uncached torrent" });
+        continue;
+      }
 
       const pre = scoreOf(cand, false);
-      if (!pre.accepted) continue;
+      if (!pre.accepted) {
+        droppedAtNames.push({ name: cand.title || "", indexer: cand.indexer, reason: pre.reasons[0] || "no reason" });
+        continue;
+      }
       preRanked.push({ cand, score: pre.score });
     }
 
@@ -2118,6 +2162,8 @@ export class AlbumResolver {
       "info",
       `resolve-album: ${album.id} raw=${rawCandidates.length} debridChecked=${hashesToCheck.length} preRanked=${preRanked.length} debrid=${debridRanked.length} usenet=${usenetDedup.length} unconfirmedDebrid=${Math.min(4, unconfirmedDebrid.length)} plugin=${pluginRanked.length}${unscored > 0 ? ` unscored=${unscored}` : ""} took=${this.env.now() - startMs}ms`
     );
+    const droppedLine = formatDroppedAtNameRanking(album.id, droppedAtNames, rawCandidates.length);
+    if (droppedLine) this.env.log("debug", droppedLine);
     return { ordered, rawCount: totalRawFromIndexer, deferredInFlight: false, incomplete };
   }
 
