@@ -172,7 +172,7 @@ export function formatDroppedAtNameRanking(
 }
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v16:${albumId}`;
+  return `alb_rel_v17:${albumId}`;
 }
 
 /**
@@ -378,7 +378,7 @@ export function pickRecordingReleases(releases: MBRecordingRelease[], ownAlbumTi
 }
 
 function albumStageKey(albumId: string): string {
-  return `alb_stage_v9:${albumId}`;
+  return `alb_stage_v10:${albumId}`;
 }
 
 export function concertCacheKey(concertId: string): string {
