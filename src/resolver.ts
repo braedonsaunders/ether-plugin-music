@@ -93,6 +93,22 @@ const MAX_PLUGIN_PROBES = 4;
 // Room for every kind the shortlist can hold: 6 Debrid, the Usenet ones, 4 unconfirmed, the plugin ones.
 const MAX_FILE_LIST_PROBES = 6 + MAX_USENET_PROBES + 4 + MAX_PLUGIN_PROBES;
 const MAX_USENET_CHECKS_PER_ALBUM = 4;
+/** A request for a track this soon after the last answer for it is the host asking again (not at once, not much later). */
+const REPEAT_MIN_GAP_MS = 2000;
+const REPEAT_WINDOW_MS = 90_000;
+const SERVED_TTL_MS = 5 * 60 * 1000;
+function servedKey(itemId: string): string {
+  return `served_v1:${itemId}`;
+}
+interface ServedRecord {
+  at: number;
+  /** Source ids of the last answer. */
+  offered: string[];
+  /** Source ids the host came back from. */
+  refused: string[];
+  /** The last answer was a whole-album source without a running-time check. */
+  lastResort?: boolean;
+}
 
 export interface DroppedCandidate {
   name: string;
@@ -1943,12 +1959,20 @@ export class AlbumResolver {
       }
       const sources = this.buildTrackSources(item, cached.releases, excluded);
       if (sources.length > 0) {
-        return { sources, ttlSec: 3600 };
+        // The host asks again with no exclusion when it refused every source it was given (it
+        // reports a failed source only on a failover inside a stream): then more is looked for
+        // while the search can go on, else the sources are offered again (see offerSources).
+        const resumable = excluded.size === 0 && !cached.exhausted && cached.releases.length > 0 && (cached.resumes || 0) < MAX_ALBUM_RESUMES;
+        const again = this.repeatOf(item, excluded);
+        if (!again || !resumable || sources.some((s) => !again.refused.has(s.id))) {
+          return this.offerSources(item, sources, cached.releases, again, albumId);
+        }
+        this.env.log("debug", `resolve: ${item.id} every source was refused by the host; searching on (resume ${(cached.resumes || 0) + 1})`);
       }
       // Every cached release was excluded on failover: the album is resolved again, once per
       // distinct exclude set (the record keeps the set it was resolved under; polls of the
       // song's fallback search with the same set must not start the album over each time).
-      if (excluded.size > 0 && cached.excludedSig !== excludedSigOf(excluded)) {
+      if (sources.length === 0 && excluded.size > 0 && cached.excludedSig !== excludedSigOf(excluded)) {
         this.cache.delete(albumCacheKey(albumId));
         this.cache.delete(albumStageKey(albumId));
       } else if (excluded.size === 0 && !cached.exhausted && cached.releases.length > 0 && (cached.resumes || 0) < MAX_ALBUM_RESUMES) {
@@ -1997,7 +2021,93 @@ export class AlbumResolver {
         Boolean(fresh.searchIncomplete)
       );
     }
-    return { sources, ttlSec: 3600 };
+    return this.offerSources(item, sources, fresh.releases, this.repeatOf(item, excluded), albumId);
+  }
+
+  /**
+   * The host's failure of a source reaches the plugin only as `client.exclude` on a failover inside
+   * a stream. After a source is refused at open (its real running time is off, it cannot be read)
+   * the host asks again with nothing excluded, which would get the same sources back for ever. So
+   * what was offered is remembered per track for a few minutes: a request that follows within
+   * REPEAT_WINDOW_MS of the last answer (and not at once) is a repeat, and the sources offered
+   * before count as refused.
+   */
+  private repeatOf(item: KindItem, excluded: Set<string>): { refused: Set<string>; lastResortDone: boolean } | null {
+    if (excluded.size > 0) return null;
+    const rec = this.cache.get<ServedRecord>(servedKey(item.id));
+    if (!rec) return null;
+    const age = this.env.now() - rec.at;
+    if (age < REPEAT_MIN_GAP_MS || age > REPEAT_WINDOW_MS) return null;
+    return { refused: new Set([...rec.refused, ...rec.offered]), lastResortDone: Boolean(rec.lastResort) };
+  }
+
+  /**
+   * The answer for a track that has sources: on a repeat the sources not yet offered come first;
+   * when every one was refused already, the best whole-album one is offered once more without a
+   * running-time check (an edition's real length beats the catalogue's number), the others as they
+   * were. One debug line per source says what was offered.
+   */
+  private offerSources(
+    item: KindItem,
+    sources: PlayableSource[],
+    releases: VerifiedAlbumRelease[],
+    again: { refused: Set<string>; lastResortDone: boolean } | null,
+    albumId: string
+  ): KindResolveResponse {
+    let out = sources;
+    let lastResort = false;
+    let refused: string[] = [];
+    if (again) {
+      refused = [...again.refused];
+      const fresh = sources.filter((s) => !again.refused.has(s.id));
+      if (fresh.length > 0) {
+        out = [...fresh, ...sources.filter((s) => again.refused.has(s.id))];
+      } else if (!again.lastResortDone) {
+        const pick = sources.find((s) => {
+          const r = releases.find((x) => x.releaseId === s.id);
+          return Boolean(r) && this.isWholeAlbumMatch(item, r!, albumId);
+        });
+        if (pick) {
+          const { durationToleranceSec: _dropped, ...bare } = pick;
+          out = [bare];
+          lastResort = true;
+        }
+      }
+    }
+    this.cache.set<ServedRecord>(servedKey(item.id), {
+      at: this.env.now(),
+      offered: out.map((s) => s.id),
+      refused,
+      ...(lastResort || again?.lastResortDone ? { lastResort: true } : {}),
+    }, SERVED_TTL_MS);
+    const tag = again ? (lastResort ? "repeat, last resort without a length check" : "repeat") : "first";
+    out.forEach((s, i) => {
+      const rel = s.release;
+      this.env.log(
+        "debug",
+        `serve ${item.id} #${i + 1} (${tag}) "${String(rel?.candidate?.title || s.id).slice(0, 50)}" file="${String(rel?.fileHint || rel?.file || rel?.track?.title || "").slice(-50)}" dur=${s.durationSec ?? "?"}s tol=${s.durationToleranceSec ?? "none"}`
+      );
+    });
+    return { sources: out, ttlSec: 3600 };
+  }
+
+  /**
+   * A release that is the whole album, not a loose file or a box-set member: every track (or all
+   * but one) of an album of 3 tracks or more is mapped, and the requested one sits where the
+   * album puts it (a file number that disagrees means another edition's order).
+   */
+  private isWholeAlbumMatch(item: KindItem, rel: VerifiedAlbumRelease, albumId: string): boolean {
+    if (rel.partial || rel.isArchiveFallback || rel.isUnconfirmedDebridFallback) return false;
+    const map = rel.tracks[item.id];
+    if (!map || map.isArchiveMember) return false;
+    const album = this.cache.get<CanonicalAlbum>(`album_v2:${albumId}`);
+    const count = album?.tracks.length || 0;
+    if (count < 3 || Object.keys(rel.tracks).length < count - 1) return false;
+    const hints = (item.hints || {}) as Record<string, unknown>;
+    const wantedNumber = Number(hints.trackNumber || item.index || 0);
+    const parsed = parseTrackFilename(String(map.file || map.fileHint || ""), album?.discCount || 1);
+    if (parsed.track !== null && wantedNumber > 0 && parsed.track !== wantedNumber) return false;
+    return true;
   }
 
   /**
@@ -2016,8 +2126,9 @@ export class AlbumResolver {
     const done = this.cache.get<CachedAlbumResolution>(albumCacheKey(recId));
     if (done) {
       if (done.negative) return { sources: [], ttlSec: Math.min(emptyTtlSec, this.negativeResponseTtlSec(done)) };
-      const sources = this.buildTrackSources(item, releasesForItem(done.releases, item.id), excluded);
-      if (sources.length > 0) return { sources, ttlSec: 3600 };
+      const doneReleases = releasesForItem(done.releases, item.id);
+      const sources = this.buildTrackSources(item, doneReleases, excluded);
+      if (sources.length > 0) return this.offerSources(item, sources, doneReleases, this.repeatOf(item, excluded), String(item.parentId || ""));
       if (excluded.size === 0 || done.excludedSig === excludedSigOf(excluded)) return { sources: [], ttlSec: emptyTtlSec };
       this.cache.delete(albumCacheKey(recId));
     }
@@ -2051,8 +2162,9 @@ export class AlbumResolver {
     if (fresh && !fresh.negative && fresh.releases.length > 0) {
       this.cache.set(albumCacheKey(recId), fresh, ALBUM_CACHE_TTL_MS);
       this.cache.delete(recordingPlanKey(isrc));
-      const sources = this.buildTrackSources(item, releasesForItem(fresh.releases, item.id), excluded);
-      if (sources.length > 0) return { sources, ttlSec: 3600 };
+      const freshReleases = releasesForItem(fresh.releases, item.id);
+      const sources = this.buildTrackSources(item, freshReleases, excluded);
+      if (sources.length > 0) return this.offerSources(item, sources, freshReleases, this.repeatOf(item, excluded), String(item.parentId || ""));
     }
     plan.idx++;
     if (plan.idx >= plan.candidates.length) {
@@ -3231,7 +3343,12 @@ export class AlbumResolver {
     const durationSec = Number(hints.durationSec || item.fields?.duration || 0) || undefined;
     const sources: PlayableSource[] = [];
 
-    const order = releases.map((rel, i) => ({ rel, i })).sort((a, b) => Number(Boolean(a.rel.partial)) - Number(Boolean(b.rel.partial)) || a.i - b.i);
+    // Whole albums first; then partial releases, a plain file before a member of an archive (a
+    // box set's member is the likeliest to be another mix, and the host cannot always measure it).
+    const memberOf = (r: VerifiedAlbumRelease) => Number(Boolean(r.partial && r.tracks[item.id]?.isArchiveMember));
+    const order = releases
+      .map((rel, i) => ({ rel, i }))
+      .sort((a, b) => Number(Boolean(a.rel.partial)) - Number(Boolean(b.rel.partial)) || memberOf(a.rel) - memberOf(b.rel) || a.i - b.i);
     for (const { rel, i } of order) {
       if (sources.length >= MAX_SOURCES_PER_TRACK) break;
       if (isReleaseExcluded(excluded, rel.releaseId, rel.candidate, i)) continue;

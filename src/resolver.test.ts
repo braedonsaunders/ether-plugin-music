@@ -4152,3 +4152,103 @@ test("fix 1a: a live, concert, session or demo track gets max(15 s, 10 %); a pla
   assert.equal(r.sources[0].durationSec, 254);
   assert.equal(r.sources[0].durationToleranceSec, 25);
 });
+
+/** Moves the harness's clock on by `ms` (the fake host's clock stands still otherwise). */
+function advance(h: { env: HostEnv }, ms: number): void {
+  const at = h.env.now() + ms;
+  h.env.now = () => at;
+}
+
+test("fix 1b/1c: sources the host came back from are not offered first again; a whole album is offered once without a length check", () => {
+  const album = albumOf("al-9502", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 6), {}, 254);
+  const item = trackItemFor(album, 1);
+  const h = harness(album, () => ({ candidates: [] }));
+  const put = (releases: VerifiedAlbumRelease[], extra: Record<string, unknown> = { exhausted: true }) =>
+    h.cache.set(albumCacheKey(album.id), { albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases, ...extra }, 3_600_000);
+
+  // Two whole albums: after the host came back, the one it was not given first leads.
+  put([verifiedFor(album, "a", { all: true, score: 200 }), verifiedFor(album, "b", { all: true, score: 100 })]);
+  const first = h.play(item);
+  assert.deepEqual(first.sources.map((s) => s.label), ["FLAC a", "FLAC b"]);
+  advance(h, 5000);
+  const again = h.play(item);
+  // Both were offered and both came back: the best whole album is tried once more without the length check.
+  assert.deepEqual(again.sources.map((s) => s.label), ["FLAC a"]);
+  assert.equal(again.sources[0].durationToleranceSec, undefined, "last resort: no tolerance");
+  assert.equal(again.sources[0].durationSec, 254);
+  advance(h, 5000);
+  const third = h.play(item);
+  assert.ok(third.sources.length >= 1);
+  assert.ok(third.sources.every((s) => s.durationToleranceSec !== undefined), "the last resort is offered once only");
+  assert.ok(h.logs.some((l) => /serve tr-950202 #1 \(repeat, last resort without a length check\)/.test(l)), h.logs.join("\n"));
+
+  // One answer, one source: Nirvana's case. The host refused the only source, asks again.
+  const solo = trackItemFor(album, 2);
+  put([verifiedFor(album, "only", { all: true, trackIdx: 2 })]);
+  assert.equal(h.play(solo).sources[0].durationToleranceSec, 8);
+  advance(h, 5000);
+  assert.equal(h.play(solo).sources[0].durationToleranceSec, undefined);
+
+  // A new source that appears is offered before the refused one (not a whole album: no last resort).
+  const item3 = trackItemFor(album, 3);
+  put([verifiedFor(album, "x", { all: true, trackIdx: 3 })]);
+  h.play(item3);
+  advance(h, 5000);
+  put([verifiedFor(album, "x", { all: true, trackIdx: 3 }), verifiedFor(album, "y", { all: true, trackIdx: 3, score: 50 })]);
+  assert.deepEqual(h.play(item3).sources.map((s) => s.label), ["FLAC y", "FLAC x"]);
+
+  // Never for a loose single file, a partial release or a box-set member.
+  for (const [name, rel] of [
+    ["loose", verifiedFor(album, "loose", { trackIdx: 4 })],
+    ["partial", verifiedFor(album, "part", { trackIdx: 4, partial: true })],
+    ["member", verifiedFor(album, "mem", { trackIdx: 4, member: true, partial: true })],
+  ] as Array<[string, VerifiedAlbumRelease]>) {
+    const it = trackItemFor(album, 4);
+    put([rel]);
+    h.play(it);
+    advance(h, 5000);
+    const r = h.play(it);
+    assert.equal(r.sources.length, 1, name);
+    assert.equal(r.sources[0].durationToleranceSec, 8, `${name}: the check stays`);
+    advance(h, 200_000);
+  }
+
+  // Not a repeat: the same track asked again at once, or long after, is answered as before.
+  const it5 = trackItemFor(album, 5);
+  put([verifiedFor(album, "w", { all: true, trackIdx: 5 })]);
+  h.play(it5);
+  assert.equal(h.play(it5).sources[0].durationToleranceSec, 8, "at once");
+  advance(h, 400_000);
+  assert.equal(h.play(it5).sources[0].durationToleranceSec, 8, "much later");
+  // A failover with an exclusion is never a repeat.
+  advance(h, 5000);
+  const ex = h.play(it5, ["nzb:https://nzb.test/other"]);
+  assert.equal(ex.sources[0].durationToleranceSec, 8);
+});
+
+test("fix 1b: when every source came back and the search is not finished, it goes on and the new release leads", () => {
+  const album = albumOf("al-9503", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 5), {}, 240);
+  const item = trackItemFor(album, 1);
+  const one: SourceCandidate = { title: "Test Band - Test Album (2001) [FLAC]", indexer: "NZBgeek", nzbUrl: "https://nzb.test/one", size: 150_000_000 };
+  const two: SourceCandidate = { title: "Test Band - Test Album (2001) FLAC", indexer: "NZBgeek", nzbUrl: "https://nzb.test/two", size: 150_000_000 };
+  const h = harness(album, (q) => {
+    if (q.kind === "indexer_search") return { candidates: [one, two] };
+    if (q.kind === "release_files") {
+      const c = q.candidate as SourceCandidate;
+      return { candidates: [{ ...c, files: filesOf(album.tracks.map((t, i) => `${pad2(i + 1)} ${t.title}.flac`)) }] };
+    }
+    if (q.kind === "usenet_check") return usenetOk(q.candidate as SourceCandidate);
+    return { candidates: [] };
+  });
+  h.cache.set(albumCacheKey(album.id), {
+    albumId: album.id, resolvedAt: 0, expiresAt: Date.now() + 3_600_000, exhausted: false, resumes: 0, probedRefs: ["nzb:https://nzb.test/one"],
+    releases: [{ ...verifiedFor(album, "one", { all: true }), releaseId: "nzb:https://nzb.test/one", candidate: one }],
+  }, 3_600_000);
+  const first = h.play(item);
+  assert.equal(first.sources.length, 1);
+  advance(h, 5000);
+  const again = h.play(item);
+  assert.equal(again.sources.length, 2, h.logs.join("\n"));
+  assert.equal(again.sources[0].id, "nzb:https://nzb.test/two", "the release found now leads");
+  assert.equal(again.sources[1].id, "nzb:https://nzb.test/one");
+});
