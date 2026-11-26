@@ -2828,3 +2828,32 @@ test("a complete search answer is not searched again within 5 minutes", () => {
   }
   assert.equal(searches, afterFirst, "a complete answer is reused for 5 minutes");
 });
+
+test("a refresh that comes back empty or fails keeps the earlier incomplete answer", () => {
+  const album = sampleDiscoveryAlbum();
+  let searches = 0;
+  const seenLists: number[] = [];
+  const { resolver, advance: tick } = clockedResolverFor(album, (req: any) => {
+    if (req.kind === "indexer_search") {
+      searches++;
+      if (searches === 1) {
+        return { candidates: [{ title: "Daft Punk - Discovery (2001) [FLAC]", nzbUrl: "https://x.test/1", indexer: "altHUB", size: 400_000_000 }], indexers: [{ status: "answered" }, { status: "pending" }] };
+      }
+      if (searches === 2) return { candidates: [], indexers: [{ status: "pending" }, { status: "pending" }] };
+      throw new Error("indexer search failed");
+    }
+    if (req.kind === "release_files") {
+      seenLists.push(searches);
+      return { files: [{ path: "unrelated.flac", size: 1 }] };
+    }
+    return null;
+  });
+  const item = trackItemFor(album, 0);
+  for (let i = 0; i < 6; i++) {
+    resolver.resolve({ item });
+    tick(3000);
+  }
+  assert(searches >= 3, `expected refreshes, got ${searches}`);
+  // The first answer's candidate was still probed after the empty and the failed refresh.
+  assert(seenLists.some((n) => n >= 2), `candidate lost after refresh: ${JSON.stringify(seenLists)}`);
+});

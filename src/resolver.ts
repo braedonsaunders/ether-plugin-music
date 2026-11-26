@@ -1599,12 +1599,6 @@ export class AlbumResolver {
         "debug",
         `indexer_search ${entityId} "${query}" returned=${list.length} in ${elapsedMs}ms (timeout ${timeoutMs}ms) indexers=${statusText}`
       );
-      if (incomplete && list.length === 0) {
-        // Indexers still running (or cut off) and nothing yet: not an answer. Keep it marked in
-        // flight so concurrent tracks wait, and search again after the wait window.
-        this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
-        return { candidates: [], rawCount: 0, fromCache: false, errored: false, deferredInFlight: false, elapsedMs, incomplete: true };
-      }
       if (staleIncomplete && incomplete && list.length <= staleIncomplete.rawCount) {
         // Still incomplete and no richer than before: keep the earlier answer, restart its window.
         this.cache.set<SearchQueryMemo>(
@@ -1621,6 +1615,12 @@ export class AlbumResolver {
           elapsedMs,
           incomplete: true,
         };
+      }
+      if (incomplete && list.length === 0) {
+        // Indexers still running (or cut off) and nothing yet: not an answer. Keep it marked in
+        // flight so concurrent tracks wait, and search again after the wait window.
+        this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
+        return { candidates: [], rawCount: 0, fromCache: false, errored: false, deferredInFlight: false, elapsedMs, incomplete: true };
       }
       const rankAt = this.env.now();
       const ordered = prioritize ? prioritize(list) : list;
@@ -1643,6 +1643,20 @@ export class AlbumResolver {
     } catch (err) {
       rethrowHostFault(err);
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
+      if (staleIncomplete) {
+        // The refresh failed: the earlier answer still stands.
+        this.cache.set<SearchQueryMemo>(memoKey, { ...staleIncomplete, at: this.env.now() }, INCOMPLETE_MEMO_TTL_MS);
+        this.env.log("debug", `indexer_search refresh failed ${entityId} "${query}": ${String(err).slice(0, 120)}`);
+        return {
+          candidates: (staleIncomplete.candidates || []).map((c) => ({ ...c })),
+          rawCount: staleIncomplete.rawCount,
+          fromCache: false,
+          errored: false,
+          deferredInFlight: false,
+          elapsedMs,
+          incomplete: true,
+        };
+      }
       // A failed search says nothing about the album: keep it in flight for the wait window
       // (concurrent tracks wait), then search again.
       this.cache.set<SearchQueryMemo>(memoKey, { status: "inflight", at: this.env.now(), rawCount: 0 }, SEARCH_DEDUP_WINDOW_MS);
