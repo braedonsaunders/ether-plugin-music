@@ -4831,3 +4831,22 @@ test("review b20 / 5: carried unscored candidates live 2 minutes and never enter
   assert.ok(!listed.some((t) => /Last Waltz/.test(t)), "the album's carried candidate is not listed by the song query");
   assert.deepEqual(h3.cache.get(key), [marker], "and stays for the album's own search");
 });
+
+test("a source that answered lately and now reports an error is down: the miss is not remembered", () => {
+  const album = albumOf("al-9700", "Test Band", "Test Album", 2001, trackTitles("Disc Song", 6), {}, 254);
+  const item = trackItemFor(album, 1);
+  const statuses = (slsk: string) => [{ indexerId: "nzb1", indexer: "N", status: "answered" }, { indexerId: "films", indexer: "F", status: "error" }, { indexerId: "slsk", indexer: "SlskSource", status: slsk }];
+  // Healthy day: everything that can answer answers with nothing. That is a verdict and is remembered.
+  const up = harness(album, (q) => q.kind === "indexer_search" ? ({ candidates: [], indexers: statuses("answered") } as never) : { candidates: [] });
+  up.play(item);
+  assert.equal(up.cache.get<{ negative?: boolean }>(albumCacheKey(album.id))?.negative, true, "a finished empty search is remembered");
+  assert.ok(up.logs.every((l) => !/sources down/.test(l)), "a source that always errors is not 'down'");
+  // Soulseek answered a while ago and now errors: no verdict, nothing negative is stored.
+  const down = harness(album, (q) => q.kind === "indexer_search" ? ({ candidates: [], indexers: statuses("error") } as never) : { candidates: [] });
+  down.cache.set("src_health_v1", { slsk: Date.now() - 60_000 }, 3_600_000);
+  const r = down.play(item);
+  assert.equal(r.sources.length, 0);
+  assert.ok(!down.cache.get<{ negative?: boolean }>(albumCacheKey(album.id))?.negative, "an outage is not remembered as a miss");
+  assert.ok(down.logs.some((l) => /sources down that normally answer: slsk/.test(l)), down.logs.join("\n"));
+  assert.ok((r.ttlSec ?? 0) <= 30, "the empty answer is short-lived");
+});

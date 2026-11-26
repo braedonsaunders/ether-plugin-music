@@ -172,7 +172,7 @@ export function formatDroppedAtNameRanking(
 }
 
 export function albumCacheKey(albumId: string): string {
-  return `alb_rel_v15:${albumId}`;
+  return `alb_rel_v16:${albumId}`;
 }
 
 /**
@@ -378,7 +378,7 @@ export function pickRecordingReleases(releases: MBRecordingRelease[], ownAlbumTi
 }
 
 function albumStageKey(albumId: string): string {
-  return `alb_stage_v8:${albumId}`;
+  return `alb_stage_v9:${albumId}`;
 }
 
 export function concertCacheKey(concertId: string): string {
@@ -404,6 +404,10 @@ interface SearchQueryMemo {
   incomplete?: boolean;
 }
 
+/** Which sources answered a search lately (id -> time): one of them reporting an error now is down. */
+const SOURCE_HEALTH_KEY = "src_health_v1";
+const SOURCE_HEALTH_WINDOW_MS = 6 * HOUR_MS;
+const SOURCE_HEALTH_REFRESH_MS = 5 * 60 * 1000;
 /** How many times one album's or concert's inconclusive search is tried again in a few minutes. */
 const MAX_INCONCLUSIVE_SEARCHES = 8;
 const INCONCLUSIVE_WINDOW_MS = 3 * 60 * 1000;
@@ -2210,6 +2214,34 @@ export class AlbumResolver {
   }
 
   /**
+   * The sources of a search answer that report an error although they answered a search within
+   * SOURCE_HEALTH_WINDOW_MS. Sources that answer are remembered as healthy as a side effect.
+   */
+  private sourcesDown(statuses: Array<{ indexerId?: string; status?: string }>): string[] {
+    const seen = this.cache.get<Record<string, number>>(SOURCE_HEALTH_KEY) || {};
+    const now = this.env.now();
+    let changed = false;
+    const down: string[] = [];
+    for (const st of statuses) {
+      const id = String(st.indexerId || "");
+      if (!id) continue;
+      if (st.status === "answered") {
+        if (!(now - (seen[id] || 0) < SOURCE_HEALTH_REFRESH_MS)) {
+          seen[id] = now;
+          changed = true;
+        }
+      } else if (st.status === "error" && now - (seen[id] || 0) < SOURCE_HEALTH_WINDOW_MS) {
+        down.push(id);
+      }
+    }
+    if (changed) {
+      for (const id of Object.keys(seen)) if (now - seen[id] > SOURCE_HEALTH_WINDOW_MS) delete seen[id];
+      this.cache.set(SOURCE_HEALTH_KEY, seen, SOURCE_HEALTH_WINDOW_MS);
+    }
+    return down;
+  }
+
+  /**
    * The song queries of a track not yet tried, in order: "artist title" with the catalogue's labels
    * dropped, a short form for a long title, the form without a "part N" tail (see
    * trackQueryVariants), the album's credit beside the track's. What the album search sent is left out.
@@ -2615,7 +2647,12 @@ export class AlbumResolver {
       });
       const list = Array.isArray(res?.candidates) ? res.candidates : [];
       const elapsedMs = Math.max(0, this.env.now() - reqAt);
-      const incomplete = searchIncomplete(res);
+      // A source that answered within the last hours and now reports an error is down, not
+      // empty (Soulseek offline, an indexer paused): what this search says is no verdict, so it
+      // counts as unfinished and no miss is remembered from it.
+      const degraded = this.sourcesDown((res as { indexers?: Array<{ indexerId?: string; status?: string }> } | null)?.indexers || []);
+      const incomplete = searchIncomplete(res) || degraded.length > 0;
+      if (degraded.length > 0) this.env.log("debug", `indexer_search ${entityId} sources down that normally answer: ${degraded.join(", ").slice(0, 120)}`);
       const statusCounts: Record<string, number> = {};
       for (const st of ((res as { indexers?: Array<{ status?: string }> } | null)?.indexers || [])) {
         const k = st.status || "unknown";
