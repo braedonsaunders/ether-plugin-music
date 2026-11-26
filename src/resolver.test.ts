@@ -3500,3 +3500,76 @@ test("a requested box set is not rejected for being a box set; dotted SACD.5.1 n
   assert.equal(isWrongVersionRelease("Pink Floyd - The Dark Side Of The Moon [FLAC 24-44.1]", "The Dark Side of the Moon", "Pink Floyd").rejected, false);
   assert.equal(isWrongVersionRelease("Artist - Album v4.1", "Album", "Artist").rejected, false);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Review 3 fixes
+// ---------------------------------------------------------------------------------------------
+
+function review3Settings() {
+  return {
+    qualityPreference: "flac_preferred" as const,
+    newznabCategories: "3000,3010,3040",
+    videoQualityPreference: "uhd_preferred" as const,
+    concertNewznabCategories: "2000,2040,2045,3020,5000",
+    curatedSize: "standard" as const,
+    enrichMusicBrainz: false,
+  };
+}
+
+test("defect 7: a MusicBrainz failure is not remembered as 'no such recording'", () => {
+  const album = sampleDiscoveryAlbum();
+  const single: SourceCandidate = {
+    title: "Daft Punk - One More Time (2000) [FLAC]",
+    indexer: "NZBgeek",
+    nzbUrl: "https://api.nzbgeek.info/api?t=get&id=omt-single7",
+    size: 90_000_000,
+  };
+  const mbOk = JSON.stringify({ recordings: [{ "artist-credit": [{ name: "Daft Punk" }], releases: [
+    { title: "One More Time", status: "Official", "track-count": 2, "release-group": { "primary-type": "Single" } },
+  ] }] });
+  const failures: Array<() => { status: number; body: string }> = [
+    () => ({ status: 500, body: "" }),
+    () => ({ status: 502, body: "bad gateway" }),
+    () => { throw new Error("network down"); },
+    () => ({ status: 200, body: "<html>not json" }),
+    () => ({ status: 200, body: JSON.stringify({ error: "oops" }) }),
+  ];
+  for (const fail of failures) {
+    let mbMode: "fail" | "ok" = "fail";
+    const { env, kvMap } = makeFakeHost({
+      onResolve: (q) => {
+        if (q.kind === "indexer_search") return { candidates: /one more time/i.test(q.query || "") ? [single] : [] };
+        if (q.kind === "release_files") return { candidates: [{ ...q.candidate!, files: [{ index: 0, path: "01 - One More Time.flac", size: 40_000_000 }] }] };
+        if (q.kind === "usenet_check") return { candidates: [{ ...single, usenetCheck: { available: true, checked: 8, missing: 0 } }] };
+        return { candidates: [] };
+      },
+    });
+    env.http.fetch = (req) => {
+      if (!req.url.includes("musicbrainz.org/ws/2/recording")) return { status: 404, body: "" };
+      return mbMode === "ok" ? { status: 200, body: mbOk } : fail();
+    };
+    const cache = new KVCache(env);
+    cache.set("album_v2:al-302127", album, 60_000);
+    const settings = review3Settings();
+    const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+    const resolver = new AlbumResolver(env, cache, catalog, settings);
+    const item = trackItemFor(album, 0);
+    item.hints = { ...(item.hints || {}), isrc: "GBDUW0000053" };
+    // The album itself is known not to hold the song: straight to the recording path.
+    cache.set(albumCacheKey("al-302127"), { albumId: "al-302127", resolvedAt: 0, expiresAt: Date.now() + 3_600_000, releases: [], negative: true }, 3_600_000);
+
+    const first = resolver.resolve({ item });
+    assert.equal(first.sources.length, 0);
+    assert.ok((first.ttlSec ?? 0) > 0 && (first.ttlSec ?? 0) <= 60, `short ttl, got ${first.ttlSec}`);
+    assert.equal(cache.get(albumCacheKey("rec-GBDUW0000053")), null);
+    assert.equal(cache.get("mb:isrc:GBDUW0000053"), null, "the failure is not cached as a miss");
+
+    // MusicBrainz is back: the recording is found.
+    mbMode = "ok";
+    cache.delete("rl:musicbrainz");
+    for (const k of kvMap.keys()) if (k.includes("rl:musicbrainz")) kvMap.delete(k);
+    let res = resolver.resolve({ item });
+    for (let i = 0; res.pending && i < 12; i++) res = resolver.resolve({ item });
+    assert.equal(res.sources[0]?.release?.candidate?.nzbUrl, single.nzbUrl);
+  }
+});

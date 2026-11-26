@@ -700,16 +700,26 @@ export class MusicCatalog {
     const trackTimeout = extra.timeoutMs && extra.timeoutMs > 0
       ? Math.max(350, extra.timeoutMs - elapsed)
       : 4000;
+    const nbTracks = detail.nb_tracks || 0;
     const trackRes = needTrackEndpoint
-      ? this.dz.getAlbumTracksEx(deezerAlbumId, 100, trackTimeout)
-      : { tracks: [] as DeezerTrack[], outcome: "ok" as const };
+      ? this.dz.getAlbumTracksEx(deezerAlbumId, 100, trackTimeout, nbTracks)
+      : { tracks: [] as DeezerTrack[], outcome: "ok" as const, complete: true };
     const detailedTracks = trackRes.tracks;
-    // The track list could not be fetched: the embedded part is not the whole album.
+    // The track list is not the whole album: it could not be fetched, or it came back empty
+    // (HTTP 404, "no data"), cut short (a page missing, the time budget ended) or more than one
+    // track short of the count Deezer states for the album. One track of slack: the stated count
+    // can include a track unavailable in the listing. The embedded part (25 tracks) is then not
+    // the album, and it is never cached as such.
     let incomplete = false;
-    if (needTrackEndpoint && detailedTracks.length === 0 && trackRes.outcome === "failed") {
+    const finalCount = detailedTracks.length > 0 ? detailedTracks.length : embedded.length;
+    const listShort =
+      needTrackEndpoint &&
+      (!trackRes.complete ||
+        (nbTracks > embedded.length && (detailedTracks.length === 0 || finalCount < nbTracks - 1)));
+    if (needTrackEndpoint && ((detailedTracks.length === 0 && trackRes.outcome === "failed") || listShort)) {
       const copy = fallbackCopy();
       if (copy) return copy;
-      if (embedded.length === 0) return { album: null, status: "failed" };
+      if (embedded.length === 0 && detailedTracks.length === 0) return { album: null, status: "failed" };
       incomplete = true;
     }
     const rawTracks: DeezerTrack[] = detailedTracks.length > 0 ? detailedTracks : embedded;

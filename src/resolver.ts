@@ -1812,6 +1812,9 @@ export class AlbumResolver {
     if (!plan) {
       const looked = this.catalog.recordingReleases(isrc);
       if (looked.status === "busy") return { pending: true, retryInMs: 1200, sources: [] };
+      // MusicBrainz gave no answer (5xx, network, timeout, bad body): without its releases there
+      // is nothing to search, but that is not "no such recording": nothing is remembered.
+      if (looked.status === "failed") return { sources: [], ttlSec: 30 };
       const candidates = looked.status === "ok" ? pickRecordingReleases(looked.releases, String(hints.albumTitle || "")) : [];
       if (candidates.length === 0) {
         this.rememberRecordingMiss(recId);

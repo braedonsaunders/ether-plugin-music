@@ -133,6 +133,9 @@ export interface DeezerAlbumDetail extends DeezerAlbumSummary {
   tracks?: { data?: DeezerTrack[] };
 }
 
+/** At most this many pages of one album's track listing are read (100 tracks each). */
+const MAX_TRACK_PAGES = 6;
+
 export class DeezerClient {
   private env: HostEnv;
   private cache: KVCache;
@@ -439,16 +442,56 @@ export class DeezerClient {
     );
   }
 
-  /** getAlbumTracks, with the outcome (see getJsonEx). */
-  getAlbumTracksEx(albumId: number, limit = 100, timeoutMs = 4000): { tracks: DeezerTrack[]; outcome: "ok" | "stale" | "not_found" | "failed" } {
-    const res = this.getJsonEx<{ data?: DeezerTrack[] }>(
-      `/album/${albumId}/tracks?limit=${limit}`,
-      `dz:album:${albumId}:tracks:${limit}`,
-      30 * 60 * 1000,
-      timeoutMs,
-      { persist: false }
-    );
-    return { tracks: Array.isArray(res.value?.data) ? res.value!.data! : [], outcome: res.outcome };
+  /**
+   * getAlbumTracks, with the outcome (see getJsonEx). Follows the listing's pages (`next`, or a
+   * `total` not yet reached) while time is left in `timeoutMs` and at most MAX_TRACK_PAGES pages
+   * are read; a page that adds no new track ends it. `complete` is false when a later page
+   * failed or the budget ended while the listing said more was to come. When the caller says how
+   * many tracks to `expect` (the album's nb_tracks), a listing more than one short of that, or an
+   * incomplete one, is not kept in the memory cache: the next ask fetches again.
+   */
+  getAlbumTracksEx(albumId: number, limit = 100, timeoutMs = 4000, expect = 0): { tracks: DeezerTrack[]; outcome: "ok" | "stale" | "not_found" | "failed"; complete: boolean } {
+    const startMs = this.env.now();
+    const tracks: DeezerTrack[] = [];
+    const seen = new Set<number>();
+    let outcome: "ok" | "stale" | "not_found" | "failed" = "ok";
+    let complete = true;
+    const keys: string[] = [];
+    for (let page = 0; page < MAX_TRACK_PAGES; page++) {
+      const index = tracks.length;
+      const left = page === 0 ? timeoutMs : Math.max(0, timeoutMs - (this.env.now() - startMs));
+      if (page > 0 && left < 350) {
+        complete = false;
+        break;
+      }
+      const key = index === 0 ? `dz:album:${albumId}:tracks:${limit}` : `dz:album:${albumId}:tracks:${limit}:i${index}`;
+      keys.push(key);
+      const res = this.getJsonEx<{ data?: DeezerTrack[]; total?: number; next?: string }>(
+        index === 0 ? `/album/${albumId}/tracks?limit=${limit}` : `/album/${albumId}/tracks?limit=${limit}&index=${index}`,
+        key,
+        30 * 60 * 1000,
+        left,
+        { persist: false }
+      );
+      if (page === 0) outcome = res.outcome;
+      else if (res.outcome === "failed" || res.outcome === "not_found") {
+        complete = false;
+        break;
+      }
+      const data = Array.isArray(res.value?.data) ? res.value!.data! : [];
+      let added = 0;
+      for (const t of data) {
+        if (!t || seen.has(t.id)) continue;
+        seen.add(t.id);
+        tracks.push(t);
+        added++;
+      }
+      const more = Boolean(res.value?.next) || (typeof res.value?.total === "number" && tracks.length < res.value.total);
+      if (!more || added === 0) break;
+      if (page === MAX_TRACK_PAGES - 1) complete = false;
+    }
+    if (!complete || (expect > 0 && tracks.length < expect - 1)) for (const k of keys) this.cache.delete(k);
+    return { tracks, outcome, complete };
   }
 
   /**

@@ -1391,3 +1391,88 @@ test("PLUGIN_VERSION matches manifest.json", async () => {
   const { PLUGIN_VERSION } = await import("./index.ts");
   assert.equal(PLUGIN_VERSION, manifest.version);
 });
+
+// ---- Review 3: a bad answer from the track-list endpoint never caches a truncated album ----
+
+function bigAlbumCatalog(tracksResp: (url: string, calls: string[]) => HttpFetchResponse, nbTracks = 60) {
+  const kv = new Map<string, string>();
+  const now = 1_760_000_000_000;
+  const calls: string[] = [];
+  const emb = Array.from({ length: 25 }, (_, i) => ({ id: 1000 + i, title: `T${i}`, duration: 200, track_position: i + 1, disk_number: 1, artist: { id: 1, name: "A" }, isrc: `X${i}` }));
+  const env: HostEnv = {
+    now: () => now,
+    log: () => {},
+    kv: {
+      get: (k) => kv.get(k) ?? null,
+      put: (k, v) => { kv.set(k, v); },
+      delete: (k) => { kv.delete(k); },
+      list: (p = "") => [...kv.keys()].filter((k) => k.startsWith(p)),
+    },
+    settings: { get: () => ({}) },
+    sources: { resolve: () => ({}) },
+    http: {
+      fetch: (r) => {
+        calls.push(r.url);
+        if (r.url.includes("/tracks")) return tracksResp(r.url, calls);
+        return { status: 200, body: JSON.stringify({ id: 5, title: "Big", nb_tracks: nbTracks, artist: { id: 1, name: "A" }, release_date: "2000-01-01", record_type: "album", tracks: { data: emb } }) };
+      },
+    },
+  };
+  const cache = new KVCache(env);
+  const settings: any = { enrichMusicBrainz: false, qualityPreference: "flac_preferred" };
+  const catalog = new MusicCatalog(env, cache, new DeezerClient(env, cache), new MusicBrainzClient(env, cache), settings);
+  return { catalog, kv, calls };
+}
+const bigTracks = (from: number, n: number) => Array.from({ length: n }, (_, i) => ({ id: 2000 + from + i, title: `U${from + i}`, duration: 200, track_position: from + i + 1, disk_number: 1, artist: { id: 1, name: "A" }, isrc: `Y${from + i}` }));
+
+test("defect 6: a track endpoint that answers 404, empty, DataException or a short page leaves the album incomplete and uncached", () => {
+  const answers: Record<string, (u: string) => HttpFetchResponse> = {
+    "HTTP 404": () => ({ status: 404, body: "" }),
+    "empty data": () => ({ status: 200, body: JSON.stringify({ data: [], total: 0 }) }),
+    "DataException 800": () => ({ status: 200, body: JSON.stringify({ error: { type: "DataException", code: 800 } }) }),
+    "HTTP 500": () => ({ status: 500, body: "" }),
+    "short page, same page again": () => ({ status: 200, body: JSON.stringify({ data: bigTracks(0, 30), total: 60, next: "x" }) }),
+    "a second page that fails": (u) => u.includes("index=")
+      ? { status: 500, body: "" }
+      : { status: 200, body: JSON.stringify({ data: bigTracks(0, 30), total: 60, next: "x" }) },
+    "no next, total 60, only 30": () => ({ status: 200, body: JSON.stringify({ data: bigTracks(0, 30), total: 60 }) }),
+  };
+  for (const [label, resp] of Object.entries(answers)) {
+    const h = bigAlbumCatalog((u) => resp(u));
+    const r = h.catalog.loadCanonicalAlbumResult(5, { allowMusicBrainz: true, requireTrackDetails: true });
+    assert.equal(r.status, "failed", label);
+    assert.equal(r.album?.incomplete, true, label);
+    assert.equal(h.kv.has("album_v2:al-5"), false, `${label}: nothing cached`);
+    // Asked again, the track endpoint is asked again (a bad answer is not remembered either).
+    const before = h.calls.filter((u) => u.includes("/tracks")).length;
+    h.catalog.loadCanonicalAlbumResult(5, { allowMusicBrainz: true, requireTrackDetails: true });
+    assert.ok(h.calls.filter((u) => u.includes("/tracks")).length > before, `${label}: fetched again`);
+  }
+});
+
+test("defect 6: pages are followed and a listing within one track of the stated count is a complete album", () => {
+  // 150 tracks in pages of 100 and 50
+  const paged = bigAlbumCatalog((u) => u.includes("index=100")
+    ? { status: 200, body: JSON.stringify({ data: bigTracks(100, 50), total: 150 }) }
+    : { status: 200, body: JSON.stringify({ data: bigTracks(0, 100), total: 150, next: "https://api.deezer.com/album/5/tracks?index=100" }) }, 150);
+  const r = paged.catalog.loadCanonicalAlbumResult(5, { requireTrackDetails: true });
+  assert.equal(r.status, "ok");
+  assert.equal(r.album?.tracks.length, 150);
+  assert.ok(paged.kv.has("album_v2:al-5"));
+
+  // 59 of 60: one off is allowed (a stated count can include an unavailable track)
+  const off1 = bigAlbumCatalog(() => ({ status: 200, body: JSON.stringify({ data: bigTracks(0, 59), total: 59 }) }));
+  const r1 = off1.catalog.loadCanonicalAlbumResult(5, { requireTrackDetails: true });
+  assert.equal(r1.status, "ok");
+  assert.equal(r1.album?.tracks.length, 59);
+
+  // 58 of 60 is not
+  const off2 = bigAlbumCatalog(() => ({ status: 200, body: JSON.stringify({ data: bigTracks(0, 58), total: 58 }) }));
+  assert.equal(off2.catalog.loadCanonicalAlbumResult(5, { requireTrackDetails: true }).status, "failed");
+
+  // The whole listing in one page
+  const full = bigAlbumCatalog(() => ({ status: 200, body: JSON.stringify({ data: bigTracks(0, 60), total: 60 }) }));
+  const rf = full.catalog.loadCanonicalAlbumResult(5, { requireTrackDetails: true });
+  assert.equal(rf.status, "ok");
+  assert.equal(rf.album?.tracks.length, 60);
+});
