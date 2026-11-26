@@ -327,7 +327,10 @@ export function computeAlbumOrderIndex(
 export function isRejectedReleaseForRequest(
   releaseTitle: string,
   requestedAlbumTitle: string,
-  requestedReleaseType: ReleaseType
+  requestedReleaseType: ReleaseType,
+  // allowCompilations: the question is whether a release holds one song (or the library's
+  // album is itself a various-artists one), so a compilation or soundtrack name is no reason.
+  opts?: { allowCompilations?: boolean }
 ): { rejected: boolean; reason?: string } {
   const rel = String(releaseTitle || "");
   const reqNorm = normalizeText(requestedAlbumTitle);
@@ -347,6 +350,7 @@ export function isRejectedReleaseForRequest(
   // When requesting a studio album/EP/single, reject compilations & greatest hits unless requested.
   if (requestedReleaseType === "album" || requestedReleaseType === "ep" || requestedReleaseType === "single") {
     if (
+      !opts?.allowCompilations &&
       /\b(?:greatest\s+hits|best\s+of|the\s+very\s+best|anthology|compilation|various\s+artists|\bva\s+-|\bva\b|essential\s+collection|hits\s+collection|ultimate\s+collection|now\s+thats\s+what\s+i\s+call)\b/i.test(rel) &&
       !/\b(?:greatest\s+hits|best\s+of|anthology|compilation|essential|ultimate)\b/i.test(reqNorm)
     ) {
@@ -588,6 +592,8 @@ export interface ParsedTrackFilename {
   track: number | null;
   titleGuess: string;
   baseName: string;
+  /** The file name without extension and without the leading disc/track number (underscores as spaces). */
+  rest: string;
 }
 
 /**
@@ -653,7 +659,7 @@ export function parseTrackFilename(filePath: string, totalDiscs = 1): ParsedTrac
     }
   }
 
-  return { disc, track, titleGuess, baseName };
+  return { disc, track, titleGuess, baseName, rest: rest.replace(/_/g, " ").trim() };
 }
 
 export function validExternalId(id: string): string {
@@ -723,4 +729,134 @@ export function coreReleaseTitle(title: string): string {
     out = stripEditionSuffix(out);
   }
   return out || original;
+}
+
+/**
+ * normalizeText for titles in any script: accents folded and punctuation dropped like
+ * normalizeText, but letters and digits of other scripts (Japanese, Korean, Cyrillic...) are kept,
+ * so such titles still compare. normalizeText turns them into nothing.
+ */
+export function normalizeTitleKey(input: string): string {
+  return String(input || "")
+    .replace(/[Ææ]/g, "ae")
+    .replace(/[Œœ]/g, "oe")
+    .replace(/[Øø]/g, "o")
+    .replace(/[ß]/g, "ss")
+    .replace(/[Ðð]/g, "d")
+    .replace(/[Þþ]/g, "th")
+    .replace(/[Łł]/g, "l")
+    .normalize("NFD")
+    .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
+    .normalize("NFKC")
+    .replace(/['’`´]/g, "")
+    .replace(/[&+]/g, " and ")
+    .replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/** "Various Artists" and its short forms: a credit that names no band. */
+export function isVariousArtistsName(name: string): boolean {
+  return /^(?:various(?:\s+artists?)?|va|v\/a|multi[\s-]?artists?)$/i.test(String(name || "").trim());
+}
+
+// Words that, alone in a bracketed note, say nothing about WHICH recording a title is: a release
+// may or may not carry them ("Money (2011 Remaster)", "Song (Album Version)", "(Explicit)").
+const BENIGN_NOTE_WORDS = new Set(
+  (
+    "album original lp full stereo digital explicit clean bonus track deluxe edition version ver " +
+    "remaster remastered mastered new hd hq anniversary expanded special standard"
+  ).split(" ")
+);
+const BENIGN_NOTE_LEAD_RE = /^(?:feat|ft|featuring|with|prod|produced by|from|music from|theme from|original motion picture|original soundtrack|ost)(?: |$)/;
+
+/**
+ * Whether a bracketed or dashed note on a title is harmless (a credit, a source, a remaster or
+ * edition mark). Anything else - "live", "remix", "early version", "radio edit", a name plus
+ * "ver." - names another version of the song.
+ */
+export function isBenignTitleNote(note: string): boolean {
+  const n = normalizeTitleKey(note);
+  if (!n) return true;
+  if (BENIGN_NOTE_LEAD_RE.test(n)) return true;
+  return n.split(" ").every((w) => BENIGN_NOTE_WORDS.has(w) || /^(?:19|20)\d\d$/.test(w));
+}
+
+const TITLE_MARKER_RE =
+  /\b(?:live|remix(?:es|ed)?|rmx|mix|demo|acoustic|instrumental|karaoke|edit|mono|sessions?|early|alternate|alternative|alt|take|unplugged|cover|cappella|acapella|reprise|dub|rehearsal|outtake|unreleased|radio|single|extended|version|ver|sped|slowed|reverb|stripped|piano|orchestral|reimagined|rework|bootleg)\b/;
+
+export interface TitleSignature {
+  /** The whole title, normalized: two titles equal here are the same text. */
+  full: string;
+  /** The title without its benign trailing notes, plus the notes that name a version. */
+  sig: string;
+}
+
+/**
+ * What a track title says about WHICH recording it is. Trailing brackets and " - ..." notes are
+ * peeled off: harmless ones (feat./with credits, "From ...", "Album Version", remaster marks) are
+ * dropped, the others are kept as version qualifiers. Two titles are the same song when their
+ * `sig` is equal: "Money (2011 Remaster)" = "Money", but "Money (Live)" != "Money" and
+ * "World Turning" != "World Turning (Early Version)".
+ */
+export function titleSignature(title: string): TitleSignature | null {
+  const raw = String(title || "").trim();
+  const full = normalizeTitleKey(raw);
+  if (!full) return null;
+  let s = stripFeaturing(raw);
+  const quals: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const g = s.match(/^(.*\S)\s*[\(\[\{]([^()\[\]{}]*)[\)\]\}]\s*$/);
+    if (g) {
+      if (!isBenignTitleNote(g[2])) quals.push(normalizeTitleKey(g[2]));
+      s = g[1].replace(/[\s\-–—:]+$/, "");
+      continue;
+    }
+    const d = s.match(/^(.*\S)\s+[-–—]\s+([^-–—]+)$/);
+    if (d) {
+      const clause = normalizeTitleKey(d[2]);
+      if (isBenignTitleNote(d[2])) {
+        s = d[1];
+        continue;
+      }
+      if (clause.split(" ").length <= 5 && TITLE_MARKER_RE.test(clause)) {
+        quals.push(clause);
+        s = d[1];
+        continue;
+      }
+    }
+    break;
+  }
+  const base = normalizeTitleKey(s);
+  if (!base) return { full, sig: `${full}|` };
+  return { full, sig: `${base}|${quals.sort().join(";")}` };
+}
+
+/**
+ * The titles a file name may carry, longest first: a name is often "Artist - Album - 01 - Title"
+ * or scene style "01-artist-title", so every tail after a separator is a candidate. `rest` is the
+ * file name without extension and track number; `baseName` the one with the number kept
+ * ("99 Problems").
+ */
+export function fileTitleRuns(rest: string, baseName = ""): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (text: string) => {
+    const segs = text
+      .split(/\s+[-–—]\s+/)
+      .flatMap((p) => p.split(/-(?=[^\s-])/))
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .slice(0, 8);
+    for (let i = 0; i < segs.length; i++) {
+      const run = segs.slice(i).join(" - ");
+      if (!seen.has(run)) {
+        seen.add(run);
+        out.push(run);
+      }
+    }
+  };
+  add(rest.replace(/_/g, " "));
+  if (baseName && baseName !== rest) add(baseName.replace(/_/g, " "));
+  return out;
 }

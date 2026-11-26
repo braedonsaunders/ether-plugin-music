@@ -180,6 +180,11 @@ export interface PlayableSource {
   mime: string;
   size?: number;
   durationSec?: number;
+  /**
+   * With a positive value and `durationSec`, the host reads the file's real running time on open
+   * and refuses the source as wrong content when it differs by more than this many seconds.
+   */
+  durationToleranceSec?: number;
   url?: string;
   headers?: Record<string, string>;
   release?: ReleaseHint;
@@ -338,6 +343,11 @@ export interface VerifiedAlbumRelease {
    * and relies on Ether's acquire-time cache check + release.track selection.
    */
   isUnconfirmedDebridFallback?: boolean;
+  /**
+   * True when the release serves only some of the album's tracks (`tracks` lists them): another
+   * edition, one album of a box set, a single, a soundtrack holding the song.
+   */
+  partial?: boolean;
   /** Map from canonical track ID (e.g. "tr-3135553") -> matched file in release. */
   tracks: Record<string, TrackFileMapping>;
 }
@@ -348,6 +358,12 @@ export interface CachedAlbumResolution {
   expiresAt: number;
   releases: VerifiedAlbumRelease[];
   negative?: boolean;
+  /** Every release of the shortlist was listed: a track none of `releases` serves has no copy here. */
+  exhausted?: boolean;
+  /** Refs of the candidates already listed, so a later search for another track skips them. */
+  probedRefs?: string[];
+  /** How often the search went on for a track the cached releases did not serve. */
+  resumes?: number;
 }
 
 export interface VerifiedConcertRelease {
